@@ -124,6 +124,34 @@ router.post('/registered_partners/reject', async (req, res) => {
   }
 });
 
+// POST /api/registered_partners/freeze — تجميد مؤقت
+router.post('/registered_partners/freeze', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    const { id } = req.body || {};
+    if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
+    await db.collection('users').doc(String(id)).update({ status: 'frozen' });
+    res.json({ success: true, status: 'frozen' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/registered_partners/unfreeze — فك التجميد (يرجع معتمد)
+router.post('/registered_partners/unfreeze', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    const { id } = req.body || {};
+    if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
+    await db.collection('users').doc(String(id)).update({ status: 'approved' });
+    res.json({ success: true, status: 'approved' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // POST /api/registered_partners/delete
 router.post('/registered_partners/delete', async (req, res) => {
   try {
