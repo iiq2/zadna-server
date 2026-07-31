@@ -75,7 +75,9 @@ try {
 const registerSchema = Joi.object({
   name: Joi.string().required().min(3).max(50),
   email: Joi.string().email().required(),
-  phone: Joi.string().pattern(/^[0-9]{10}$/).required(),
+  phone: Joi.string().pattern(/^(059|056|050|052|053|054|055|058)[0-9]{7}$/).required().messages({
+    'string.pattern.base': 'رقم الجوال غير صالح ❌ — يجب أن يكون 10 أرقام ويبدأ بـ 059 (جوال) أو 056 (وطنية) أو رقم إسرائيلي صحيح (050/052/053/054/055/058)'
+  }),
   password: Joi.string().required().min(6),
   userType: Joi.string().valid('customer', 'driver', 'restaurant', 'manager').required(),
   adminCode: Joi.string().optional().allow(''),
