@@ -117,7 +117,10 @@ router.post('/registered_partners/reject', async (req, res) => {
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
-    await db.collection('users').doc(String(id)).update({ status: 'rejected' });
+    const note = (req.body && req.body.note) || '';
+    await db.collection('users').doc(String(id)).update({ status: 'rejected', statusNote: note, statusAt: new Date() });
+    const io = req.app.get('socketio');
+    if (io) io.emit('partner_status_changed', { id: String(id), status: 'rejected', note });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -131,7 +134,11 @@ router.post('/registered_partners/freeze', async (req, res) => {
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
-    await db.collection('users').doc(String(id)).update({ status: 'frozen' });
+    const note = (req.body && req.body.note) || '';
+    await db.collection('users').doc(String(id)).update({ status: 'frozen', statusNote: note, statusAt: new Date() });
+    // أبلغ الشريك فوراً عبر السوكت
+    const io = req.app.get('socketio');
+    if (io) io.emit('partner_status_changed', { id: String(id), status: 'frozen', note });
     res.json({ success: true, status: 'frozen' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -145,7 +152,9 @@ router.post('/registered_partners/unfreeze', async (req, res) => {
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
-    await db.collection('users').doc(String(id)).update({ status: 'approved' });
+    await db.collection('users').doc(String(id)).update({ status: 'approved', statusNote: '', statusAt: new Date() });
+    const io = req.app.get('socketio');
+    if (io) io.emit('partner_status_changed', { id: String(id), status: 'approved', note: '' });
     res.json({ success: true, status: 'approved' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -218,6 +227,7 @@ router.get('/partner_status', async (req, res) => {
     const status = data.status || 'approved';
     res.json({
       status,
+      statusNote: data.statusNote || '',
       isFrozen: status === 'frozen',
       isRejected: status === 'rejected',
       isPending: status === 'pending',

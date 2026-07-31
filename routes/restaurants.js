@@ -203,11 +203,37 @@ router.get('/', async (req, res) => {
       const showAll = req.query.all === '1' || req.query.all === 'true';
       const visible = showAll
         ? restaurants
-        : restaurants.filter(r => !r.status || r.status === 'approved');
+        : restaurants.filter(r => (!r.status || r.status === 'approved') && r.isOpen !== false);
       const ids = new Set(visible.map(r => String(r.id)));
       const merged = visible.concat(demoRestaurants.filter(d => !ids.has(String(d.id))));
 
-      res.json({ success: true, count: merged.length, restaurants: merged, city: 'نابلس' });
+      // ترتيب جميل للزبون: المفتوح أولاً، ثم الأعلى تقييماً، ثم الأسرع توصيلاً
+      const nowOpen = (r) => r.isOpen !== false;
+      merged.sort((a, b) => {
+        if (nowOpen(a) !== nowOpen(b)) return nowOpen(a) ? -1 : 1;
+        const fa = a.isFeatured ? 1 : 0, fb = b.isFeatured ? 1 : 0;
+        if (fa !== fb) return fb - fa;
+        const ra = Number(a.rating) || 0, rb = Number(b.rating) || 0;
+        if (rb !== ra) return rb - ra;
+        return (Number(a.deliveryTime) || 99) - (Number(b.deliveryTime) || 99);
+      });
+
+      // أكمل الحقول الناقصة حتى لا تظهر بطاقات مشوّهة
+      const clean = merged.map(r => ({
+        ...r,
+        name: r.name || 'مطعم',
+        description: r.description || 'مطعم شريك على منصة زادنا',
+        emoji: r.emoji || '🍽️',
+        rating: Number(r.rating) || 5,
+        deliveryTime: Number(r.deliveryTime) || 25,
+        deliveryFee: r.deliveryFee != null ? Number(r.deliveryFee) : 5,
+        categories: Array.isArray(r.categories) && r.categories.length ? r.categories : ['all'],
+        menu: Array.isArray(r.menu) ? r.menu.filter(m => m && m.available !== false) : [],
+        isOpen: r.isOpen !== false,
+        menuCount: Array.isArray(r.menu) ? r.menu.filter(m => m && m.available !== false).length : 0
+      }));
+
+      res.json({ success: true, count: clean.length, restaurants: clean, city: 'نابلس' });
     } catch (error) {
           res.status(500).json({ success: false, error: error.message });
     }
