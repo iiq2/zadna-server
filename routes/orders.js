@@ -106,13 +106,19 @@ router.patch('/:id', async (req, res) => {
 
       // Notify via sockets
       const io = req.app.get('socketio');
-          if (io) {
-                  io.emit('order_updated', {
-                            orderId: id,
-                            ...updateData,
-                            timestamp: new Date()
-                  });
-          }
+      if (io) {
+        io.emit('order_updated', { orderId: id, ...updateData, timestamp: new Date() });
+        // الطلب صار جاهزاً → أبلغ كل المناديب فوراً
+        if (status === 'READY_FOR_PICKUP') {
+          const snap2 = await docRef.get();
+          const o = snap2.exists ? snap2.data() : {};
+          io.emit('new_ready_order', {
+            orderId: id,
+            restaurantName: o.restaurant || 'زادنا',
+            location: o.location || { lat: 32.2211, lng: 35.2622 }
+          });
+        }
+      }
 
       res.json({ success: true });
     } catch (error) {
