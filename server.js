@@ -91,17 +91,20 @@ const loginSchema = Joi.object({
 // Helper Functions
 // =====================
 
+const JWT_SECRET_ACTIVE = process.env.JWT_SECRET || require('crypto').randomBytes(32).toString('hex');
+if (!process.env.JWT_SECRET) console.warn('⚠️ JWT_SECRET غير مضبوط - تم توليد مفتاح مؤقت (التوكنات تنتهي عند إعادة التشغيل)');
+
 function generateToken(userId, userType) {
   return jwt.sign(
     { userId, userType },
-    process.env.JWT_SECRET || 'zadna-secret-key-2024',
+    JWT_SECRET_ACTIVE,
     { expiresIn: '7d' }
   );
 }
 
 function verifyToken(token) {
   try {
-    return jwt.verify(token, process.env.JWT_SECRET || 'zadna-secret-key-2024');
+    return jwt.verify(token, JWT_SECRET_ACTIVE);
   } catch (error) {
     return null;
   }
@@ -149,14 +152,14 @@ app.post('/api/auth/register', async (req, res) => {
 
     // Security Guard: Check Secret Codes for Partners
     const CODES = {
-      driver: 'ZADNA-DRV',
-      restaurant: 'ZADNA-RST',
-      manager: 'ZADNA-BOSS'
+      driver: process.env.CODE_DRIVER,
+      restaurant: process.env.CODE_RESTAURANT,
+      manager: process.env.CODE_MANAGER
     };
 
     if (userType !== 'customer') {
       const requiredCode = CODES[userType];
-      if (adminCode !== requiredCode) {
+      if (!requiredCode || adminCode !== requiredCode) {
         return res.status(403).json({
           success: false,
           error: `كود تفعيل الـ ${userType === 'driver' ? 'مناديب' : userType === 'restaurant' ? 'مطاعم' : 'إدارة'} غير صحيح.`
@@ -289,29 +292,23 @@ app.post('/api/auth/login', async (req, res) => {
 
     const { email, password } = value;
 
-    // --- Master Accounts Bypass ---
-    const MASTER_ACCOUNTS = {
-      'boss': { name: 'يزن حناوي (المدير)', type: 'manager' },
-      'yazan': { name: 'يزن حناوي', type: 'customer' },
-      'driver': { name: 'المندوب الرسمي', type: 'driver' },
-      'rest': { name: 'مطعم زادنا الرسمي', type: 'restaurant' }
-    };
-
-    if (MASTER_ACCOUNTS[email] && password === email) {
-      const masterUser = MASTER_ACCOUNTS[email];
-      const token = generateToken(email, masterUser.type);
-      console.log('👑 دخول الزعيم/المسؤول:', email);
+    // --- Admin Account (from environment variables only) ---
+    const ADMIN_USER = process.env.ADMIN_USER;
+    const ADMIN_PASS = process.env.ADMIN_PASS;
+    if (ADMIN_USER && ADMIN_PASS && email === ADMIN_USER && password === ADMIN_PASS) {
+      const token = generateToken('admin_root', 'manager');
+      console.log('👑 دخول المدير من متغيرات البيئة');
       return res.json({
         success: true,
-        message: 'تم الدخول بحساب المسؤول',
+        message: 'تم الدخول بحساب المدير',
         token,
         user: {
-          id: `master_${email}`,
-          name: masterUser.name,
-          email: `${email}@zadna.app`,
+          id: 'admin_root',
+          name: 'المدير العام',
+          email: ADMIN_USER + '@zadna.app',
           phone: '0590000000',
-          userType: masterUser.type,
-          ownedRestaurantId: email === 'rest' ? 'rest_001' : null
+          userType: 'manager',
+          ownedRestaurantId: null
         }
       });
     }
