@@ -505,6 +505,9 @@ app.use('/api/orders', ordersRouter);
 const martRouter = require('./routes/mart');
 app.use('/api/mart_products', martRouter);
 
+const partnersRouter = require('./routes/partners');
+app.use('/api', partnersRouter);
+
 // =====================
 // Routes - General
 // =====================
