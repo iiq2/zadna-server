@@ -502,6 +502,9 @@ app.use('/api/restaurants', restaurantsRouter);
 const ordersRouter = require('./routes/orders');
 app.use('/api/orders', ordersRouter);
 
+const martRouter = require('./routes/mart');
+app.use('/api/mart_products', martRouter);
+
 // =====================
 // Routes - General
 // =====================
