@@ -34,9 +34,17 @@ function periodStart(period) {
   return null;
 }
 
+// كاش قصير + حد أقصى — يمنع استنزاف حصة Firestore
+let _cache = { at: 0, data: null };
+const CACHE_MS = 60000;      // دقيقة واحدة
+const MAX_ORDERS = 2000;     // سقف القراءة
+
 async function fetchDelivered(db) {
-  const snap = await db.collection('orders').where('status', '==', 'DELIVERED').get();
-  const list = []; snap.forEach(d => list.push({ _id: d.id, ...d.data() })); return list;
+  if (_cache.data && (Date.now() - _cache.at) < CACHE_MS) return _cache.data;
+  const snap = await db.collection('orders').where('status', '==', 'DELIVERED').limit(MAX_ORDERS).get();
+  const list = []; snap.forEach(d => list.push({ _id: d.id, ...d.data() }));
+  _cache = { at: Date.now(), data: list };
+  return list;
 }
 
 // حساب مستحقات زادنا على طلب واحد
@@ -204,6 +212,7 @@ router.post('/wallet/settlement', async (req, res) => {
     if (!amt || amt <= 0) return res.status(400).json({ success:false, error:'المبلغ غير صحيح' });
     const doc = { driverId:String(driverId), driverName:driverName||'', amount:amt, note:note||'', createdAt:new Date() };
     const ref = await db.collection('settlements').add(doc);
+    _cache = { at: 0, data: null }; // إبطال الكاش
     res.status(201).json({ success:true, id:ref.id, ...doc });
   } catch (e) { res.status(500).json({ success:false, error:e.message }); }
 });

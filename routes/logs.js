@@ -91,4 +91,42 @@ router.get('/diagnostics', async (req, res) => {
   res.json(out);
 });
 
+// POST /api/reset_experience — تنظيف بيانات الاختبار (آمن: يحذف المُعلَّم كتجريبي فقط)
+router.post('/reset_experience', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    const confirm = (req.body && req.body.confirm) || req.query.confirm;
+    if (confirm !== 'ZADNA-RESET') {
+      return res.status(400).json({
+        success: false,
+        error: 'للحماية: أرسل confirm=ZADNA-RESET لتأكيد الحذف',
+        hint: 'يحذف فقط الطلبات التجريبية (ORD_CLAUDE_*, ORD_FLOW_*, ORD_TEST_*) والمستخدمين بإيميلات @test.com'
+      });
+    }
+    let deletedOrders = 0, deletedUsers = 0;
+
+    const oSnap = await db.collection('orders').get();
+    const oBatch = db.batch();
+    oSnap.forEach(d => {
+      const id = String(d.id || '');
+      if (/^ORD_(CLAUDE|FLOW|TEST)_/i.test(id)) { oBatch.delete(d.ref); deletedOrders++; }
+    });
+    if (deletedOrders) await oBatch.commit();
+
+    const uSnap = await db.collection('users').get();
+    const uBatch = db.batch();
+    uSnap.forEach(d => {
+      const u = d.data();
+      if (/@test\.com$/i.test(String(u.email || ''))) { uBatch.delete(d.ref); deletedUsers++; }
+    });
+    if (deletedUsers) await uBatch.commit();
+
+    console.log(`🧹 تنظيف بيانات الاختبار: ${deletedOrders} طلب، ${deletedUsers} مستخدم`);
+    res.json({ success: true, deletedOrders, deletedUsers });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 module.exports = router;
