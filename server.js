@@ -159,14 +159,16 @@ app.post('/api/auth/register', async (req, res) => {
       manager: process.env.CODE_MANAGER
     };
 
-    if (userType !== 'customer') {
-      const requiredCode = CODES[userType];
-      if (!requiredCode || adminCode !== requiredCode) {
-        return res.status(403).json({
-          success: false,
-          error: `كود تفعيل الـ ${userType === 'driver' ? 'مناديب' : userType === 'restaurant' ? 'مطاعم' : 'إدارة'} غير صحيح.`
-        });
-      }
+    const isPartner = (userType === 'driver' || userType === 'restaurant');
+    const envCodeOk = CODES[userType] && adminCode === CODES[userType];
+
+    // المدير: فقط عبر كود البيئة
+    if (userType === 'manager' && !envCodeOk) {
+      return res.status(403).json({ success: false, error: 'كود تفعيل الإدارة غير صحيح.' });
+    }
+    // الشريك: يلزمه كود اعتماد من المدير (أو كود بيئة احتياطي)
+    if (isPartner && !envCodeOk && (!db || !adminCode)) {
+      return res.status(403).json({ success: false, error: 'كود الاعتماد مطلوب — اطلبه من إدارة زادنا 🔑' });
     }
 
     // إذا كان Firebase متصل
@@ -183,6 +185,23 @@ app.post('/api/auth/register', async (req, res) => {
         });
       }
 
+      // حرق كود الاعتماد ذرياً (Transaction) — يمنع استخدامه مرتين
+      if (isPartner && !envCodeOk) {
+        const codeRef = db.collection('partner_codes').doc(String(adminCode).toUpperCase().trim());
+        try {
+          await db.runTransaction(async (t) => {
+            const snap = await t.get(codeRef);
+            if (!snap.exists) throw new Error('كود الاعتماد غير صحيح ❌');
+            const c = snap.data();
+            if (c.isUsed) throw new Error('هذا الكود مستخدم سابقاً ❌ اطلب كوداً جديداً من الإدارة');
+            if (c.type !== userType) throw new Error('هذا الكود مخصص لنوع شريك آخر ❌');
+            t.update(codeRef, { isUsed: true, usedBy: phone || email, usedAt: new Date() });
+          });
+        } catch (txErr) {
+          return res.status(403).json({ success: false, error: txErr.message });
+        }
+      }
+
       const hashedPassword = await bcryptjs.hash(password, 10);
 
       const newUser = {
@@ -197,11 +216,21 @@ app.post('/api/auth/register', async (req, res) => {
         rating: 5,
         isActive: true,
         walletBalance: 0,
-        addresses: []
+        addresses: [],
+        ...(isPartner ? { status: 'pending', joinCode: String(adminCode || '').toUpperCase() } : {})
       };
 
       const docRef = await db.collection('users').add(newUser);
       const userId = docRef.id;
+
+      // إشعار فوري للوحة المدير بطلب انضمام جديد
+      if (isPartner) {
+        const ioRT = req.app.get('socketio');
+        if (ioRT) {
+          ioRT.emit('new_partner_request', { id: userId, name, phone, type: userType, date: new Date() });
+          ioRT.to('manager_monitor').emit('new_partner_request', { id: userId, name, phone, type: userType, date: new Date() });
+        }
+      }
 
       const token = generateToken(userId, userType);
 
@@ -209,7 +238,7 @@ app.post('/api/auth/register', async (req, res) => {
 
       return res.status(201).json({
         success: true,
-        message: 'تم التسجيل بنجاح - مرحباً بك في زادنا!',
+        message: isPartner ? 'تم التسجيل! حسابك قيد المراجعة — بانتظار موافقة الإدارة ⏳' : 'تم التسجيل بنجاح - مرحباً بك في زادنا!',
         token,
         user: {
           id: userId,
@@ -339,6 +368,19 @@ app.post('/api/auth/login', async (req, res) => {
           success: false,
           error: 'البريد الإلكتروني أو كلمة السر غير صحيحة'
         });
+      }
+
+      // فحص حالة الشريك (المستخدمون القدامى بدون status يمرون عادي)
+      if (user.userType === 'driver' || user.userType === 'restaurant') {
+        if (user.status === 'rejected') {
+          return res.status(403).json({ success: false, error: 'تم رفض طلب انضمامك من الإدارة ❌' });
+        }
+        if (user.status === 'frozen') {
+          return res.status(403).json({ success: false, error: 'حسابك مجمد مؤقتاً من الإدارة ⛔ تواصل معنا لإعادة التفعيل' });
+        }
+        if (user.status === 'pending') {
+          return res.status(403).json({ success: false, error: 'حسابك قيد المراجعة — بانتظار موافقة الإدارة ⏳' });
+        }
       }
 
       const token = generateToken(userId, user.userType);
