@@ -226,4 +226,133 @@ router.get('/:id', async (req, res) => {
     }
 });
 
+// ==============================
+// إنشاء وتعديل المطاعم (لتطبيق المطعم)
+// ==============================
+
+// POST /api/restaurants — صاحب المطعم يسجل مطعمه (يصل للمدير للاعتماد)
+router.post('/', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    const b = req.body || {};
+    if (!b.name || !String(b.name).trim()) {
+      return res.status(400).json({ success: false, error: 'اسم المطعم مطلوب' });
+    }
+    const id = b.id || ('rest_' + Date.now());
+    const doc = {
+      id,
+      name: String(b.name).trim(),
+      description: b.description || '',
+      phone: b.phone || '',
+      address: b.address || '',
+      workingHours: b.workingHours || '',
+      ownerId: b.ownerId || null,
+      emoji: b.emoji || '🍽️',
+      rating: b.rating || 5,
+      deliveryTime: b.deliveryTime || 25,
+      deliveryFee: b.deliveryFee != null ? b.deliveryFee : 5,
+      cuisineType: b.cuisineType || [],
+      categories: b.categories || [],
+      menu: Array.isArray(b.menu) ? b.menu : [],
+      commission: '10%',
+      status: 'pending',
+      isActive: false,
+      createdAt: new Date()
+    };
+    await db.collection('restaurants').doc(id).set(doc);
+
+    // إشعار فوري للوحة المدير
+    const io = req.app.get('socketio');
+    if (io) {
+      const payload = { id, name: doc.name, phone: doc.phone, type: 'restaurant', date: new Date() };
+      io.emit('new_partner_request', payload);
+      io.to('manager_monitor').emit('new_partner_request', payload);
+    }
+
+    res.status(201).json({ success: true, id, message: 'تم إرسال مطعمك للإدارة — بانتظار الاعتماد ⏳' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PATCH /api/restaurants/:id — تعديل بيانات المطعم
+router.patch('/:id', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    const ref = db.collection('restaurants').doc(String(req.params.id));
+    if (!(await ref.get()).exists) {
+      const demo = demoRestaurants.find(r => r.id === req.params.id);
+      if (demo) { await ref.set({ ...demo, ...req.body, id: demo.id, status: 'approved' }); return res.json({ success: true, created: true }); }
+      return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
+    }
+    const body = { ...req.body };
+    delete body.status; delete body.id; // الحالة يغيرها المدير فقط
+    await ref.update(body);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/restaurants/:id/menu — إضافة وجبة
+router.post('/:id/menu', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    const ref = db.collection('restaurants').doc(String(req.params.id));
+    const snap = await ref.get();
+    let base = snap.exists ? snap.data() : demoRestaurants.find(r => r.id === req.params.id);
+    if (!base) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
+    const item = req.body || {};
+    if (!item.name) return res.status(400).json({ success: false, error: 'اسم الوجبة مطلوب' });
+    item.id = item.id || ('item_' + Date.now());
+    if (item.available === undefined) item.available = true;
+    const menu = Array.isArray(base.menu) ? base.menu.slice() : [];
+    menu.push(item);
+    await ref.set({ ...base, menu }, { merge: true });
+    res.status(201).json({ success: true, item });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PATCH /api/restaurants/:id/menu/:itemId — تعديل وجبة (سعر/توفر/وصف)
+router.patch('/:id/menu/:itemId', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    const ref = db.collection('restaurants').doc(String(req.params.id));
+    const snap = await ref.get();
+    let base = snap.exists ? snap.data() : demoRestaurants.find(r => r.id === req.params.id);
+    if (!base) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
+    const menu = Array.isArray(base.menu) ? base.menu.slice() : [];
+    const idx = menu.findIndex(m => String(m.id) === String(req.params.itemId));
+    if (idx === -1) return res.status(404).json({ success: false, error: 'الوجبة غير موجودة' });
+    menu[idx] = { ...menu[idx], ...req.body, id: menu[idx].id };
+    await ref.set({ ...base, menu }, { merge: true });
+    res.json({ success: true, item: menu[idx] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/restaurants/:id/menu/:itemId — حذف وجبة
+router.delete('/:id/menu/:itemId', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    const ref = db.collection('restaurants').doc(String(req.params.id));
+    const snap = await ref.get();
+    let base = snap.exists ? snap.data() : demoRestaurants.find(r => r.id === req.params.id);
+    if (!base) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
+    const menu = (Array.isArray(base.menu) ? base.menu : []).filter(m => String(m.id) !== String(req.params.itemId));
+    await ref.set({ ...base, menu }, { merge: true });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 module.exports = router;

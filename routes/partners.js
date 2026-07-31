@@ -166,4 +166,100 @@ router.post('/registered_partners/delete', async (req, res) => {
   }
 });
 
+// POST /api/registered_partners — التطبيق يبلّغ عن شريك جديد (توافقية)
+router.post('/registered_partners', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    const b = req.body || {};
+    const io = req.app.get('socketio');
+    if (io) {
+      const payload = { id: b.id || null, name: b.name || '', phone: b.phone || '', type: b.type || b.userType || 'driver', date: new Date() };
+      io.emit('new_partner_request', payload);
+      io.to('manager_monitor').emit('new_partner_request', payload);
+    }
+    res.status(200).json({ success: true, message: 'تم استلام الطلب' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/partner_codes/:code/verify — التحقق من صلاحية الكود قبل التسجيل
+router.get('/partner_codes/:code/verify', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.json({ valid: false, error: 'Database not connected' });
+    const snap = await db.collection('partner_codes').doc(String(req.params.code).toUpperCase().trim()).get();
+    if (!snap.exists) return res.json({ valid: false, error: 'كود الاعتماد غير صحيح ❌' });
+    const c = snap.data();
+    if (c.isUsed) return res.json({ valid: false, error: 'هذا الكود مستخدم سابقاً ❌' });
+    res.json({ valid: true, type: c.type });
+  } catch (error) {
+    res.json({ valid: false, error: error.message });
+  }
+});
+
+// GET /api/partner_status?phone=... أو ?id=... — حالة الشريك (للتحقق من التجميد بالتطبيق)
+router.get('/partner_status', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.json({ status: 'approved' });
+    const { phone, id, email } = req.query;
+    let data = null;
+    if (id) {
+      const d = await db.collection('users').doc(String(id)).get();
+      if (d.exists) data = d.data();
+    } else if (phone || email) {
+      const field = phone ? 'phone' : 'email';
+      const snap = await db.collection('users').where(field, '==', String(phone || email)).limit(1).get();
+      if (!snap.empty) data = snap.docs[0].data();
+    }
+    if (!data) return res.status(404).json({ status: 'unknown', error: 'المستخدم غير موجود' });
+    const status = data.status || 'approved';
+    res.json({
+      status,
+      isFrozen: status === 'frozen',
+      isRejected: status === 'rejected',
+      isPending: status === 'pending',
+      canWork: status === 'approved'
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'unknown', error: error.message });
+  }
+});
+
+// GET /api/top_driver — أفضل مندوب لليوم (إعفاء من العمولة يوم واحد)
+router.get('/top_driver', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.json({ topDriverId: null, deliveries: 0, date: null });
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    const snap = await db.collection('orders').where('status', '==', 'DELIVERED').get();
+    const counts = {};
+    snap.forEach(doc => {
+      const o = doc.data();
+      const ts = o.createdAt && o.createdAt._seconds ? new Date(o.createdAt._seconds * 1000) : null;
+      if (!ts || ts < start) return;
+      const drvId = (o.driver && (o.driver.id || o.driver.phone || o.driver.name)) || o.driverId;
+      if (!drvId) return;
+      const key = String(drvId);
+      if (!counts[key]) counts[key] = { id: key, name: (o.driver && o.driver.name) || key, deliveries: 0 };
+      counts[key].deliveries++;
+    });
+    const list = Object.values(counts).sort((a, b) => b.deliveries - a.deliveries);
+    const top = list[0] || null;
+    res.json({
+      topDriverId: top ? top.id : null,
+      topDriverName: top ? top.name : null,
+      deliveries: top ? top.deliveries : 0,
+      commissionExempt: !!top,
+      period: 'اليوم',
+      date: start.toISOString().slice(0, 10),
+      leaderboard: list.slice(0, 5)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 module.exports = router;
