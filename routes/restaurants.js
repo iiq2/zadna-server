@@ -199,12 +199,15 @@ router.get('/', async (req, res) => {
                   restaurants.push({ id: doc.id, ...doc.data() });
           });
 
-      // Fallback to demo if empty (first time)
-      if (restaurants.length === 0) {
-              return res.json({ success: true, count: demoRestaurants.length, restaurants: demoRestaurants, city: 'نابلس' });
-      }
+      // دمج المطاعم الأساسية مع المسجلة، وإخفاء غير المعتمدة عن الزبائن
+      const showAll = req.query.all === '1' || req.query.all === 'true';
+      const visible = showAll
+        ? restaurants
+        : restaurants.filter(r => !r.status || r.status === 'approved');
+      const ids = new Set(visible.map(r => String(r.id)));
+      const merged = visible.concat(demoRestaurants.filter(d => !ids.has(String(d.id))));
 
-      res.json({ success: true, count: restaurants.length, restaurants: restaurants, city: 'نابلس' });
+      res.json({ success: true, count: merged.length, restaurants: merged, city: 'نابلس' });
     } catch (error) {
           res.status(500).json({ success: false, error: error.message });
     }
@@ -349,6 +352,42 @@ router.delete('/:id/menu/:itemId', async (req, res) => {
     if (!base) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
     const menu = (Array.isArray(base.menu) ? base.menu : []).filter(m => String(m.id) !== String(req.params.itemId));
     await ref.set({ ...base, menu }, { merge: true });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE /api/restaurants/:id — حذف مطعم (للمدير)
+router.delete('/:id', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    await db.collection('restaurants').doc(String(req.params.id)).delete();
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/restaurants/:id/approve — اعتماد المطعم من المدير
+router.post('/:id/approve', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    await db.collection('restaurants').doc(String(req.params.id)).update({ status: 'approved', isActive: true });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/restaurants/:id/freeze — تجميد المطعم
+router.post('/:id/freeze', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    await db.collection('restaurants').doc(String(req.params.id)).update({ status: 'frozen', isActive: false });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
