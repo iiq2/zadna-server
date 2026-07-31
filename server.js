@@ -552,6 +552,12 @@ app.use('/api/mart_products', martRouter);
 const partnersRouter = require('./routes/partners');
 app.use('/api', partnersRouter);
 
+const walletRouter = require('./routes/wallet');
+app.use('/api', walletRouter);
+
+const logsRouter = require('./routes/logs');
+app.use('/api', logsRouter);
+
 // =====================
 // Routes - General
 // =====================
@@ -642,7 +648,10 @@ io.on('connection', (socket) => {
       createdAt: new Date()
     };
 
-    const targetRoom = `order_room_${messagePayload.orderId}`;
+    // الغرف العامة تُستخدم باسمها، وشات الطلب بصيغة order_room_[orderId]
+    const GLOBAL_ROOMS = ['global_driver_chat', 'global_zadna_chat', 'manager_monitor'];
+    const isGlobal = GLOBAL_ROOMS.includes(messagePayload.orderId);
+    const targetRoom = isGlobal ? messagePayload.orderId : `order_room_${messagePayload.orderId}`;
 
     // Save to Firestore if available
     if (db) {
@@ -656,13 +665,12 @@ io.on('connection', (socket) => {
     // Broadcast to specific order room (Customer/Driver sync)
     io.to(targetRoom).emit('receive_message', messagePayload);
 
-    // Also broadcast to global chat if it's the global one
-    if (messagePayload.orderId === 'global_zadna_chat') {
-        io.to('global_zadna_chat').emit('receive_message', messagePayload);
-    }
+    // ملاحظة: الغرف العامة تُبث أعلاه مباشرة عبر targetRoom
 
     // Broadcast to Manager monitor room
-    io.to('manager_monitor').emit('receive_message', messagePayload);
+    if (messagePayload.orderId !== 'manager_monitor') {
+      io.to('manager_monitor').emit('receive_message', messagePayload);
+    }
   });
   
   socket.on('disconnect', () => {
@@ -698,6 +706,16 @@ app.use((req, res) => {
 // Start Server
 // =====================
 const PORT = process.env.PORT || 5000;
+
+// ===== التقاط أخطاء السيرفر تلقائياً =====
+app.use((err, req, res, next) => {
+  console.error(`🐞 [server/${req.method} ${req.path}] ${err.message}`);
+  if (db) { db.collection('error_logs').add({ level:'error', app:'server', screen:`${req.method} ${req.path}`, message:String(err.message).slice(0,500), detail:String(err.stack||'').slice(0,1500), createdAt:new Date() }).catch(()=>{}); }
+  res.status(500).json({ success: false, error: 'حدث خطأ داخلي' });
+});
+process.on('unhandledRejection', (r) => console.error('🐞 [server/unhandledRejection]', r));
+process.on('uncaughtException', (e) => console.error('🐞 [server/uncaughtException]', e.message));
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
   ╔════════════════════════════════════════╗
