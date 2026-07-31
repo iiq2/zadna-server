@@ -59,15 +59,19 @@ router.get('/', async (req, res) => {
           const db = getDb(req);
           const { restaurantId } = req.query;
 
-      let query = db.collection('orders').orderBy('createdAt', 'desc');
-
-      if (restaurantId) {
-              query = query.where('restaurantId', '==', restaurantId);
-      }
+      let query = db.collection('orders');
+    if (restaurantId) {
+      query = query.where('restaurantId', '==', restaurantId);
+    } else {
+      query = query.orderBy('createdAt', 'desc');
+    }
 
       const snapshot = await query.get();
           const orders = [];
           snapshot.forEach(doc => orders.push(doc.data()));
+    if (restaurantId) {
+      orders.sort((a, b) => ((b.createdAt && b.createdAt._seconds) || 0) - ((a.createdAt && a.createdAt._seconds) || 0));
+    }
 
       res.json(orders);
     } catch (error) {
@@ -94,7 +98,11 @@ router.patch('/:id', async (req, res) => {
           }
           if (driver) updateData.driver = driver;
 
-      await db.collection('orders').doc(id).update(updateData);
+      const docRef = db.collection('orders').doc(id);
+    if (!(await docRef.get()).exists) {
+      return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+    }
+    await docRef.update(updateData);
 
       // Notify via sockets
       const io = req.app.get('socketio');
