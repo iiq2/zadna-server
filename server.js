@@ -223,6 +223,38 @@ app.post('/api/auth/register', async (req, res) => {
       const docRef = await db.collection('users').add(newUser);
       const userId = docRef.id;
 
+      // صاحب المطعم: أنشئ مطعمه تلقائياً واربطه بحسابه
+      let createdRestId = null;
+      if (userType === 'restaurant' && ownedRestaurantId && String(ownedRestaurantId).trim()) {
+        try {
+          const restName = String(ownedRestaurantId).trim();
+          createdRestId = 'rest_' + Date.now();
+          await db.collection('restaurants').doc(createdRestId).set({
+            id: createdRestId,
+            name: restName,
+            description: 'مطعم شريك على منصة زادنا',
+            phone: phone,
+            ownerId: userId,
+            ownerEmail: email,
+            emoji: '🍽️',
+            rating: 5,
+            deliveryTime: 25,
+            deliveryFee: 5,
+            categories: [],
+            menu: [],
+            commission: '10%',
+            status: 'pending',
+            isActive: false,
+            isOpen: false,
+            createdAt: new Date()
+          });
+          await db.collection('users').doc(userId).update({ ownedRestaurantId: createdRestId });
+          console.log('🏠 مطعم جديد بانتظار الاعتماد:', restName, createdRestId);
+        } catch (e) {
+          console.error('تعذر إنشاء المطعم:', e.message);
+        }
+      }
+
       // إشعار فوري للوحة المدير بطلب انضمام جديد
       if (isPartner) {
         const ioRT = req.app.get('socketio');
@@ -246,7 +278,8 @@ app.post('/api/auth/register', async (req, res) => {
           email,
           phone,
           userType,
-          ownedRestaurantId: newUser.ownedRestaurantId
+          ownedRestaurantId: createdRestId || newUser.ownedRestaurantId,
+          restaurantName: userType === 'restaurant' ? String(ownedRestaurantId || '').trim() : null
         }
       });
 
@@ -291,7 +324,8 @@ app.post('/api/auth/register', async (req, res) => {
           email: newUser.email,
           phone: newUser.phone,
           userType: newUser.userType,
-          ownedRestaurantId: newUser.ownedRestaurantId
+          ownedRestaurantId: createdRestId || newUser.ownedRestaurantId,
+          restaurantName: userType === 'restaurant' ? String(ownedRestaurantId || '').trim() : null
         }
       });
     }
