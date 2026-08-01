@@ -85,9 +85,27 @@ router.get('/', async (req, res) => {
             return list;
         });
 
-        const orders = restaurantId
+        const filtered = restaurantId
             ? all.filter(o => o.restaurantId === restaurantId)
             : all;
+
+        // نُرفق رقم المطعم مع كل طلب ليتصل به المندوب وقت الاستلام.
+        // نقرأه من نفس كاش المطاعم، فلا يكلّف قراءة إضافية.
+        let phoneById = {};
+        try {
+            const rests = await cached('restaurants:raw', 600000, async () => {
+                const snap = await db.collection('restaurants').get();
+                const list = [];
+                snap.forEach(d => list.push({ id: d.id, ...d.data() }));
+                return list;
+            });
+            rests.forEach(r => { if (r.phone) phoneById[String(r.id)] = String(r.phone); });
+        } catch (e) { /* بلا أرقام أفضل من فشل الطلب كله */ }
+
+        const orders = filtered.map(o => ({
+            ...o,
+            restaurantPhone: o.restaurantPhone || phoneById[String(o.restaurantId)] || ''
+        }));
 
         res.json(orders);
     } catch (error) {
