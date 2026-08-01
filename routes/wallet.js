@@ -63,6 +63,38 @@ function orderBreakdown(o) {
   };
 }
 
+/**
+ * أفضل مندوب اليوم = صاحب أكثر توصيلات منذ منتصف الليل، وهو معفى من
+ * عمولة التوصيل ذلك اليوم. تُحسب هنا مرة واحدة لأن حسابها في مكانين
+ * جعل محفظة المندوب تقول رقماً ولوحة المدير رقماً آخر.
+ */
+function topDriverToday(all, todayStart) {
+  const counts = {};
+  all.forEach(o => {
+    const d = orderDate(o);
+    if (!d || d < todayStart) return;
+    const k = driverKeyOf(o);
+    if (k) counts[k] = (counts[k] || 0) + 1;
+  });
+  return Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0] || null;
+}
+
+// جائزة أفضل مندوب = عرض اسمه. الإعفاء المالي اختياري وتضبطه الإدارة:
+// TOP_DRIVER_WAIVER بين 0 و 1 (0 = بلا إعفاء، 0.5 = نصف العمولة، 1 = كامل).
+const TOP_DRIVER_WAIVER = Math.min(1, Math.max(0, parseFloat(process.env.TOP_DRIVER_WAIVER || '0')));
+
+/** ما يستحقه زادنا من طلب واحد، مع مراعاة نسبة إعفاء أفضل مندوب. */
+function owedFor(b, exempt) {
+  const discount = exempt ? b.drvCommission * TOP_DRIVER_WAIVER : 0;
+  return r2(b.restCommission + b.drvCommission - discount);
+}
+
+/** ما يبقى للمندوب من أجرة التوصيل بعد العمولة (مع الإعفاء إن وُجد). */
+function driverNetFor(b, exempt) {
+  const discount = exempt ? b.drvCommission * TOP_DRIVER_WAIVER : 0;
+  return r2(b.fee - b.drvCommission + discount);
+}
+
 async function settlementsOf(db, driverId) {
   const snap = await db.collection('settlements').where('driverId','==',String(driverId)).get();
   let sum = 0; const items = [];
@@ -84,9 +116,7 @@ router.get('/wallet/driver/:id', async (req, res) => {
 
     // أفضل مندوب اليوم معفى من عمولته
     const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-    const counts = {};
-    all.forEach(o => { const d = orderDate(o); if (!d || d < todayStart) return; const k = driverKeyOf(o); if (k) counts[k] = (counts[k]||0)+1; });
-    const topId = Object.keys(counts).sort((a,b)=>counts[b]-counts[a])[0] || null;
+    const topId = topDriverToday(all, todayStart);
     const isTop = topId === id;
     const isToday = (o) => { const d = orderDate(o); return d && d >= todayStart; };
 
@@ -95,14 +125,19 @@ router.get('/wallet/driver/:id', async (req, res) => {
       const b = orderBreakdown(o);
       collected += b.collectedFromCustomer; paidRest += b.paidToRestaurant;
       const exempt = isTop && isToday(o);
-      owed += b.restCommission + (exempt ? 0 : b.drvCommission);
-      net  += exempt ? b.fee : b.driverNet;
-      if (exempt) waived += b.drvCommission;
+      owed += owedFor(b, exempt);
+      net  += driverNetFor(b, exempt);
+      if (exempt) waived += r2(b.drvCommission * TOP_DRIVER_WAIVER);
     });
 
-    // الإجمالي التاريخي مقابل ما سدّده
+    // الإجمالي التاريخي مقابل ما سدّده.
+    // لا بد أن يطبّق الإعفاء نفسه، وإلا أخبرنا المندوب أنه أُعفي ثم حاسبناه.
     let owedAll = 0;
-    mine.forEach(o => { const b = orderBreakdown(o); owedAll += b.owedToZadna; });
+    mine.forEach(o => {
+      const b = orderBreakdown(o);
+      const exempt = isTop && isToday(o);
+      owedAll += owedFor(b, exempt);
+    });
     const { sum: paid, items: settlements } = await settlementsOf(db, id);
 
     res.json({
@@ -114,6 +149,7 @@ router.get('/wallet/driver/:id', async (req, res) => {
       owedToZadna: r2(owed),
       driverEarnings: r2(net),
       isTopDriverToday: isTop,
+      waiverRate: TOP_DRIVER_WAIVER,
       commissionWaived: r2(waived),
       lifetimeOwed: r2(owedAll),
       totalSettled: paid,
@@ -152,6 +188,7 @@ router.get('/wallet/summary', async (req, res) => {
     if (!db) return res.status(503).json({ success:false, error:'Database not connected' });
     const all = await fetchDelivered(db);
     const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+    const topDriverId = topDriverToday(all, todayStart);
 
     const drivers = {}, rests = {};
     let revenue=0, revenueToday=0, volume=0;
@@ -163,8 +200,12 @@ router.get('/wallet/summary', async (req, res) => {
       if (did) {
         if (!drivers[did]) drivers[did] = { id:did, name:driverNameOf(o), deliveries:0, collected:0, owed:0, owedToday:0, earnings:0 };
         drivers[did].deliveries++; drivers[did].collected += b.collectedFromCustomer;
-        drivers[did].owed += b.owedToZadna; drivers[did].earnings += b.driverNet;
-        if (d && d >= todayStart) drivers[did].owedToday += b.owedToZadna;
+        // نفس قاعدة الإعفاء المطبّقة في محفظة المندوب — رقم واحد للطرفين
+        const exemptD = topDriverId && String(did) === String(topDriverId) && d && d >= todayStart;
+        const owedThis = owedFor(b, exemptD);
+        drivers[did].owed += owedThis;
+        drivers[did].earnings += driverNetFor(b, exemptD);
+        if (d && d >= todayStart) drivers[did].owedToday += owedThis;
       }
       const rid = String(o.restaurantId||'');
       if (rid) {

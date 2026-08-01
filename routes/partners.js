@@ -251,15 +251,24 @@ router.get('/partner_status', async (req, res) => {
 });
 
 // GET /api/top_driver — أفضل مندوب لليوم (إعفاء من العمولة يوم واحد)
+// نسبة إعفاء أفضل مندوب — نفس المتغير المستخدم في المحفظة
+const TOP_DRIVER_WAIVER = Math.min(1, Math.max(0, parseFloat(process.env.TOP_DRIVER_WAIVER || '0')));
+
 router.get('/top_driver', async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.json({ topDriverId: null, deliveries: 0, date: null });
     const start = new Date(); start.setHours(0, 0, 0, 0);
-    const snap = await db.collection('orders').where('status', '==', 'DELIVERED').get();
+    // تطبيق المندوب يستطلع هذا المسار؛ بلا كاش كان كل نداء يقرأ
+    // مجموعة الطلبات كاملة من كل جهاز.
+    const docs = await cached('top_driver:delivered', 300000, async () => {
+      const snap = await db.collection('orders').where('status', '==', 'DELIVERED').get();
+      const out = [];
+      snap.forEach(d => out.push(d.data()));
+      return out;
+    });
     const counts = {};
-    snap.forEach(doc => {
-      const o = doc.data();
+    docs.forEach(o => {
       const ts = o.createdAt && o.createdAt._seconds ? new Date(o.createdAt._seconds * 1000) : null;
       if (!ts || ts < start) return;
       const drvId = (o.driver && (o.driver.id || o.driver.phone || o.driver.name)) || o.driverId;
@@ -274,7 +283,9 @@ router.get('/top_driver', async (req, res) => {
       topDriverId: top ? top.id : null,
       topDriverName: top ? top.name : null,
       deliveries: top ? top.deliveries : 0,
-      commissionExempt: !!top,
+      // الجائزة الأساسية عرض الاسم؛ الإعفاء المالي حسب النسبة المضبوطة
+      commissionExempt: !!top && TOP_DRIVER_WAIVER > 0,
+      waiverRate: TOP_DRIVER_WAIVER,
       period: 'اليوم',
       date: start.toISOString().slice(0, 10),
       leaderboard: list.slice(0, 5)
