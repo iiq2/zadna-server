@@ -3,6 +3,12 @@ const router = express.Router();
 
 // Get Firestore from app
 const getDb = (req) => req.app.get('db');
+const { cached, invalidate, updateCached } = require('../utils/cache');
+// 5 دقائق: آمنة لأن كل إنشاء/تعديل طلب يُبطل الكاش فوراً،
+// و Socket.io يدفع التحديث للأجهزة لحظياً. الاستطلاع مجرد شبكة أمان.
+const ORDERS_TTL = 1800000;  // 30 دقيقة — الكاش يُحدَّث مكانه بعد كل كتابة
+                             // فتبقى البيانات صحيحة، وهذه المدة شبكة أمان فقط
+const ORDERS_LIMIT = 250;  // أحدث 250 طلباً — يغطي أيام العمل بوفرة
 
 // =====================
 // Routes - Orders
@@ -44,6 +50,11 @@ router.post('/', async (req, res) => {
                   });
           }
 
+      // نحدّث الكاش مكانه بدل مسحه — يوفّر قراءة كاملة لكل طلب جديد
+
+      updateCached('orders:all', list => [{ ...orderData, id: orderId }, ...list].slice(0, ORDERS_LIMIT));
+
+
       res.status(201).json({ success: true, id: orderId });
     } catch (error) {
           console.error('❌ خطأ Firestore:', error);
@@ -56,29 +67,36 @@ router.post('/', async (req, res) => {
  */
 router.get('/', async (req, res) => {
     try {
-          const db = getDb(req);
-          const { restaurantId } = req.query;
+        const db = getDb(req);
+        if (!db) return res.json([]);
+        const { restaurantId } = req.query;
 
-      let query = db.collection('orders');
-    if (restaurantId) {
-      query = query.where('restaurantId', '==', restaurantId);
-    } else {
-      query = query.orderBy('createdAt', 'desc');
-    }
+        // نقرأ المجموعة كاملة مرة واحدة ونُخزّنها، ثم نفلتر في الذاكرة.
+        // الفلترة داخل Firestore كانت تعني قراءة جديدة لكل مطعم ولكل استطلاع.
+        const all = await cached('orders:all', ORDERS_TTL, async () => {
+            // سقف القراءة: مجموعة الطلبات تكبر بلا حد، وبدون سقف تصير كل
+            // قراءة أغلى يوماً بعد يوم حتى تلتهم الحصة وحدها.
+            const snapshot = await db.collection('orders')
+                .orderBy('createdAt', 'desc')
+                .limit(ORDERS_LIMIT)
+                .get();
+            const list = [];
+            snapshot.forEach(doc => list.push(doc.data()));
+            return list;
+        });
 
-      const snapshot = await query.get();
-          const orders = [];
-          snapshot.forEach(doc => orders.push(doc.data()));
-    if (restaurantId) {
-      orders.sort((a, b) => ((b.createdAt && b.createdAt._seconds) || 0) - ((a.createdAt && a.createdAt._seconds) || 0));
-    }
+        const orders = restaurantId
+            ? all.filter(o => o.restaurantId === restaurantId)
+            : all;
 
-      res.json(orders);
+        res.json(orders);
     } catch (error) {
-          console.error('❌ خطأ GET Firestore:', error);
-          res.status(500).json({ success: false, error: error.message });
+        console.error('❌ خطأ GET Firestore:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
+
+
 
 /**
  * PATCH /api/orders/:id
@@ -119,6 +137,9 @@ router.patch('/:id', async (req, res) => {
           });
         }
       }
+
+      updateCached('orders:all', list => list.map(o => (String(o.id) === String(id) ? { ...o, ...updateData } : o)));
+
 
       res.json({ success: true });
     } catch (error) {

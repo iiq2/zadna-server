@@ -189,14 +189,18 @@ const demoRestaurants = [
 
 // Get Firestore from app
 const getDb = (req) => req.app.get('db');
+const { cached, invalidate } = require('../utils/cache');
+// 10 دقائق: المطاعم نادرة التغيير، وأي تعديل منيو أو اعتماد يُبطل الكاش.
+const REST_TTL = 600000;
 
 router.get('/', async (req, res) => {
     try {
           const db = getDb(req);
-          const snapshot = await db.collection('restaurants').get();
-          const restaurants = [];
-          snapshot.forEach(doc => {
-                  restaurants.push({ id: doc.id, ...doc.data() });
+          const restaurants = await cached('restaurants:raw', REST_TTL, async () => {
+            const snapshot = await db.collection('restaurants').get();
+            const list = [];
+            snapshot.forEach(doc => list.push({ id: doc.id, ...doc.data() }));
+            return list;
           });
 
       // دمج المطاعم الأساسية مع المسجلة، وإخفاء غير المعتمدة عن الزبائن
@@ -262,6 +266,7 @@ router.get('/:id', async (req, res) => {
 // POST /api/restaurants — صاحب المطعم يسجل مطعمه (يصل للمدير للاعتماد)
 router.post('/', async (req, res) => {
   try {
+    invalidate('restaurants:raw');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const b = req.body || {};
@@ -308,6 +313,7 @@ router.post('/', async (req, res) => {
 // PATCH /api/restaurants/:id — تعديل بيانات المطعم
 router.patch('/:id', async (req, res) => {
   try {
+    invalidate('restaurants:raw');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const ref = db.collection('restaurants').doc(String(req.params.id));
@@ -328,6 +334,7 @@ router.patch('/:id', async (req, res) => {
 // POST /api/restaurants/:id/menu — إضافة وجبة
 router.post('/:id/menu', async (req, res) => {
   try {
+    invalidate('restaurants:raw');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const ref = db.collection('restaurants').doc(String(req.params.id));
@@ -350,6 +357,7 @@ router.post('/:id/menu', async (req, res) => {
 // PATCH /api/restaurants/:id/menu/:itemId — تعديل وجبة (سعر/توفر/وصف)
 router.patch('/:id/menu/:itemId', async (req, res) => {
   try {
+    invalidate('restaurants:raw');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const ref = db.collection('restaurants').doc(String(req.params.id));
@@ -370,6 +378,7 @@ router.patch('/:id/menu/:itemId', async (req, res) => {
 // DELETE /api/restaurants/:id/menu/:itemId — حذف وجبة
 router.delete('/:id/menu/:itemId', async (req, res) => {
   try {
+    invalidate('restaurants:raw');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const ref = db.collection('restaurants').doc(String(req.params.id));
@@ -387,6 +396,7 @@ router.delete('/:id/menu/:itemId', async (req, res) => {
 // DELETE /api/restaurants/:id — حذف مطعم (للمدير)
 router.delete('/:id', async (req, res) => {
   try {
+    invalidate('restaurants:raw');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     await db.collection('restaurants').doc(String(req.params.id)).delete();
@@ -399,6 +409,7 @@ router.delete('/:id', async (req, res) => {
 // POST /api/restaurants/:id/approve — اعتماد المطعم من المدير
 router.post('/:id/approve', async (req, res) => {
   try {
+    invalidate('restaurants:raw');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     await db.collection('restaurants').doc(String(req.params.id)).update({ status: 'approved', isActive: true });
@@ -411,6 +422,7 @@ router.post('/:id/approve', async (req, res) => {
 // POST /api/restaurants/:id/freeze — تجميد المطعم
 router.post('/:id/freeze', async (req, res) => {
   try {
+    invalidate('restaurants:raw');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     await db.collection('restaurants').doc(String(req.params.id)).update({ status: 'frozen', isActive: false });

@@ -2,6 +2,9 @@ const express = require('express');
 const router = express.Router();
 
 const getDb = (req) => req.app.get('db');
+const { cached, invalidate } = require('../utils/cache');
+// 5 دقائق: أي اعتماد أو تجميد أو تسجيل جديد يُبطل الكاش فوراً.
+const PARTNERS_TTL = 300000;
 
 // ==============================
 // أكواد الشركاء الأحادية (partner_codes)
@@ -74,22 +77,25 @@ router.get('/registered_partners', async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.json([]);
-    const partners = [];
-    for (const t of ['driver', 'restaurant']) {
-      const snap = await db.collection('users').where('userType', '==', t).get();
-      snap.forEach(doc => {
-        const u = doc.data();
-        partners.push({
-          id: doc.id,
-          name: u.name || '',
-          phone: u.phone || '',
-          email: u.email || '',
-          type: t,
-          status: u.status || 'approved',
-          date: (u.createdAt && u.createdAt._seconds) ? new Date(u.createdAt._seconds * 1000).toLocaleString('ar-EG') : ''
+    const partners = await cached('partners:all', PARTNERS_TTL, async () => {
+      const list = [];
+      for (const t of ['driver', 'restaurant']) {
+        const snap = await db.collection('users').where('userType', '==', t).get();
+        snap.forEach(doc => {
+          const u = doc.data();
+          list.push({
+            id: doc.id,
+            name: u.name || '',
+            phone: u.phone || '',
+            email: u.email || '',
+            type: t,
+            status: u.status || 'approved',
+            date: (u.createdAt && u.createdAt._seconds) ? new Date(u.createdAt._seconds * 1000).toLocaleString('ar-EG') : ''
+          });
         });
-      });
-    }
+      }
+      return list;
+    });
     res.json(partners);
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -99,6 +105,7 @@ router.get('/registered_partners', async (req, res) => {
 // POST /api/registered_partners/approve
 router.post('/registered_partners/approve', async (req, res) => {
   try {
+    invalidate('partners:all');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const { id } = req.body || {};
@@ -113,6 +120,7 @@ router.post('/registered_partners/approve', async (req, res) => {
 // POST /api/registered_partners/reject
 router.post('/registered_partners/reject', async (req, res) => {
   try {
+    invalidate('partners:all');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const { id } = req.body || {};
@@ -130,6 +138,7 @@ router.post('/registered_partners/reject', async (req, res) => {
 // POST /api/registered_partners/freeze — تجميد مؤقت
 router.post('/registered_partners/freeze', async (req, res) => {
   try {
+    invalidate('partners:all');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const { id } = req.body || {};
@@ -148,6 +157,7 @@ router.post('/registered_partners/freeze', async (req, res) => {
 // POST /api/registered_partners/unfreeze — فك التجميد (يرجع معتمد)
 router.post('/registered_partners/unfreeze', async (req, res) => {
   try {
+    invalidate('partners:all');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const { id } = req.body || {};
@@ -164,6 +174,7 @@ router.post('/registered_partners/unfreeze', async (req, res) => {
 // POST /api/registered_partners/delete
 router.post('/registered_partners/delete', async (req, res) => {
   try {
+    invalidate('partners:all');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const { id } = req.body || {};
@@ -178,6 +189,7 @@ router.post('/registered_partners/delete', async (req, res) => {
 // POST /api/registered_partners — التطبيق يبلّغ عن شريك جديد (توافقية)
 router.post('/registered_partners', async (req, res) => {
   try {
+    invalidate('partners:all');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const b = req.body || {};
