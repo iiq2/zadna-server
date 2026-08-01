@@ -592,6 +592,9 @@ app.use('/api', walletRouter);
 const logsRouter = require('./routes/logs');
 app.use('/api', logsRouter);
 
+const zonesRouter = require('./routes/zones');
+app.use('/api', zonesRouter);
+
 // =====================
 // Routes - General
 // =====================
