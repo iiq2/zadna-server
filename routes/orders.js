@@ -8,7 +8,22 @@ const { cached, invalidate, updateCached } = require('../utils/cache');
 // و Socket.io يدفع التحديث للأجهزة لحظياً. الاستطلاع مجرد شبكة أمان.
 const ORDERS_TTL = 1800000;  // 30 دقيقة — الكاش يُحدَّث مكانه بعد كل كتابة
                              // فتبقى البيانات صحيحة، وهذه المدة شبكة أمان فقط
-const ORDERS_LIMIT = 250;  // أحدث 250 طلباً — يغطي أيام العمل بوفرة
+const ORDERS_LIMIT = 250;
+
+// الترجمة العربية لكل الحالات. كانت ناقصة فتُخزَّن الحالات غير المذكورة
+// باسمها الإنجليزي ويراها الزبون هكذا: "AT_RESTAURANT" بدل نص مفهوم.
+const STATUS_AR = {
+  PENDING_RESTAURANT: 'بانتظار موافقة المطعم ⏳',
+  ACCEPTED:           'المطعم قبل طلبك ✅',
+  PREPARING:          'قيد التحضير 👨‍🍳',
+  READY_FOR_PICKUP:   'جاهز — بانتظار مندوب 📦',
+  DRIVER_ASSIGNED:    'المندوب قبل الطلب 🛵',
+  AT_RESTAURANT:      'المندوب وصل المطعم 📍',
+  PICKED_UP:          'المندوب استلم طلبك وفي الطريق إليك 🚀',
+  ON_THE_WAY:         'المندوب في الطريق إليك 🛵',
+  DELIVERED:          'تم التوصيل ✅',
+  CANCELLED:          'ملغي ❌'
+};  // أحدث 250 طلباً — يغطي أيام العمل بوفرة
 
 // =====================
 // Routes - Orders
@@ -128,9 +143,7 @@ router.patch('/:id', async (req, res) => {
       const updateData = {};
           if (status) {
                   updateData.status = status;
-                  updateData.statusAr = status === 'ON_THE_WAY' ? 'في الطريق إليك 🛵' :
-                                              status === 'DELIVERED' ? 'تم التسليم ✅' :
-                                              status === 'PREPARING' ? 'قيد التحضير 👨‍🍳' : status;
+                  updateData.statusAr = STATUS_AR[status] || status;
           }
           if (driver) updateData.driver = driver;
 
