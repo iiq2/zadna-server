@@ -46,7 +46,13 @@ router.post('/', needsIdentity, async (req, res) => {
       const orderId = orderData.id || 'ORD_' + Date.now();
 
       // Check if Mart Order
-      const isMart = orderData.restaurantId === 'mart_001';
+      // طلبات المارت تذهب للمناديب مباشرة — لا مطعم يوافق عليها.
+      // كان الفحص بالمعرّف فقط بينما التطبيق يفحص الاسم أيضاً؛ أي اختلاف
+      // بينهما يترك طلب مارت عالقاً في "بانتظار موافقة المطعم" إلى الأبد.
+      const restNameRaw = String(orderData.restaurant || orderData.restaurantName || '');
+      const isMart = orderData.restaurantId === 'mart_001'
+        || restNameRaw.includes('مارت')
+        || restNameRaw.toLowerCase().includes('mart');
           if (isMart) {
                   orderData.statusAr = "جاهز للتسليم 📦";
                   orderData.status = "READY_FOR_PICKUP";
@@ -89,7 +95,7 @@ router.get('/', async (req, res) => {
     try {
         const db = getDb(req);
         if (!db) return res.json([]);
-        const { restaurantId, driverId } = req.query;
+        const { restaurantId, driverId, customerPhone } = req.query;
 
         // نقرأ المجموعة كاملة مرة واحدة ونُخزّنها، ثم نفلتر في الذاكرة.
         // الفلترة داخل Firestore كانت تعني قراءة جديدة لكل مطعم ولكل استطلاع.
@@ -118,6 +124,11 @@ router.get('/', async (req, res) => {
         let filtered = all;
         if (restaurantId) {
             filtered = filtered.filter(o => o.restaurantId === restaurantId);
+        }
+        if (customerPhone) {
+            // بدونها كان كل زبون يرى طلبات كل زبائن المنصة بأسمائهم وأرقامهم
+            const want = String(customerPhone).trim();
+            filtered = filtered.filter(o => String(o.customerPhone || '').trim() === want);
         }
         if (driverId) {
             // كان أي مندوب يرى طلبات كل المناديب ويستطيع تعليمها "تم التوصيل"
