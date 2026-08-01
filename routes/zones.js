@@ -2,6 +2,15 @@ const express = require('express');
 const router = express.Router();
 
 const getDb = (req) => req.app.get('db');
+/**
+ * أسعار التوصيل ومراكز المناطق — للإدارة وحدها.
+ * كانت مفتوحة: أي أحد يغيّر سعر أي منطقة بطلب واحد، وقد اكتُشفت
+ * أثناء اختبار الحماية حين تغيّر سعر وسط البلد إلى 99 ₪.
+ */
+const adminOnly = (req, res, next) => {
+  const fn = req.app.get('requireAdmin');
+  return fn ? fn(req, res, next) : next();
+};
 
 // مناطق التوصيل وأسعارها — نابلس
 //
@@ -113,7 +122,7 @@ router.get('/delivery_zones', async (req, res) => {
 });
 
 // POST /api/delivery_zones — إضافة/تعديل منطقة
-router.post('/delivery_zones', async (req, res) => {
+router.post('/delivery_zones', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
@@ -133,7 +142,7 @@ router.post('/delivery_zones', async (req, res) => {
 });
 
 // PATCH /api/delivery_zones/:id — تعديل سعر منطقة
-router.patch('/delivery_zones/:id', async (req, res) => {
+router.patch('/delivery_zones/:id', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
@@ -159,7 +168,7 @@ router.patch('/delivery_zones/:id', async (req, res) => {
 });
 
 // DELETE /api/delivery_zones/:id — إخفاء منطقة
-router.delete('/delivery_zones/:id', async (req, res) => {
+router.delete('/delivery_zones/:id', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
