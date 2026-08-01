@@ -151,10 +151,14 @@ function requireIdentity(req, res, next) {
 
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) {
+    // نسجّل سبب الرفض؛ بدونه يفشل الطلب بصمت ولا نعرف أهو غياب توكن أم بطلانه
+    console.warn('🔒 رفض بلا توكن:', req.method, req.originalUrl,
+                 '| Authorization:', req.headers.authorization ? 'موجود لكن بصيغة خاطئة' : 'غير مرسل');
     return res.status(401).json({ success: false, error: 'مطلوب تسجيل دخول لتنفيذ هذه العملية' });
   }
   const decoded = verifyToken(token);
   if (!decoded) {
+    console.warn('🔒 توكن مرفوض:', req.method, req.originalUrl, '| طوله:', token.length);
     return res.status(401).json({ success: false, error: 'انتهت جلستك — سجّل دخولك من جديد' });
   }
   req.user = decoded;
