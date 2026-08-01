@@ -81,7 +81,9 @@ const registerSchema = Joi.object({
   password: Joi.string().required().min(6),
   userType: Joi.string().valid('customer', 'driver', 'restaurant', 'manager').required(),
   adminCode: Joi.string().optional().allow(''),
-  ownedRestaurantId: Joi.string().optional().allow(null)
+  // النسخ القديمة من التطبيق ترسل نصاً فارغاً لغير المطاعم، وJoi يرفضه
+  // افتراضياً فيفشل تسجيل كل زبون ومندوب. نقبله ونعامله كـ null.
+  ownedRestaurantId: Joi.string().optional().allow(null, '')
 });
 
 const loginSchema = Joi.object({
@@ -142,6 +144,10 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     console.log('📝 طلب تسجيل جديد من:', req.body.email);
 
+    // نطبّع الحقول الاختيارية قبل التحقق
+    if (req.body && typeof req.body.ownedRestaurantId === 'string' && !req.body.ownedRestaurantId.trim()) {
+      req.body.ownedRestaurantId = null;
+    }
     const { error, value } = registerSchema.validate(req.body);
     if (error) {
       return res.status(400).json({
