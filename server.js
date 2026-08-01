@@ -130,6 +130,48 @@ function authMiddleware(req, res, next) {
   next();
 }
 
+/**
+ * توثيق مرن: يقبل توكن مستخدم صالح أو مفتاح إدارة.
+ * سبب المرونة أن لوحة المدير تطبيق سطح مكتب لا يسجّل دخولاً بتوكن،
+ * بينما التطبيقات تستعمل التوكن. الاثنان يحتاجان نفس المسارات.
+ *
+ * ADMIN_KEY يُضبط من متغيرات البيئة على Render. إن لم يُضبط،
+ * يُسمح بمرور طلبات الإدارة مؤقتاً مع تحذير في السجل — كي لا تتوقف
+ * لوحتك فجأة قبل أن تضبط المفتاح.
+ */
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
+function requireIdentity(req, res, next) {
+  const adminKey = req.headers['x-admin-key'];
+  if (ADMIN_KEY && adminKey === ADMIN_KEY) { req.isAdmin = true; return next(); }
+  if (!ADMIN_KEY && adminKey) {
+    console.warn('⚠️ ADMIN_KEY غير مضبوط على السيرفر — طلب إدارة مرّ بلا تحقق:', req.method, req.originalUrl);
+    req.isAdmin = true; return next();
+  }
+
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ success: false, error: 'مطلوب تسجيل دخول لتنفيذ هذه العملية' });
+  }
+  const decoded = verifyToken(token);
+  if (!decoded) {
+    return res.status(401).json({ success: false, error: 'انتهت جلستك — سجّل دخولك من جديد' });
+  }
+  req.user = decoded;
+  next();
+}
+
+/** عمليات لا يجوز إلا للإدارة: التسويات، الأسعار، الاعتماد والتجميد. */
+function requireAdmin(req, res, next) {
+  requireIdentity(req, res, () => {
+    if (req.isAdmin) return next();
+    return res.status(403).json({ success: false, error: 'هذه العملية للإدارة فقط' });
+  });
+}
+
+app.set('requireIdentity', requireIdentity);
+app.set('requireAdmin', requireAdmin);
+
 const demoUsers = [];
 
 // =====================
