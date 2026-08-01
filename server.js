@@ -102,7 +102,9 @@ function generateToken(userId, userType) {
   return jwt.sign(
     { userId, userType },
     JWT_SECRET_ACTIVE,
-    { expiresIn: '7d' }
+    // 90 يوماً: تطبيقات التوصيل تُبقي المستخدم داخلاً لأشهر. سبعة أيام
+    // كانت تجبره على كتابة بريده وكلمة سره كل أسبوع بلا سبب.
+    { expiresIn: process.env.TOKEN_DAYS ? process.env.TOKEN_DAYS + 'd' : '90d' }
   );
 }
 
@@ -388,6 +390,90 @@ app.post('/api/auth/register', async (req, res) => {
       success: false,
       error: `حدث خطأ داخلي: ${error.message}`
     });
+  }
+});
+
+/**
+ * POST /api/auth/google
+ * دخول أو تسجيل بحساب جوجل.
+ *
+ * التطبيق يرسل توكن فايربيز، والسيرفر يتحقق منه بالمفتاح السرّي الموجود عنده
+ * أصلاً — فلا يستطيع أحد انتحال هوية بإرسال بريد إلكتروني فقط.
+ *
+ * الزبائن فقط: الكباتن والمطاعم يمرّون بكود اعتماد الشريك وموافقة الإدارة،
+ * ولا يجوز أن يلتفّ أحد على ذلك بضغطة زر جوجل.
+ */
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { idToken } = req.body || {};
+    if (!idToken) {
+      return res.status(400).json({ success: false, error: 'توكن جوجل مفقود' });
+    }
+
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken);
+    } catch (e) {
+      console.warn('🔒 توكن جوجل مرفوض:', e.message);
+      return res.status(401).json({ success: false, error: 'تعذّر التحقق من حساب جوجل — حاول مجدداً' });
+    }
+
+    const email = String(decoded.email || '').trim().toLowerCase();
+    if (!email) {
+      return res.status(400).json({ success: false, error: 'حساب جوجل بلا بريد إلكتروني' });
+    }
+    const name = decoded.name || email.split('@')[0];
+    const picture = decoded.picture || null;
+
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'قاعدة البيانات غير متصلة' });
+    }
+
+    // حساب موجود؟ ندخله. غير موجود؟ ننشئه كزبون.
+    const snap = await db.collection('users').where('email', '==', email).limit(1).get();
+
+    let userId, userDoc;
+    if (!snap.empty) {
+      userId = snap.docs[0].id;
+      userDoc = snap.docs[0].data();
+      if (userDoc.isFrozen === true || userDoc.isRejected === true) {
+        return res.status(403).json({ success: false, error: 'حسابك موقوف — تواصل مع إدارة زادنا' });
+      }
+    } else {
+      const ref = await db.collection('users').add({
+        name,
+        email,
+        phone: '',                 // يُطلب من الزبون عند أول طلب — لا نخترع رقماً
+        userType: 'customer',
+        profileImage: picture,
+        authProvider: 'google',    // لا كلمة سر لهذا الحساب
+        isActive: true,
+        walletBalance: 0,
+        createdAt: new Date()
+      });
+      userId = ref.id;
+      userDoc = { name, email, phone: '', userType: 'customer', profileImage: picture };
+      console.log('✅ حساب جديد بجوجل:', email);
+    }
+
+    const token = generateToken(userId, userDoc.userType || 'customer');
+    return res.json({
+      success: true,
+      message: 'أهلاً بك في زادنا 👋',
+      token,
+      user: {
+        id: userId,
+        name: userDoc.name || name,
+        email,
+        phone: userDoc.phone || '',
+        userType: userDoc.userType || 'customer',
+        profileImage: userDoc.profileImage || picture,
+        ownedRestaurantId: userDoc.ownedRestaurantId || null
+      }
+    });
+  } catch (error) {
+    console.error('❌ خطأ بدخول جوجل:', error);
+    return res.status(500).json({ success: false, error: 'خطأ داخلي — حاول مجدداً' });
   }
 });
 
