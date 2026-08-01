@@ -4,14 +4,19 @@ const router = express.Router();
 const getDb = (req) => req.app.get('db');
 
 // مناطق التوصيل وأسعارها — نابلس
+//
+// حقلا lat/lng هما مركز المنطقة، يُستخدمان لتحديد أقرب منطقة لدبوس الزبون.
+// المضبوطة هنا مصدرها مراجع جغرافية موثّقة فقط؛ بقية المناطق تُترك فارغة
+// عمداً — يضبطها المدير من خريطة اللوحة لأنه أدرى بحدود أحياء نابلس،
+// وتخمينها يعني احتساب سعر خاطئ على الزبون.
 const DEFAULT_ZONES = [
   // داخل المدينة — المطاعم غالباً هنا
-  { id: 'z01', nameAr: 'وسط البلد (الدوار والمحيط)', fee: 10, group: 'داخل المدينة', level: 0 },
+  { id: 'z01', nameAr: 'وسط البلد (الدوار والمحيط)', fee: 10, group: 'داخل المدينة', level: 0, lat: 32.22111, lng: 35.25444 },
   { id: 'z02', nameAr: 'شارع سفيان', fee: 10, group: 'داخل المدينة', level: 0 },
   { id: 'z03', nameAr: 'شارع فيصل', fee: 15, group: 'داخل المدينة', level: 1 },
   { id: 'z04', nameAr: 'المنطقة الصناعية الشرقية', fee: 15, group: 'داخل المدينة', level: 1 },
-  { id: 'z05', nameAr: 'رفيديا (الشوارع الرئيسية والمحيط السفلي)', fee: 15, group: 'داخل المدينة', level: 1 },
-  { id: 'z06', nameAr: 'المخيمات القريبة (عين بيت الماء، عسكر، بلاطة)', fee: 15, group: 'داخل المدينة', level: 1 },
+  { id: 'z05', nameAr: 'رفيديا (الشوارع الرئيسية والمحيط السفلي)', fee: 15, group: 'داخل المدينة', level: 1, lat: 32.20564, lng: 35.23461 },
+  { id: 'z06', nameAr: 'المخيمات القريبة (عين بيت الماء، عسكر، بلاطة)', fee: 15, group: 'داخل المدينة', level: 1, lat: 32.20641, lng: 35.28658 },
   // المرتفعات — طلوع جبل، +5 شيكل
   { id: 'z07', nameAr: 'الجبل الشمالي (الشيخ مسلم، خلة العامود)', fee: 20, group: 'المرتفعات', level: 2 },
   { id: 'z08', nameAr: 'حي نمساوي وحي الفاطمية', fee: 20, group: 'المرتفعات', level: 2 },
@@ -33,6 +38,28 @@ const GROUP_MIN = { 'داخل المدينة': 10, 'المرتفعات': 15, 'ا
 
 // إضافة على السعر إذا كان المطعم نفسه خارج وسط البلد (بُعد الالتقاط)
 const PICKUP_SURCHARGE = { 0: 0, 1: 0, 2: 5, 3: 10 };
+
+/** المسافة بالكيلومترات بين إحداثيتين (هافرساين). */
+function distanceKm(aLat, aLng, bLat, bLng) {
+  const R = 6371;
+  const toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(bLat - aLat), dLng = toRad(bLng - aLng);
+  const h = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+/** أقرب منطقة لها إحداثيات مضبوطة. تتجاهل المناطق غير المضبوطة. */
+function nearestZone(zones, lat, lng) {
+  let best = null, bestKm = Infinity;
+  zones.forEach(z => {
+    if (typeof z.lat !== 'number' || typeof z.lng !== 'number') return;
+    if (z.active === false) return;
+    const km = distanceKm(lat, lng, z.lat, z.lng);
+    if (km < bestKm) { bestKm = km; best = z; }
+  });
+  return best ? { zone: best, km: Math.round(bestKm * 100) / 100 } : null;
+}
 
 function zoneById(id, overrides = {}) {
   const base = DEFAULT_ZONES.find(z => z.id === id);
@@ -113,6 +140,12 @@ router.patch('/delivery_zones/:id', async (req, res) => {
     const id = String(req.params.id);
     const base = DEFAULT_ZONES.find(z => z.id === id) || {};
     const body = { ...req.body };
+    ['lat', 'lng'].forEach(k => {
+      if (body[k] != null && body[k] !== '') {
+        const v = parseFloat(body[k]);
+        if (!isNaN(v)) body[k] = v; else delete body[k];
+      } else if (body[k] === '') { body[k] = null; }
+    });
     if (body.fee != null) {
       const f = Number(body.fee);
       if (isNaN(f) || f < 0) return res.status(400).json({ success: false, error: 'سعر غير صحيح' });
@@ -163,6 +196,50 @@ router.get('/delivery_quote', async (req, res) => {
       success: true, fee: q.fee, baseFee: q.baseFee, surcharge: q.surcharge,
       zoneName: cz.nameAr, restaurantZoneName: rz ? rz.nameAr : null,
       note: q.surcharge > 0 ? `+${q.surcharge} ₪ لأن المطعم خارج وسط البلد` : null
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// GET /api/resolve_zone?lat=&lng= — أقرب منطقة لدبوس الزبون
+router.get('/resolve_zone', async (req, res) => {
+  try {
+    const lat = parseFloat(req.query.lat), lng = parseFloat(req.query.lng);
+    if (isNaN(lat) || isNaN(lng)) {
+      return res.status(400).json({ success: false, error: 'إحداثيات غير صحيحة' });
+    }
+    const db = getDb(req);
+    let overrides = {};
+    if (db) {
+      try {
+        const snap = await db.collection('delivery_zones').get();
+        snap.forEach(d => { overrides[d.id] = d.data(); });
+      } catch (e) { /* حصة منتهية — نكمل بالافتراضي */ }
+    }
+    const baseIds = new Set(DEFAULT_ZONES.map(z => z.id));
+    const merged = DEFAULT_ZONES.map(z => (overrides[z.id] ? { ...z, ...overrides[z.id], id: z.id } : z));
+    Object.keys(overrides).forEach(id => {
+      if (!baseIds.has(id)) merged.push({ ...overrides[id], id });
+    });
+
+    const hit = nearestZone(merged, lat, lng);
+    if (!hit) {
+      return res.json({
+        success: true, zone: null,
+        note: 'لم تُضبط إحداثيات أي منطقة بعد — اختر منطقتك يدوياً'
+      });
+    }
+    // بعيد جداً عن كل المناطق المعروفة: نقترح لكن ننبّه
+    const farAway = hit.km > 8;
+    res.json({
+      success: true,
+      zoneId: hit.zone.id,
+      zoneName: hit.zone.nameAr,
+      fee: hit.zone.fee,
+      distanceKm: hit.km,
+      confident: !farAway,
+      note: farAway ? 'موقعك بعيد عن مناطق التغطية — تأكد من اختيارك' : null
     });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
