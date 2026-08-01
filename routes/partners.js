@@ -2,6 +2,11 @@ const express = require('express');
 const router = express.Router();
 
 const getDb = (req) => req.app.get('db');
+/** اعتماد الشركاء وتجميدهم وتوليد الأكواد — للإدارة وحدها. */
+const adminOnly = (req, res, next) => {
+  const fn = req.app.get('requireAdmin');
+  return fn ? fn(req, res, next) : next();
+};
 const { cached, invalidate } = require('../utils/cache');
 // 5 دقائق: أي اعتماد أو تجميد أو تسجيل جديد يُبطل الكاش فوراً.
 const PARTNERS_TTL = 300000;
@@ -12,7 +17,7 @@ const PARTNERS_TTL = 300000;
 // ==============================
 
 // POST /api/partner_codes — توليد كود جديد من لوحة المدير
-router.post('/partner_codes', async (req, res) => {
+router.post('/partner_codes', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
@@ -56,7 +61,7 @@ router.get('/partner_codes', async (req, res) => {
 });
 
 // DELETE /api/partner_codes/:code — حذف/إبطال كود
-router.delete('/partner_codes/:code', async (req, res) => {
+router.delete('/partner_codes/:code', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
@@ -103,7 +108,7 @@ router.get('/registered_partners', async (req, res) => {
 });
 
 // POST /api/registered_partners/approve
-router.post('/registered_partners/approve', async (req, res) => {
+router.post('/registered_partners/approve', adminOnly, async (req, res) => {
   try {
     invalidate('partners:all');
     const db = getDb(req);
@@ -118,7 +123,7 @@ router.post('/registered_partners/approve', async (req, res) => {
 });
 
 // POST /api/registered_partners/reject
-router.post('/registered_partners/reject', async (req, res) => {
+router.post('/registered_partners/reject', adminOnly, async (req, res) => {
   try {
     invalidate('partners:all');
     const db = getDb(req);
@@ -136,7 +141,7 @@ router.post('/registered_partners/reject', async (req, res) => {
 });
 
 // POST /api/registered_partners/freeze — تجميد مؤقت
-router.post('/registered_partners/freeze', async (req, res) => {
+router.post('/registered_partners/freeze', adminOnly, async (req, res) => {
   try {
     invalidate('partners:all');
     const db = getDb(req);
@@ -155,7 +160,7 @@ router.post('/registered_partners/freeze', async (req, res) => {
 });
 
 // POST /api/registered_partners/unfreeze — فك التجميد (يرجع معتمد)
-router.post('/registered_partners/unfreeze', async (req, res) => {
+router.post('/registered_partners/unfreeze', adminOnly, async (req, res) => {
   try {
     invalidate('partners:all');
     const db = getDb(req);
@@ -172,7 +177,7 @@ router.post('/registered_partners/unfreeze', async (req, res) => {
 });
 
 // POST /api/registered_partners/delete
-router.post('/registered_partners/delete', async (req, res) => {
+router.post('/registered_partners/delete', adminOnly, async (req, res) => {
   try {
     invalidate('partners:all');
     const db = getDb(req);

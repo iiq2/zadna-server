@@ -8873,6 +8873,11 @@ const defaultMartProducts = [
 ];
 
 const getDb = (req) => req.app.get('db');
+/** تعديل كتالوج المارت وأسعاره — للإدارة وحدها. */
+const adminOnly = (req, res, next) => {
+  const fn = req.app.get('requireAdmin');
+  return fn ? fn(req, res, next) : next();
+};
 
 // GET /api/mart_categories — الأقسام
 router.get('/mart_categories', (req, res) => res.json(MART_CATEGORIES));
@@ -8907,7 +8912,7 @@ router.get('/', async (req, res) => {
 });
 
 // POST /api/mart_products — إضافة/تحديث منتج
-router.post('/', async (req, res) => {
+router.post('/', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
@@ -8921,7 +8926,7 @@ router.post('/', async (req, res) => {
 });
 
 // PATCH /api/mart_products/:id — تعديل سعر أو توفر
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
@@ -8935,7 +8940,7 @@ router.patch('/:id', async (req, res) => {
 });
 
 // PATCH /api/mart_products/bulk/category — تعديل أسعار قسم كامل بنسبة مئوية
-router.patch('/bulk/category', async (req, res) => {
+router.patch('/bulk/category', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
@@ -8956,7 +8961,7 @@ router.patch('/bulk/category', async (req, res) => {
 });
 
 // DELETE /api/mart_products/:id
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });

@@ -3,6 +3,11 @@ const router = express.Router();
 
 // Get Firestore from app
 const getDb = (req) => req.app.get('db');
+/** إنشاء طلب أو تغيير حالته يتطلب هوية — كان أي أحد يعلّم أي طلب "تم التسليم". */
+const needsIdentity = (req, res, next) => {
+  const fn = req.app.get('requireIdentity');
+  return fn ? fn(req, res, next) : next();
+};
 const { cached, invalidate, updateCached } = require('../utils/cache');
 // 5 دقائق: آمنة لأن كل إنشاء/تعديل طلب يُبطل الكاش فوراً،
 // و Socket.io يدفع التحديث للأجهزة لحظياً. الاستطلاع مجرد شبكة أمان.
@@ -32,7 +37,7 @@ const STATUS_AR = {
 /**
  * POST /api/orders
  */
-router.post('/', async (req, res) => {
+router.post('/', needsIdentity, async (req, res) => {
     try {
           const db = getDb(req);
           const orderData = req.body;
@@ -84,7 +89,7 @@ router.get('/', async (req, res) => {
     try {
         const db = getDb(req);
         if (!db) return res.json([]);
-        const { restaurantId } = req.query;
+        const { restaurantId, driverId } = req.query;
 
         // نقرأ المجموعة كاملة مرة واحدة ونُخزّنها، ثم نفلتر في الذاكرة.
         // الفلترة داخل Firestore كانت تعني قراءة جديدة لكل مطعم ولكل استطلاع.
@@ -100,9 +105,26 @@ router.get('/', async (req, res) => {
             return list;
         });
 
-        const filtered = restaurantId
-            ? all.filter(o => o.restaurantId === restaurantId)
-            : all;
+        // مفتاح المندوب على الطلب قد يكون كائناً متداخلاً أو حقلاً مسطّحاً
+        const drvKeyOf = (o) => {
+            if (o.driver && typeof o.driver === 'object') {
+                return String(o.driver.id || o.driver.phone || o.driver.name || '');
+            }
+            return String(o.driverId || '');
+        };
+        // الطلب متاح لأي مندوب ما دام لم يقبله أحد
+        const UNASSIGNED = ['READY_FOR_PICKUP', 'PENDING_RESTAURANT', 'ACCEPTED', 'PREPARING'];
+
+        let filtered = all;
+        if (restaurantId) {
+            filtered = filtered.filter(o => o.restaurantId === restaurantId);
+        }
+        if (driverId) {
+            // كان أي مندوب يرى طلبات كل المناديب ويستطيع تعليمها "تم التوصيل"
+            filtered = filtered.filter(o =>
+                drvKeyOf(o) === String(driverId) || UNASSIGNED.includes(String(o.status))
+            );
+        }
 
         // نُرفق رقم المطعم مع كل طلب ليتصل به المندوب وقت الاستلام.
         // نقرأه من نفس كاش المطاعم، فلا يكلّف قراءة إضافية.
@@ -134,7 +156,7 @@ router.get('/', async (req, res) => {
 /**
  * PATCH /api/orders/:id
  */
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', needsIdentity, async (req, res) => {
     try {
           const db = getDb(req);
           const { id } = req.params;

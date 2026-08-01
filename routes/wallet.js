@@ -2,6 +2,11 @@ const express = require('express');
 const router = express.Router();
 
 const getDb = (req) => req.app.get('db');
+/** تسجيل تسوية يخفض دين مندوب — للإدارة وحدها. كان مفتوحاً للإنترنت. */
+const adminOnly = (req, res, next) => {
+  const fn = req.app.get('requireAdmin');
+  return fn ? fn(req, res, next) : next();
+};
 
 // ===== نموذج التحصيل =====
 // المندوب يدفع للمطعم كاش وقت الاستلام (ثمن الوجبة ناقص عمولة زادنا)
@@ -243,7 +248,7 @@ router.get('/wallet/summary', async (req, res) => {
 });
 
 // POST /api/wallet/settlement — تسجيل تسديد المندوب
-router.post('/wallet/settlement', async (req, res) => {
+router.post('/wallet/settlement', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success:false, error:'Database not connected' });
