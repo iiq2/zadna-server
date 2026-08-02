@@ -22,6 +22,47 @@ const needsIdentity = (req, res, next) => {
   return fn ? fn(req, res, next) : next();
 };
 
+/**
+ * هل هذا المستخدم يملك هذا المطعم؟
+ *
+ * الرابط مسجَّل باتجاهين مختلفين حسب طريقة الإنشاء:
+ *   • مطعم أنشأه شريك بالتسجيل  → `restaurant.ownerId` يشير إلى المستخدم
+ *   • مطعم مضاف من البداية      → `user.ownedRestaurantId` يشير إلى المطعم
+ *
+ * والـ14 مطعماً الأصلية أُنشئت بلا `ownerId` إطلاقاً، فالفحص باتجاه واحد
+ * كان يرفض أصحابها جميعاً بـ403 — يضغط صاحب المطعم «إغلاق» فيُمنع بلا سبب
+ * مفهوم. نفحص الاتجاهين، ونُصلح البيانات عند أول تطابق ناجح.
+ */
+async function ownsRestaurant(db, req, restaurantId, restaurantData) {
+  if (req.isAdmin) return true;
+  const meId = req.user && (req.user.userId || req.user.id);
+  if (!meId) return false;
+
+  // الاتجاه الأول: المطعم يعرف مالكه
+  if (restaurantData && restaurantData.ownerId &&
+      String(restaurantData.ownerId) === String(meId)) return true;
+
+  // الاتجاه الثاني: المستخدم يعرف مطعمه
+  try {
+    const u = await db.collection('users').doc(String(meId)).get();
+    if (!u.exists) return false;
+    const owned = u.data().ownedRestaurantId;
+    if (owned && String(owned) === String(restaurantId)) {
+      // نُثبّت الرابط على المطعم أيضاً، فلا يتكرر البحث ولا يبقى الحقل ناقصاً
+      if (!restaurantData || !restaurantData.ownerId) {
+        try {
+          await db.collection('restaurants').doc(String(restaurantId))
+                  .update({ ownerId: String(meId) });
+          invalidate('restaurants:raw');
+          console.log('🔗 رُبط المطعم', restaurantId, 'بمالكه', meId);
+        } catch (e) { /* الصلاحية ثابتة سواء نجح الإصلاح أم لا */ }
+      }
+      return true;
+    }
+  } catch (e) { /* تعذّر السؤال — نرفض بأمان */ }
+  return false;
+}
+
 const demoRestaurants = [
   {
         id: 'rest_001',
@@ -497,10 +538,7 @@ router.patch('/:id/location', needsIdentity, async (req, res) => {
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
 
-    const r = doc.data();
-    const meId = req.user && (req.user.userId || req.user.id);
-    const isOwner = meId && r.ownerId && String(r.ownerId) === String(meId);
-    if (!req.isAdmin && !isOwner) {
+    if (!(await ownsRestaurant(db, req, req.params.id, doc.data()))) {
       return res.status(403).json({ success: false, error: 'لا تملك صلاحية تعديل موقع هذا المطعم' });
     }
 
@@ -541,10 +579,7 @@ router.patch('/:id/open', needsIdentity, async (req, res) => {
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
 
-    const r = doc.data();
-    const meId = req.user && (req.user.userId || req.user.id);
-    const isOwner = meId && r.ownerId && String(r.ownerId) === String(meId);
-    if (!req.isAdmin && !isOwner) {
+    if (!(await ownsRestaurant(db, req, req.params.id, doc.data()))) {
       return res.status(403).json({ success: false, error: 'لا تملك صلاحية تغيير حالة هذا المطعم' });
     }
 
