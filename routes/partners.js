@@ -257,7 +257,7 @@ router.get('/partner_status', async (req, res) => {
 
 // GET /api/top_driver — أفضل مندوب لليوم (إعفاء من العمولة يوم واحد)
 // نسبة إعفاء أفضل مندوب — نفس المتغير المستخدم في المحفظة
-const TOP_DRIVER_WAIVER = Math.min(1, Math.max(0, parseFloat(process.env.TOP_DRIVER_WAIVER || '0')));
+// لا إعفاء مالي لأفضل مندوب — الجائزة عرض اسمه فقط (قرار الإدارة).
 
 router.get('/top_driver', async (req, res) => {
   try {
@@ -289,8 +289,8 @@ router.get('/top_driver', async (req, res) => {
       topDriverName: top ? top.name : null,
       deliveries: top ? top.deliveries : 0,
       // الجائزة الأساسية عرض الاسم؛ الإعفاء المالي حسب النسبة المضبوطة
-      commissionExempt: !!top && TOP_DRIVER_WAIVER > 0,
-      waiverRate: TOP_DRIVER_WAIVER,
+      commissionExempt: false,
+      waiverRate: 0,
       period: 'اليوم',
       date: start.toISOString().slice(0, 10),
       leaderboard: list.slice(0, 5)

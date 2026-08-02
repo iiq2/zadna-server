@@ -181,9 +181,47 @@ router.patch('/:id', needsIdentity, async (req, res) => {
           if (driver) updateData.driver = driver;
 
       const docRef = db.collection('orders').doc(id);
-    if (!(await docRef.get()).exists) {
+      const snap = await docRef.get();
+    if (!snap.exists) {
       return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
     }
+
+    // ===== من يملك حق تعديل هذا الطلب؟ =====
+    //
+    // كان needsIdentity يتحقق من وجود توكن صالح فقط — أي حساب مسجّل، زبوناً
+    // كان أو مندوباً. فكان بإمكان أي أحد أن يضع نفسه مندوباً على طلب غيره
+    // ثم يعلّمه «تم التوصيل»، فتُنسب أرباحه إليه ويخسر المندوب الحقيقي حقه،
+    // بل ويمكن تلفيق طلبات مسلَّمة وهمية تُفسد كل الأرقام المالية.
+    const cur = snap.data() || {};
+    const curDrvKey = cur.driver && typeof cur.driver === 'object'
+      ? String(cur.driver.id || cur.driver.phone || '')
+      : String(cur.driverId || '');
+    const meId = String(req.user?.userId || '');
+    const UNASSIGNED_STATES = ['READY_FOR_PICKUP', 'PENDING_RESTAURANT', 'ACCEPTED', 'PREPARING'];
+
+    if (!req.isAdmin) {
+      const isOwner = curDrvKey && meId && curDrvKey === meId;
+      const isFreeToTake = !curDrvKey || UNASSIGNED_STATES.includes(String(cur.status));
+
+      if (!isOwner && !isFreeToTake) {
+        console.warn('🔒 محاولة تعديل طلب ليس لصاحبها:', id, '| الطلب لـ:', curDrvKey, '| الطالب:', meId);
+        return res.status(403).json({
+          success: false,
+          error: 'هذا الطلب مُسند لمندوب آخر'
+        });
+      }
+      // لا يجوز لأحد أن ينسب الطلب لغيره — يأخذه لنفسه أو لا يأخذه
+      if (driver) {
+        const newKey = String(driver.id || driver.phone || '');
+        if (meId && newKey && newKey !== meId) {
+          return res.status(403).json({
+            success: false,
+            error: 'لا يمكن إسناد الطلب لحساب آخر'
+          });
+        }
+      }
+    }
+
     await docRef.update(updateData);
 
       // Notify via sockets

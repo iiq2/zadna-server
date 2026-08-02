@@ -1,6 +1,21 @@
 const express = require('express');
 const router = express.Router();
 
+/**
+ * تعديل المطاعم للإدارة وحدها.
+ *
+ * كانت المسارات الستة (إنشاء، تعديل، منيو، اعتماد، تجميد، الموقع) مفتوحة
+ * بلا أي تحقق: أي أحد يعرف عنوان السيرفر كان يستطيع تجميد مطعم، أو اعتماد
+ * مطعم وهمي، أو تغيير أسعار المنيو. ومع اعتماد أجرة التوصيل على موقع
+ * المطعم، صار تحريك الموقع وسيلة لتغيير السعر أيضاً.
+ *
+ * القراءة (GET) تبقى مفتوحة — الزبون يحتاجها ليرى المطاعم.
+ */
+const adminOnly = (req, res, next) => {
+  const fn = req.app.get('requireAdmin');
+  return fn ? fn(req, res, next) : next();
+};
+
 const demoRestaurants = [
   {
         id: 'rest_001',
@@ -264,7 +279,7 @@ router.get('/:id', async (req, res) => {
 // ==============================
 
 // POST /api/restaurants — صاحب المطعم يسجل مطعمه (يصل للمدير للاعتماد)
-router.post('/', async (req, res) => {
+router.post('/', adminOnly, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
@@ -311,7 +326,7 @@ router.post('/', async (req, res) => {
 });
 
 // PATCH /api/restaurants/:id — تعديل بيانات المطعم
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', adminOnly, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
@@ -324,6 +339,33 @@ router.patch('/:id', async (req, res) => {
     }
     const body = { ...req.body };
     delete body.status; delete body.id; // الحالة يغيرها المدير فقط
+
+    // إحداثيات المطعم تُحدّد أجرة التوصيل، فلا تُقبل قيمة غير منطقية.
+    // نخزّنها رقمين عاديين lat/lng لا GeoPoint: الأخير يخرج من Firestore
+    // باسمي _latitude/_longitude فلا يجدهما التطبيق — تُحفظ ولا تُقرأ.
+    for (const k of ['lat', 'lng']) {
+      if (body[k] === undefined) continue;
+      const v = Number(body[k]);
+      if (!Number.isFinite(v)) {
+        return res.status(400).json({ success: false, error: `قيمة ${k} غير صحيحة` });
+      }
+      body[k] = v;
+    }
+    if (body.lat !== undefined || body.lng !== undefined) {
+      const lat = body.lat, lng = body.lng;
+      if (lat === undefined || lng === undefined) {
+        return res.status(400).json({ success: false, error: 'يجب إرسال lat و lng معاً' });
+      }
+      // حدود فلسطين تقريباً — تمنع نقرة خاطئة على طرف الخريطة من نقل
+      // المطعم إلى قارة أخرى فتصير أجرة التوصيل بالآلاف.
+      if (lat < 29 || lat > 34 || lng < 33.5 || lng > 36.5) {
+        return res.status(400).json({
+          success: false,
+          error: 'الموقع خارج فلسطين — تأكد من النقطة على الخريطة'
+        });
+      }
+    }
+
     await ref.update(body);
     res.json({ success: true });
   } catch (error) {
@@ -332,7 +374,7 @@ router.patch('/:id', async (req, res) => {
 });
 
 // POST /api/restaurants/:id/menu — إضافة وجبة
-router.post('/:id/menu', async (req, res) => {
+router.post('/:id/menu', adminOnly, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
@@ -355,7 +397,7 @@ router.post('/:id/menu', async (req, res) => {
 });
 
 // PATCH /api/restaurants/:id/menu/:itemId — تعديل وجبة (سعر/توفر/وصف)
-router.patch('/:id/menu/:itemId', async (req, res) => {
+router.patch('/:id/menu/:itemId', adminOnly, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
@@ -376,7 +418,7 @@ router.patch('/:id/menu/:itemId', async (req, res) => {
 });
 
 // DELETE /api/restaurants/:id/menu/:itemId — حذف وجبة
-router.delete('/:id/menu/:itemId', async (req, res) => {
+router.delete('/:id/menu/:itemId', adminOnly, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
@@ -394,7 +436,7 @@ router.delete('/:id/menu/:itemId', async (req, res) => {
 });
 
 // DELETE /api/restaurants/:id — حذف مطعم (للمدير)
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', adminOnly, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
@@ -407,7 +449,7 @@ router.delete('/:id', async (req, res) => {
 });
 
 // POST /api/restaurants/:id/approve — اعتماد المطعم من المدير
-router.post('/:id/approve', async (req, res) => {
+router.post('/:id/approve', adminOnly, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
@@ -420,7 +462,7 @@ router.post('/:id/approve', async (req, res) => {
 });
 
 // POST /api/restaurants/:id/freeze — تجميد المطعم
-router.post('/:id/freeze', async (req, res) => {
+router.post('/:id/freeze', adminOnly, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);

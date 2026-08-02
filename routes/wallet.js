@@ -21,7 +21,9 @@ const orderTotal = (o) => {
   const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/[^\d.]/g, ''));
   return isNaN(n) ? 0 : n;
 };
-const feeOf = (o) => Number(o.deliveryFee) || DEFAULT_DELIVERY_FEE;
+// 0 || 5 في جافاسكربت = 5 — فطلب بتوصيل مجاني كان يُحسب 5 ₪،
+// فتُفرض على المندوب عمولة على مال لم يقبضه وتُسجَّل له أرباح وهمية.
+const feeOf = (o) => (o.deliveryFee == null || o.deliveryFee === '' ? DEFAULT_DELIVERY_FEE : Number(o.deliveryFee) || 0);
 const orderDate = (o) => (o.createdAt && o.createdAt._seconds) ? new Date(o.createdAt._seconds * 1000) : null;
 const driverKeyOf = (o) => {
   if (o.driver && typeof o.driver === 'object') return String(o.driver.id || o.driver.phone || o.driver.name || '');
@@ -46,8 +48,26 @@ const MAX_ORDERS = 2000;     // سقف القراءة
 
 async function fetchDelivered(db) {
   if (_cache.data && (Date.now() - _cache.at) < CACHE_MS) return _cache.data;
-  const snap = await db.collection('orders').where('status', '==', 'DELIVERED').limit(MAX_ORDERS).get();
+  // orderBy ضروري مع limit: بدونه يُرجع Firestore 2000 مستنداً بترتيب
+  // المعرّف لا بترتيب الزمن، فبمجرد تجاوز الطلبات المسلَّمة هذا السقف
+  // تُسقَط طلبات عشوائية من كل الحسابات — إيرادات المنصة وديون المناديب
+  // وأرباح المطاعم — بلا أي تحذير. والأحدث أولى بالبقاء.
+  let snap;
+  try {
+    snap = await db.collection('orders')
+      .where('status', '==', 'DELIVERED')
+      .orderBy('createdAt', 'desc')
+      .limit(MAX_ORDERS)
+      .get();
+  } catch (e) {
+    // يحتاج فهرساً مركباً في Firestore؛ إن لم يكن جاهزاً لا نُسقط الخدمة
+    console.warn('⚠️ تعذّر ترتيب الطلبات (فهرس ناقص) — القراءة بلا ترتيب:', e.message);
+    snap = await db.collection('orders').where('status', '==', 'DELIVERED').limit(MAX_ORDERS).get();
+  }
   const list = []; snap.forEach(d => list.push({ _id: d.id, ...d.data() }));
+  if (list.length >= MAX_ORDERS) {
+    console.warn(`⚠️ بلغت الطلبات المسلَّمة سقف ${MAX_ORDERS} — الأرقام المالية صارت جزئية. ارفع MAX_ORDERS أو انقل الحساب إلى تجميع دوري.`);
+  }
   _cache = { at: Date.now(), data: list };
   return list;
 }
@@ -69,9 +89,8 @@ function orderBreakdown(o) {
 }
 
 /**
- * أفضل مندوب اليوم = صاحب أكثر توصيلات منذ منتصف الليل، وهو معفى من
- * عمولة التوصيل ذلك اليوم. تُحسب هنا مرة واحدة لأن حسابها في مكانين
- * جعل محفظة المندوب تقول رقماً ولوحة المدير رقماً آخر.
+ * أفضل مندوب اليوم = صاحب أكثر توصيلات منذ منتصف الليل.
+ * الجائزة عرض اسمه فقط — لا أثر مالي.
  */
 function topDriverToday(all, todayStart) {
   const counts = {};
@@ -84,20 +103,21 @@ function topDriverToday(all, todayStart) {
   return Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0] || null;
 }
 
-// جائزة أفضل مندوب = عرض اسمه. الإعفاء المالي اختياري وتضبطه الإدارة:
-// TOP_DRIVER_WAIVER بين 0 و 1 (0 = بلا إعفاء، 0.5 = نصف العمولة، 1 = كامل).
-const TOP_DRIVER_WAIVER = Math.min(1, Math.max(0, parseFloat(process.env.TOP_DRIVER_WAIVER || '0')));
+// جائزة أفضل مندوب = عرض اسمه فقط، بلا أي إعفاء مالي.
+//
+// كان هنا TOP_DRIVER_WAIVER يخصم جزءاً من العمولة. أُلغي بقرار الإدارة:
+// الجائزة تقدير معنوي لا خصم، وإبقاء آلية معطّلة يفتح باب اختلاف بين ما
+// يعرضه التطبيق وما يحسبه السيرفر — وهو ما حدث فعلاً حين أعفى التطبيق
+// المندوب بالكامل بينما لم يعفه السيرفر إطلاقاً.
 
-/** ما يستحقه زادنا من طلب واحد، مع مراعاة نسبة إعفاء أفضل مندوب. */
-function owedFor(b, exempt) {
-  const discount = exempt ? b.drvCommission * TOP_DRIVER_WAIVER : 0;
-  return r2(b.restCommission + b.drvCommission - discount);
+/** ما يستحقه زادنا من طلب واحد. */
+function owedFor(b) {
+  return r2(b.restCommission + b.drvCommission);
 }
 
-/** ما يبقى للمندوب من أجرة التوصيل بعد العمولة (مع الإعفاء إن وُجد). */
-function driverNetFor(b, exempt) {
-  const discount = exempt ? b.drvCommission * TOP_DRIVER_WAIVER : 0;
-  return r2(b.fee - b.drvCommission + discount);
+/** ما يبقى للمندوب من أجرة التوصيل بعد العمولة. */
+function driverNetFor(b) {
+  return r2(b.fee - b.drvCommission);
 }
 
 async function settlementsOf(db, driverId) {
@@ -119,29 +139,26 @@ router.get('/wallet/driver/:id', async (req, res) => {
     const mine = all.filter(o => driverKeyOf(o) === id);
     const inPeriod = from ? mine.filter(o => { const d = orderDate(o); return d && d >= from; }) : mine;
 
-    // أفضل مندوب اليوم معفى من عمولته
+    // أفضل مندوب اليوم — للعرض فقط
     const todayStart = new Date(); todayStart.setHours(0,0,0,0);
     const topId = topDriverToday(all, todayStart);
     const isTop = topId === id;
     const isToday = (o) => { const d = orderDate(o); return d && d >= todayStart; };
 
-    let collected=0, paidRest=0, owed=0, net=0, waived=0;
+    let collected=0, paidRest=0, owed=0, net=0;
     inPeriod.forEach(o => {
       const b = orderBreakdown(o);
       collected += b.collectedFromCustomer; paidRest += b.paidToRestaurant;
-      const exempt = isTop && isToday(o);
-      owed += owedFor(b, exempt);
-      net  += driverNetFor(b, exempt);
-      if (exempt) waived += r2(b.drvCommission * TOP_DRIVER_WAIVER);
+      owed += owedFor(b);
+      net  += driverNetFor(b);
+      
     });
 
     // الإجمالي التاريخي مقابل ما سدّده.
-    // لا بد أن يطبّق الإعفاء نفسه، وإلا أخبرنا المندوب أنه أُعفي ثم حاسبناه.
     let owedAll = 0;
     mine.forEach(o => {
       const b = orderBreakdown(o);
-      const exempt = isTop && isToday(o);
-      owedAll += owedFor(b, exempt);
+      owedAll += owedFor(b);
     });
     const { sum: paid, items: settlements } = await settlementsOf(db, id);
 
@@ -154,11 +171,13 @@ router.get('/wallet/driver/:id', async (req, res) => {
       owedToZadna: r2(owed),
       driverEarnings: r2(net),
       isTopDriverToday: isTop,
-      waiverRate: TOP_DRIVER_WAIVER,
-      commissionWaived: r2(waived),
+      waiverRate: 0,   // لا إعفاء — الجائزة عرض الاسم
       lifetimeOwed: r2(owedAll),
       totalSettled: paid,
-      balanceDue: r2(owedAll - paid),
+      // لا ينزل تحت الصفر: تسديد زائد كان يجعل الدين سالباً، فيُخصم
+      // من ديون بقية المناديب في المجموع ويخفي مستحقات حقيقية.
+      balanceDue: r2(Math.max(0, owedAll - paid)),
+      overpaid: r2(Math.max(0, paid - owedAll)),
       settlements: settlements.slice(0, 20)
     });
   } catch (e) { res.status(500).json({ success:false, error:e.message }); }
@@ -206,10 +225,9 @@ router.get('/wallet/summary', async (req, res) => {
         if (!drivers[did]) drivers[did] = { id:did, name:driverNameOf(o), deliveries:0, collected:0, owed:0, owedToday:0, earnings:0 };
         drivers[did].deliveries++; drivers[did].collected += b.collectedFromCustomer;
         // نفس قاعدة الإعفاء المطبّقة في محفظة المندوب — رقم واحد للطرفين
-        const exemptD = topDriverId && String(did) === String(topDriverId) && d && d >= todayStart;
-        const owedThis = owedFor(b, exemptD);
+        const owedThis = owedFor(b);
         drivers[did].owed += owedThis;
-        drivers[did].earnings += driverNetFor(b, exemptD);
+        drivers[did].earnings += driverNetFor(b);
         if (d && d >= todayStart) drivers[did].owedToday += owedThis;
       }
       const rid = String(o.restaurantId||'');
@@ -225,7 +243,9 @@ router.get('/wallet/summary', async (req, res) => {
 
     const driversList = Object.values(drivers).map(d => ({
       ...d, collected:r2(d.collected), owed:r2(d.owed), owedToday:r2(d.owedToday),
-      earnings:r2(d.earnings), settled:r2(settled[d.id]||0), balanceDue:r2(d.owed - (settled[d.id]||0))
+      earnings:r2(d.earnings), settled:r2(settled[d.id]||0),
+      balanceDue:r2(Math.max(0, d.owed - (settled[d.id]||0))),
+      overpaid:r2(Math.max(0, (settled[d.id]||0) - d.owed))
     })).sort((a,b) => b.balanceDue - a.balanceDue);
 
     const restsList = Object.values(rests).map(r => ({
@@ -256,6 +276,30 @@ router.post('/wallet/settlement', adminOnly, async (req, res) => {
     if (!driverId) return res.status(400).json({ success:false, error:'driverId مطلوب' });
     const amt = Number(amount);
     if (!amt || amt <= 0) return res.status(400).json({ success:false, error:'المبلغ غير صحيح' });
+
+    // ===== منع التسوية المكررة =====
+    // ضغطتان متتاليتان على «استلمت» كانتا تُسجّلان تسويتين، فيُشطب من دَين
+    // المندوب ضِعف ما دفع فعلاً. نرفض أي مبلغ مطابق لنفس المندوب خلال
+    // دقيقتين إلا إذا أكّد المدير صراحة أنها دفعة منفصلة.
+    if (!req.body.allowDuplicate) {
+      const twoMinAgo = new Date(Date.now() - 120000);
+      const recent = await db.collection('settlements')
+        .where('driverId', '==', String(driverId))
+        .get();
+      const dup = recent.docs.find(d => {
+        const s = d.data();
+        const t = s.createdAt && s.createdAt.toDate ? s.createdAt.toDate() : new Date(s.createdAt || 0);
+        return Number(s.amount) === amt && t > twoMinAgo;
+      });
+      if (dup) {
+        return res.status(409).json({
+          success: false,
+          error: 'سُجّلت تسوية بنفس المبلغ لهذا المندوب قبل دقائق — إن كانت دفعة منفصلة أعد الإرسال بتأكيد',
+          duplicateId: dup.id
+        });
+      }
+    }
+
     const doc = { driverId:String(driverId), driverName:driverName||'', amount:amt, note:note||'', createdAt:new Date() };
     const ref = await db.collection('settlements').add(doc);
     _cache = { at: 0, data: null }; // إبطال الكاش
