@@ -16,6 +16,12 @@ const adminOnly = (req, res, next) => {
   return fn ? fn(req, res, next) : next();
 };
 
+/** يتطلّب Token صالحاً (لا مفتاح إدارة) — يملأ req.user */
+const needsIdentity = (req, res, next) => {
+  const fn = req.app.get('requireIdentity');
+  return fn ? fn(req, res, next) : next();
+};
+
 const demoRestaurants = [
   {
         id: 'rest_001',
@@ -456,6 +462,100 @@ router.post('/:id/approve', adminOnly, async (req, res) => {
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     await db.collection('restaurants').doc(String(req.params.id)).update({ status: 'approved', isActive: true });
     res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * PATCH /api/restaurants/:id/location — يحدّد صاحب المطعم موقعه بنفسه.
+ *
+ * لماذا مسار منفصل عن PATCH /:id العام؟
+ * ذاك مفتوح على كل الحقول (السعر، العمولة، الاعتماد) فبقي للإدارة وحدها.
+ * وهذا يقبل حقلين اثنين فقط — lat وlng — ولا شيء غيرهما مهما أُرسل،
+ * فلا يستطيع صاحب مطعم أن يعتمد نفسه أو يغيّر عمولته من هنا.
+ *
+ * ولماذا يُسمح له أصلاً؟ لأنه أدرى بباب محلّه من أي أحد، والموقع الخاطئ
+ * يعني مندوباً يدور ويأجرة توصيل محسوبة على مسافة ليست الحقيقية.
+ *
+ * الشرط: أن يكون هو المالك (ownerId) — أو الإدارة.
+ */
+router.patch('/:id/location', needsIdentity, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+
+    const lat = Number(req.body && req.body.lat);
+    const lng = Number(req.body && req.body.lng);
+    // حدود فلسطين — دبوس خارجها خطأ إدخال لا موقع مطعم
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) ||
+        lat < 29 || lat > 34 || lng < 33.5 || lng > 36.5) {
+      return res.status(400).json({ success: false, error: 'إحداثيات غير صالحة' });
+    }
+
+    const ref = db.collection('restaurants').doc(String(req.params.id));
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
+
+    const r = doc.data();
+    const meId = req.user && (req.user.userId || req.user.id);
+    const isOwner = meId && r.ownerId && String(r.ownerId) === String(meId);
+    if (!req.isAdmin && !isOwner) {
+      return res.status(403).json({ success: false, error: 'لا تملك صلاحية تعديل موقع هذا المطعم' });
+    }
+
+    invalidate('restaurants:raw');
+    await ref.update({
+      lat: Math.round(lat * 100000) / 100000,
+      lng: Math.round(lng * 100000) / 100000,
+      locationSetAt: new Date(),
+      locationSetBy: req.isAdmin ? 'admin' : 'owner'
+    });
+    res.json({ success: true, lat, lng });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * PATCH /api/restaurants/:id/open — يفتح صاحب المطعم محلّه أو يغلقه.
+ *
+ * لماذا مسار منفصل؟ لأن PATCH /:id العام يفتح كل الحقول — العمولة والاعتماد
+ * والأسعار — فبقي للإدارة وحدها. وكان صاحب المطعم يضغط مفتاح «مغلق» فيردّ
+ * السيرفر 403 ويبتلعه التطبيق بصمت: يرى المفتاح أحمر على شاشته والمطعم
+ * مفتوح فعلاً، فتصله طلبات وهو مقفل، أو يظنّ نفسه مقفلاً فيتجاهلها.
+ *
+ * هنا حقل واحد فقط — isOpen — ولمالك المطعم أو الإدارة.
+ */
+router.patch('/:id/open', needsIdentity, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+
+    const isOpen = req.body && req.body.isOpen;
+    if (typeof isOpen !== 'boolean') {
+      return res.status(400).json({ success: false, error: 'isOpen يجب أن يكون true أو false' });
+    }
+
+    const ref = db.collection('restaurants').doc(String(req.params.id));
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
+
+    const r = doc.data();
+    const meId = req.user && (req.user.userId || req.user.id);
+    const isOwner = meId && r.ownerId && String(r.ownerId) === String(meId);
+    if (!req.isAdmin && !isOwner) {
+      return res.status(403).json({ success: false, error: 'لا تملك صلاحية تغيير حالة هذا المطعم' });
+    }
+
+    invalidate('restaurants:raw');
+    await ref.update({ isOpen, openChangedAt: new Date() });
+
+    // نُعلم الزبائن فوراً: مطعم أُغلق يجب أن يختفي من قوائمهم بلا انتظار
+    const io = req.app.get('socketio');
+    if (io) io.emit('restaurant_status_changed', { id: String(req.params.id), isOpen });
+
+    res.json({ success: true, isOpen });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
