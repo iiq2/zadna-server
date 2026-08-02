@@ -534,6 +534,17 @@ app.post('/api/auth/login', async (req, res) => {
       const user = userDoc.data();
       const userId = userDoc.id;
 
+      // حساب أُنشئ بجوجل لا يملك كلمة سر أصلاً. تمرير قيمة غير موجودة إلى
+      // bcrypt يرمي استثناءً فيصير الرد خطأ 500 بلا معنى، والمستخدم يظن أنه
+      // نسي كلمة سره ويذهب لاستعادتها — وهي غير موجودة أصلاً.
+      if (!user.password || user.authProvider === 'google') {
+        return res.status(409).json({
+          success: false,
+          error: 'هذا الحساب مسجّل بحساب جوجل — استخدم زر «الدخول بحساب جوجل» بالأسفل',
+          authProvider: 'google'
+        });
+      }
+
       const isPasswordValid = await bcryptjs.compare(password, user.password);
       if (!isPasswordValid) {
         return res.status(401).json({
@@ -650,6 +661,64 @@ app.get('/api/auth/profile', authMiddleware, async (req, res) => {
 
   } catch (error) {
     console.error('❌ خطأ:', error);
+    return res.status(500).json({ success: false, error: 'حدث خطأ داخلي' });
+  }
+});
+
+/**
+ * PATCH /api/auth/profile
+ * تحديث بيانات المستخدم لنفسه فقط (الاسم والهاتف).
+ *
+ * الداعي: من يدخل بحساب جوجل لا يصل معه رقم هاتف، فيضطر لكتابته في كل طلب.
+ * نحفظه بعد أول طلب فلا يكتبه ثانية — والأهم أن يبقى رقم واحد ثابت في
+ * حسابه، لأن اختلاف الرقم بين الطلبات يُربك المندوب ويُفسد سجل الزبون.
+ *
+ * لا يُسمح بتعديل userType ولا ownedRestaurantId ولا الرصيد من هنا:
+ * تلك قرارات إدارة، ولو فُتحت للمستخدم لرقّى نفسه إلى مندوب أو مطعم.
+ */
+app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { name, phone } = req.body || {};
+
+    const updates = {};
+    if (typeof name === 'string' && name.trim()) updates.name = name.trim();
+    if (typeof phone === 'string' && phone.trim()) {
+      // نُطبّع الرقم قبل التحقق: الزبون قد يكتبه بصيغ كثيرة
+      // (+970 / 00970 / +972 / 0592… / 592…) وكلها لنفس الجوال.
+      // تخزينها كما كُتبت يعني أن نفس الزبون يظهر برقمين مختلفين.
+      let p = phone.trim().replace(/[\s-]/g, '');
+      p = p.replace(/^(\+?970|00970|\+?972|00972)/, '');
+      if (!p.startsWith('0')) p = '0' + p;
+
+      // القاعدة نفسها المستعملة في التطبيق (PhoneValidator):
+      // 059/056 فلسطينية، و050/052/053/054/058 إسرائيلية يستعملها كثيرون
+      // في الضفة. السيرفر لا يجوز أن يكون أضيق من التطبيق، وإلا قَبِل الطلب
+      // ورفض حفظ رقم صاحبه — فيبقى الزبون بلا رقم في حسابه بلا سبب ظاهر.
+      if (!/^05[0234689]\d{7}$/.test(p)) {
+        return res.status(400).json({ success: false, error: 'رقم الجوال غير صحيح' });
+      }
+      updates.phone = p;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, error: 'لا يوجد ما يُحدَّث' });
+    }
+
+    if (!db) return res.status(503).json({ success: false, error: 'قاعدة البيانات غير متصلة' });
+
+    const ref = db.collection('users').doc(userId);
+    if (!(await ref.get()).exists) {
+      return res.status(404).json({ success: false, error: 'المستخدم غير موجود' });
+    }
+    await ref.update(updates);
+
+    const fresh = (await ref.get()).data();
+    delete fresh.password;
+    return res.json({ success: true, user: { id: userId, ...fresh } });
+
+  } catch (error) {
+    console.error('❌ خطأ بتحديث الحساب:', error);
     return res.status(500).json({ success: false, error: 'حدث خطأ داخلي' });
   }
 });
@@ -798,6 +867,13 @@ io.on('connection', (socket) => {
     console.log('📍 تحديث موقع المندوب:', data.driverId);
     io.emit('driver_location', {
       driverId: data.driverId,
+      // التطبيق يرسل اسم المندوب مع الموقع، وكان يُسقَط هنا — فتعرض لوحة
+      // المدير «كابتن 1234» بدل الاسم الحقيقي ولا يعرف من على الخريطة.
+      driverName: data.driverName || '',
+      driverPhone: data.driverPhone || '',
+      // نسبة الشحن الحقيقية من جهاز المندوب (-1 إن تعذّرت قراءتها)
+      battery: (data.battery == null ? -1 : data.battery),
+      accuracy: (data.accuracy == null ? -1 : data.accuracy),
       latitude: data.latitude,
       longitude: data.longitude,
       timestamp: new Date()
