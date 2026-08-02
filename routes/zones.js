@@ -179,10 +179,74 @@ router.delete('/delivery_zones/:id', adminOnly, async (req, res) => {
   }
 });
 
+/* ================= التسعير بالمسافة =================
+ * القاعدة المتفق عليها: 10 ₪ لأول كيلومترين، ثم 3 ₪ لكل كيلومتر بعدهما.
+ *   fee = 10 + max(0, ceil(km − 2)) × 3
+ *
+ * المسافة خط مستقيم × 1.35، وهو معامل التفاف الطرق. اخترناه بديلاً عن
+ * محرّك مسارات مدفوع: الفارق بضعة أمتار في مدينة بحجم نابلس، ولا تكلفة
+ * شهرية على كل طلب. يُعاير من بيانات الطلبات الحقيقية لاحقاً.
+ *
+ * تُقاس من موقع المطعم إلى موقع الزبون — لا من مركز منطقة إلى مركز منطقة،
+ * لأن مطعمين في «وسط البلد» قد يبعد أحدهما عن الزبون ضعف الآخر.
+ */
+/* الأجرة بمضاعفات 5 ₪ فقط — قرار تشغيلي لا حسابي:
+ * المندوب يقبض نقداً في الشارع، و«13 ₪» تعني بحثاً عن فراطة عند كل باب،
+ * وتأخيراً، وخلافاً على شيكلين. الشرائح: 10 ثم 15 ثم 20 ثم 25...
+ *   كل كيلومترين بعد أول كيلومترين = +5 ₪
+ */
+const BASE_FEE = 10;        // أول كيلومترين
+const FREE_KM = 2;
+const STEP_KM = 2;          // طول الشريحة
+const STEP_FEE = 5;         // زيادة الشريحة — مضاعفات 5 تُدفع بلا فراطة
+const ROAD_FACTOR = 1.35;   // التفاف الطرق مقابل الخط المستقيم
+
+function haversineKm(aLat, aLng, bLat, bLng) {
+  const R = 6371, rad = (d) => d * Math.PI / 180;
+  const dLat = rad(bLat - aLat), dLng = rad(bLng - aLng);
+  const h = Math.sin(dLat / 2) ** 2 +
+            Math.cos(rad(aLat)) * Math.cos(rad(bLat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function feeForKm(km) {
+  const steps = Math.max(0, Math.ceil((km - FREE_KM) / STEP_KM));
+  return BASE_FEE + steps * STEP_FEE;
+}
+
+const validPoint = (lat, lng) =>
+  Number.isFinite(lat) && Number.isFinite(lng) &&
+  lat >= 29 && lat <= 34 && lng >= 33.5 && lng <= 36.5;   // فلسطين
+
 // GET /api/delivery_quote?zone=z07&restaurantZone=z01 — كم أجرة هذه التوصيلة
+// أو بالمسافة: ?restaurantId=..&lat=..&lng=..  (يُفضَّل — أدق وأعدل)
 router.get('/delivery_quote', async (req, res) => {
   try {
     const db = getDb(req);
+
+    // ——— المسار المفضَّل: مسافة حقيقية بين نقطتين ———
+    const cLat = parseFloat(req.query.lat), cLng = parseFloat(req.query.lng);
+    if (validPoint(cLat, cLng) && req.query.restaurantId && db) {
+      try {
+        const doc = await db.collection('restaurants').doc(String(req.query.restaurantId)).get();
+        const r = doc.exists ? doc.data() : null;
+        const rLat = r ? Number(r.lat) : NaN, rLng = r ? Number(r.lng) : NaN;
+        if (validPoint(rLat, rLng)) {
+          const km = haversineKm(rLat, rLng, cLat, cLng) * ROAD_FACTOR;
+          const fee = feeForKm(km);
+          return res.json({
+            success: true,
+            fee,
+            baseFee: BASE_FEE,
+            surcharge: fee - BASE_FEE,
+            distanceKm: Math.round(km * 100) / 100,
+            method: 'distance',
+            note: `المسافة ${km.toFixed(1)} كم من ${r.name || 'المطعم'}`
+          });
+        }
+      } catch (e) { /* نسقط للمناطق */ }
+    }
+    // ——— الاحتياطي: نظام المناطق، حتى لا ينكسر الطلب بلا إحداثيات ———
     let overrides = {};
     if (db) {
       try {
