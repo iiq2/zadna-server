@@ -270,8 +270,18 @@ router.get('/', async (req, res) => {
       const visible = showAll
         ? restaurants
         : restaurants.filter(r => (!r.status || r.status === 'approved') && r.isOpen !== false);
-      const ids = new Set(visible.map(r => String(r.id)));
-      const merged = visible.concat(demoRestaurants.filter(d => !ids.has(String(d.id))));
+      // الاستبعاد يُبنى على **كل** المطاعم المسجَّلة لا على الظاهر منها فقط.
+      //
+      // كان يُبنى من `visible`: فمطعم يُغلقه صاحبه يُحذف من القائمة، ويصبح
+      // معرّفه غير موجود في المجموعة، فتُضاف **نسخته المحفورة في الكود**
+      // مكانه — بمنيو قديم من سطر واحد، و`isOpen` غير مضبوط أي «مفتوح».
+      //
+      // النتيجة: زرّ الإغلاق لا يعمل إطلاقاً. يقفل صاحب المطعم محلّه فيراه
+      // الزبون مفتوحاً بمنيو لا يعرفه، ويطلب منه، والمطبخ مغلق.
+      // والأمر نفسه ينطبق على المطعم المجمَّد أو غير المعتمد: يُخفى ثم يعود
+      // بنسخة الديمو — أي أن التجميد بلا أثر أيضاً.
+      const knownIds = new Set(restaurants.map(r => String(r.id)));
+      const merged = visible.concat(demoRestaurants.filter(d => !knownIds.has(String(d.id))));
 
       // ترتيب جميل للزبون: المفتوح أولاً، ثم الأعلى تقييماً، ثم الأسرع توصيلاً
       const nowOpen = (r) => r.isOpen !== false;
