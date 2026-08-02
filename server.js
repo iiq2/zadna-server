@@ -864,7 +864,18 @@ io.on('connection', (socket) => {
 
   // تحديث موقع المندوب
   socket.on('driver_location_update', (data) => {
-    console.log('📍 تحديث موقع المندوب:', data.driverId);
+    // تطبيق المندوب يرسل lat/lng، وكان هذا المستمع يقرأ latitude/longitude
+    // فقط — وهما غير موجودين في الرسالة، فيُبثّ الموقع فارغاً وترميه لوحة
+    // المدير عند فحص الأرقام. النتيجة: لم يصل موقع حقيقي واحد إلى الخريطة
+    // منذ بداية المشروع، وما كان يظهر عليها دبابيس مولّدة محلياً.
+    // نقبل الاسمين معاً حتى لا ينكسر أي إصدار تطبيق قديم منصَّب على جوال.
+    const lat = Number(data.lat != null ? data.lat : data.latitude);
+    const lng = Number(data.lng != null ? data.lng : data.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      console.warn('⚠️ موقع مندوب بلا إحداثيات صالحة:', data && data.driverId);
+      return;
+    }
+    console.log('📍 تحديث موقع المندوب:', data.driverId, lat, lng);
     io.emit('driver_location', {
       driverId: data.driverId,
       // التطبيق يرسل اسم المندوب مع الموقع، وكان يُسقَط هنا — فتعرض لوحة
@@ -874,8 +885,11 @@ io.on('connection', (socket) => {
       // نسبة الشحن الحقيقية من جهاز المندوب (-1 إن تعذّرت قراءتها)
       battery: (data.battery == null ? -1 : data.battery),
       accuracy: (data.accuracy == null ? -1 : data.accuracy),
-      latitude: data.latitude,
-      longitude: data.longitude,
+      // نبثّ بالاسمين: latitude/longitude للوحة، وlat/lng لأي مستهلك آخر
+      latitude: lat,
+      longitude: lng,
+      lat: lat,
+      lng: lng,
       timestamp: new Date()
     });
   });
