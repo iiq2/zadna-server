@@ -487,13 +487,19 @@ router.patch('/:id', needsIdentity, async (req, res) => {
             data: { orderId: String(id), type: 'status', status },
           }).catch(() => {});
         }
-        // المناديب: صار في طلب جاهز
+        // المناديب: صار في طلب جاهز — والأقرب للمطعم أولاً
         if (status === 'READY_FOR_PICKUP') {
           const total = Number(cur.grandTotal || cur.totalAmount || 0);
+          let rLat, rLng;
+          try {
+            const rd = await db.collection('restaurants').doc(String(cur.restaurantId || '')).get();
+            if (rd.exists) { rLat = Number(rd.data().lat); rLng = Number(rd.data().lng); }
+          } catch (e) { /* بلا إحداثيات: يُنبَّه الجميع كما كان */ }
           notifyDrivers(req.app, {
             title: 'طلب جاهز للاستلام 📦',
             body: `${cur.restaurant || 'مطعم'} — ${total} ₪`,
             data: { orderId: String(id), type: 'new_ready_order' },
+            restaurantLat: rLat, restaurantLng: rLng,
           }).catch(() => {});
         }
       }

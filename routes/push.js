@@ -164,8 +164,48 @@ async function notifyRestaurant(app, restaurantId, { title, body, data }) {
   } catch (e) { console.warn('⚠️ إشعار المطعم:', e.message); }
 }
 
-/** كل المناديب المعتمدين وغير المجمّدين — طلب جاهز للاستلام */
-async function notifyDrivers(app, { title, body, data }) {
+/* ============================================================
+   ترتيب المناديب: الأقرب للمطعم أولاً، والمشغول آخِراً.
+
+   كان الإشعار يُرسل للجميع دفعةً واحدة، فيتسابقون على الطلب: يصل
+   البعيد أولاً فيأخذه، ويصل الطلب متأخراً، ويغضب من كان على بُعد
+   مئتَي متر ووجده مأخوذاً.
+
+   والقرب وحده لا يكفي: مندوب على بُعد ٢٠٠ متر ماسكٌ طلبين أبطأ فعلياً
+   من فارغٍ على بُعد ٦٠٠. لذلك نستبعد المشغول بطلبين ونضعه في آخر
+   الترتيب لا نحرمه — فقد يكون هو الوحيد المتاح.
+   ============================================================ */
+const R_EARTH = 6371;
+const rad = (d) => (d * Math.PI) / 180;
+function distKm(aLat, aLng, bLat, bLng) {
+  const dLat = rad(bLat - aLat), dLng = rad(bLng - aLng);
+  const s = Math.sin(dLat / 2) ** 2 +
+            Math.cos(rad(aLat)) * Math.cos(rad(bLat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R_EARTH * Math.asin(Math.sqrt(s));
+}
+const BUSY_LIMIT = 2;           // من معه طلبان فأكثر يُؤخَّر
+const ACTIVE = ['DRIVER_ASSIGNED', 'AT_RESTAURANT', 'PICKED_UP', 'ON_THE_WAY'];
+
+/** كم طلباً نشطاً مع كل مندوب الآن؟ */
+async function activeLoadByDriver(db) {
+  const load = {};
+  try {
+    const snap = await db.collection('orders').where('status', 'in', ACTIVE).get();
+    snap.forEach(d => {
+      const o = d.data();
+      const k = (o.driver && typeof o.driver === 'object')
+        ? String(o.driver.id || o.driver.phone || '') : String(o.driverId || '');
+      if (k) load[k] = (load[k] || 0) + 1;
+    });
+  } catch (e) { /* بلا فهرس: نكمل بلا أحمال */ }
+  return load;
+}
+
+/**
+ * كل المناديب المعتمدين وغير المجمّدين — طلب جاهز للاستلام.
+ * إن مرّرتَ موقع المطعم، رُتِّبوا بالقرب منه.
+ */
+async function notifyDrivers(app, { title, body, data, restaurantLat, restaurantLng }) {
   const db = app.get('db');
   if (!db) return;
   try {
@@ -177,6 +217,27 @@ async function notifyDrivers(app, { title, body, data }) {
       // المجمّد والمرفوض لا يُنبَّهان — لا نُغريه بطلب لا يستطيع أخذه
       if (st === 'approved') ids.push(d.id);
     });
+    if (!ids.length) return;
+
+    const haveGeo = Number.isFinite(Number(restaurantLat)) && Number.isFinite(Number(restaurantLng));
+    if (haveGeo) {
+      const locs = app.get('lastDriverLocation') || new Map();
+      const load = await activeLoadByDriver(db);
+      const scored = ids.map(id => {
+        const l = locs.get(String(id));
+        // من لا نعرف موقعه يُوضع بعد من نعرفهم لا يُحرَم
+        const km = l ? distKm(Number(restaurantLat), Number(restaurantLng), l.lat, l.lng) : 999;
+        const busy = (load[String(id)] || 0) >= BUSY_LIMIT ? 1 : 0;
+        return { id, km, busy };
+      });
+      scored.sort((a, b) => (a.busy - b.busy) || (a.km - b.km));
+      ids.length = 0;
+      scored.forEach(s => ids.push(s.id));
+      const near = scored.filter(s => s.km < 900).slice(0, 3)
+        .map(s => `${s.id.slice(0, 6)}:${s.km.toFixed(1)}كم${s.busy ? '(مشغول)' : ''}`);
+      if (near.length) console.log('🛵 أقرب المناديب:', near.join(' · '));
+    }
+
     const tokens = await tokensOf(db, ids);
     return await push(db, tokens, { title, body, channel: 'alert', data });
   } catch (e) { console.warn('⚠️ إشعار المناديب:', e.message); }
