@@ -10,6 +10,20 @@ const needsIdentity = (req, res, next) => {
 };
 const { cached, invalidate, updateCached } = require('../utils/cache');
 const { quoteDelivery } = require('./zones');
+const { notifyRestaurant, notifyDrivers, notifyCustomer } = require('./push');
+
+/** نصّ الحالة كما يراه الزبون في الإشعار */
+const CUSTOMER_NOTE = {
+  ACCEPTED:         ['المطعم قبل طلبك ✅', 'جارٍ تحضير طلبك الآن'],
+  PREPARING:        ['قيد التحضير 👨‍🍳', 'طلبك تحت التحضير'],
+  READY_FOR_PICKUP: ['طلبك جاهز 📦', 'بانتظار مندوب ليستلمه'],
+  DRIVER_ASSIGNED:  ['المندوب قبل طلبك 🛵', 'في طريقه إلى المطعم'],
+  PICKED_UP:        ['المندوب استلم طلبك 🚀', 'في الطريق إليك'],
+  ON_THE_WAY:       ['المندوب في الطريق 🛵', 'اقترب من عندك'],
+  AT_RESTAURANT:    ['المندوب وصل المطعم 📍', 'يستلم طلبك الآن'],
+  DELIVERED:        ['تم التوصيل ✅', 'صحتين وعافية — شكراً لطلبك من زادنا'],
+  CANCELLED:        ['أُلغي الطلب ❌', 'تواصل معنا إن كان هناك خطأ'],
+};
 
 /* ============================================================
    تسعير الطلب — السيرفر هو من يحسب، لا التطبيق.
@@ -195,6 +209,32 @@ router.post('/', needsIdentity, async (req, res) => {
           timestamp: new Date()
         });
       }
+
+      /* ===== الإشعارات =====
+       * السوكت يكفي إن كان التطبيق مفتوحاً. وهو ليس مفتوحاً عادةً:
+       * صاحب المطعم في المطبخ. لذلك الإشعار هو القناة الحقيقية. */
+      const money = `${orderData.grandTotal || orderData.totalAmount || 0} ₪`;
+      if (isMart) {
+        // طلب مارت يذهب للمناديب مباشرة — لا مطعم يوافق عليه
+        notifyDrivers(req.app, {
+          title: 'طلب جاهز للاستلام 📦',
+          body: `${orderData.restaurant || 'زادنا مارت'} — ${money}`,
+          data: { orderId: savedId, type: 'new_ready_order' },
+        }).catch(() => {});
+      } else {
+        notifyRestaurant(req.app, orderData.restaurantId, {
+          title: 'طلب جديد وصلك 🔔',
+          body: `${orderData.itemsSummary || 'طلب جديد'} — ${money}`,
+          data: { orderId: savedId, type: 'new_order' },
+        }).catch(() => {});
+      }
+      // الزبون: نجح الطلب — هنا تأتي أغنية زادنا
+      notifyCustomer(req.app, orderData.customerPhone, {
+        title: 'تم استلام طلبك 🎉',
+        body: `طلبك من ${orderData.restaurant || 'زادنا'} — ${money}`,
+        channel: 'success',
+        data: { orderId: savedId, type: 'order_placed' },
+      }).catch(() => {});
 
       // نحدّث الكاش مكانه بدل مسحه — يوفّر قراءة كاملة لكل طلب جديد
 
@@ -401,6 +441,32 @@ router.patch('/:id', needsIdentity, async (req, res) => {
             restaurantName: o.restaurant || 'زادنا',
             location: o.location || { lat: 32.2211, lng: 35.2622 }
           });
+        }
+      }
+
+      /* ===== إشعارات تغيّر الحالة =====
+       * السوكت يصل التطبيق المفتوح فقط. الزبون يضع جواله جانباً
+       * وينتظر، والمندوب على الطريق — فالإشعار هو ما يصلهم فعلاً. */
+      if (status) {
+        // الزبون: نصّ مفهوم لكل حالة، ونغمة تناسبها
+        const note = CUSTOMER_NOTE[status];
+        if (note && cur.customerPhone) {
+          const ch = status === 'DELIVERED' ? 'success'
+                   : (status === 'ON_THE_WAY' || status === 'PICKED_UP') ? 'arrived'
+                   : 'update';
+          notifyCustomer(req.app, cur.customerPhone, {
+            title: note[0], body: note[1], channel: ch,
+            data: { orderId: String(id), type: 'status', status },
+          }).catch(() => {});
+        }
+        // المناديب: صار في طلب جاهز
+        if (status === 'READY_FOR_PICKUP') {
+          const total = Number(cur.grandTotal || cur.totalAmount || 0);
+          notifyDrivers(req.app, {
+            title: 'طلب جاهز للاستلام 📦',
+            body: `${cur.restaurant || 'مطعم'} — ${total} ₪`,
+            data: { orderId: String(id), type: 'new_ready_order' },
+          }).catch(() => {});
         }
       }
 
