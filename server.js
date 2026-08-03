@@ -8,6 +8,8 @@ const socketIo = require('socket.io');
 const jwt = require('jsonwebtoken');
 const bcryptjs = require('bcryptjs');
 const Joi = require('joi');
+// كاش مشترك — يحمي حصة Firestore المجانية (٥٠ ألف قراءة/يوم)
+const { cached, invalidate } = require('./utils/cache');
 
 dotenv.config();
 
@@ -1021,8 +1023,18 @@ async function canAccessRoom(req, roomId) {
     );
     return false;
   } catch (e) {
+    /* عجزنا عن الفحص ≠ ليس له حقّ.
+     *
+     * حين نفدت حصة Firestore اليوم، فشلت قراءة مستند الطلب، فأعاد
+     * هذا السطر false، فقال السيرفر للزبون: «لا تملك صلاحية قراءة
+     * هذه المحادثة». وهي جملة كاذبة: المحادثة محادثته، والعطل عندنا.
+     *
+     * نُميّز الحالتين الآن: المنع يبقى ٤٠٣، والعجز يصير ٥٠٣ برسالة
+     * صادقة. أسوأ ما في العطل أن يتّهم صاحبَ الحقّ في حقّه. */
     console.warn(`🔒 شات: تعثّر فحص الصلاحية للطلب ${roomId} — ${e.message}`);
-    return false;
+    const err = new Error('تعذّر التحقق');
+    err.checkFailed = true;
+    throw err;
   }
 }
 
@@ -1061,10 +1073,16 @@ app.post('/api/driver_chats', requireIdentity, async (req, res) => {
         timestamp:  new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' }),
         createdAt:  new Date()
       });
+      // الكاتب يرى رسالته فوراً — لا ينتظر انتهاء كاش الثواني الثماني
+      invalidate(`chat:${orderId}`);
     }
 
     res.json({ success: true });
   } catch (error) {
+    if (error && error.checkFailed) {
+      return res.status(503).json({ success: false, busy: true,
+        error: 'الخدمة مشغولة الآن — رسالتك لم تُرسَل، أعد المحاولة بعد قليل' });
+    }
     console.error('❌ Error saving chat:', error);
     res.status(500).json({ success: false, error: error.message });
   }
@@ -1085,11 +1103,39 @@ app.get('/api/driver_chats', requireIdentity, async (req, res) => {
 
     if (!db) return res.json([]);
 
-    const snapshot = await db.collection('chats')
-      .doc(orderId)
-      .collection('messages')
-      .orderBy('createdAt', 'asc')
-      .get();
+    /* ============================================================
+       هنا كانت تُستهلك الحصة كلّها.
+
+       كان كل استطلاع يقرأ **المحادثة بأكملها** بلا حدّ ولا كاش.
+       وفي Firestore تُحسب القراءة لكل مستند لا لكل استعلام: محادثة
+       فيها ٥٠ رسالة = ٥٠ قراءة في كل مرّة.
+
+       ولوحة الإدارة تستطلع كل ١٥ ثانية، والتطبيقات كل ٩٠. أي أن
+       شاشة شات واحدة مفتوحة كانت تلتهم آلاف القراءات في الساعة،
+       حتى نفدت الخمسون ألفاً اليومية — فتوقّف كل شيء: لا شات، ولا
+       فحص حساب، ولا حتى صلاحية دخول الغرفة (فيُقرأ الرفض 403 وكأنه
+       منع، وهو في الحقيقة عجزٌ عن القراءة).
+
+       الحلّ في ملاحظة بسيطة: **لا أحد يكتب في المحادثة إلا عبرنا.**
+       كل رسالة تمرّ بـ POST /api/driver_chats — من التطبيقات ومن
+       اللوحة معاً. فما دام لا كاتب سوانا، لا داعي لأن نسأل قاعدة
+       البيانات «هل تغيّر شيء؟» كل بضع ثوانٍ: نحن نعلم متى يتغيّر.
+
+       فالكاش يعيش خمس دقائق، ويُمحى لحظة وصول رسالة جديدة. النتيجة:
+       القراءة تحدث عند تغيّر حقيقي فقط، والاستطلاع الفارغ — وهو
+       الغالبية الساحقة — لا يكلّف قراءة واحدة.
+
+       ومعه حدّ ١٠٠ رسالة، فلا تكبر المحادثة الطويلة بلا سقف.
+       ============================================================ */
+    const CHAT_LIMIT = 100;
+    const snapshot = await cached(`chat:${orderId}`, 300000, () =>
+      db.collection('chats')
+        .doc(orderId)
+        .collection('messages')
+        .orderBy('createdAt', 'desc')     // الأحدث أولاً كي يقتطع الحدّ الأقدم
+        .limit(CHAT_LIMIT)
+        .get()
+    );
 
     // نُرفق معرّف المستند مع كل رسالة.
     //
@@ -1098,8 +1144,15 @@ app.get('/api/driver_chats', requireIdentity, async (req, res) => {
     // وأي اختلاف بسيط في صيغة الوقت يُظهر الرسالة مرّتين.
     const messages = [];
     snapshot.forEach(doc => messages.push({ id: doc.id, ...doc.data() }));
+    // قرأناها من الأحدث للأقدم لنقتطع القديم؛ والتطبيق يعرضها بالترتيب
+    // الزمني، فنعيدها إلى نصابها قبل الإرسال.
+    messages.reverse();
     res.json(messages);
   } catch (error) {
+    if (error && error.checkFailed) {
+      return res.status(503).json({ success: false, busy: true,
+        error: 'الخدمة مشغولة الآن — أعد المحاولة بعد قليل' });
+    }
     console.error('❌ Error fetching chats:', error);
     res.status(500).json({ success: false, error: error.message });
   }
