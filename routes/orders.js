@@ -288,24 +288,41 @@ router.get('/', needsIdentity, async (req, res) => {
                 return res.status(403).json({ success: false, error: 'تعذّر التعرّف على حسابك' });
             }
             const type = String(me.userType || 'customer');
+            const myId = String(me.id), myPhone = String(me.phone || '');
+            const myRest = String(me.ownedRestaurantId || '');
+            const q = req.query;
             restaurantId = driverId = customerPhone = undefined;
 
-            // المدير الداخل من التطبيق (لا من اللوحة بالمفتاح) يرى كل شيء،
-            // وإلا عُومل كزبون فلا يرى إلا طلباته هو — وشاشة الإدارة تفرغ.
+            /* القاعدة: يحقّ لك أن تطلب أي نطاق تُثبت أنه لك.
+             *
+             * كنت أشتقّ النطاق من userType وحده. وهذا يكسر كل حالة يعمل
+             * فيها شخص بأكثر من دور — وهي الحالة الطبيعية عندنا: صاحب
+             * المنصّة يوصّل بنفسه، وصاحب مطعم قد يكون مندوباً أيضاً.
+             * فحسابٌ نوعه «مطعم» يفتح تطبيق الكابتن ويقبل طلباً، ثم
+             * يختفي الطلب من أمامه لأن السيرفر أعطاه طلبات مطعمه لا
+             * طلباته كمندوب — وهو ماسكٌ الطلب بيده.
+             *
+             * الأمان محفوظ: لا يُقبل إلا ما يطابق هويتك المسجّلة.
+             */
             if (type === 'manager' || type === 'admin') {
-                restaurantId = req.query.restaurantId;
-                driverId = req.query.driverId;
-                customerPhone = req.query.customerPhone;
-            } else if (type === 'driver') {
-                driverId = String(me.id);
-            } else if (type === 'restaurant') {
-                if (!me.ownedRestaurantId) {
-                    return res.json([]);   // مطعم بلا مطعم مرتبط: لا شيء يخصّه
-                }
-                restaurantId = String(me.ownedRestaurantId);
+                restaurantId = q.restaurantId; driverId = q.driverId; customerPhone = q.customerPhone;
             } else {
-                if (!me.phone) return res.json([]);   // زبون بلا رقم: لا طلبات بعد
-                customerPhone = String(me.phone);
+                if (q.driverId && (String(q.driverId) === myId || (myPhone && String(q.driverId) === myPhone))) {
+                    driverId = String(q.driverId);
+                }
+                if (q.restaurantId && myRest && String(q.restaurantId) === myRest) {
+                    restaurantId = myRest;
+                }
+                if (q.customerPhone && myPhone && String(q.customerPhone) === myPhone) {
+                    customerPhone = myPhone;
+                }
+                // لم يطلب نطاقاً صالحاً؟ نُعطيه نطاقه الافتراضي حسب نوعه
+                if (!driverId && !restaurantId && !customerPhone) {
+                    if (type === 'driver') driverId = myId;
+                    else if (type === 'restaurant' && myRest) restaurantId = myRest;
+                    else if (myPhone) customerPhone = myPhone;
+                    else return res.json([]);
+                }
             }
         }
 
