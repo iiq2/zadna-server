@@ -266,11 +266,18 @@ router.post('/', needsIdentity, async (req, res) => {
           data: { orderId: savedId, type: 'new_order' },
         }).catch(() => {});
       }
-      // الزبون: نجح الطلب — هنا تأتي أغنية زادنا
+      /* الزبون: وصلنا طلبك — بنغمة تحديث، لا بالأغنية.
+       *
+       * كانت الأغنية تعمل هنا وعند التسليم معاً، فيسمعها الزبون
+       * مرّتين في الطلب الواحد. واللحن الذي يتكرّر يفقد معناه:
+       * يصير صوتاً كأي صوت، ثم يُملّ، ثم يُطفأ.
+       *
+       * مكانها الصحيح لحظة واحدة: حين يمسك طلبه بيده. عندها تكون
+       * خاتمةً يتذكّرها، لا إشعاراً يمرّ. */
       notifyCustomer(req.app, orderData.customerPhone, {
         title: 'تم استلام طلبك 🎉',
         body: `طلبك من ${orderData.restaurant || 'زادنا'} — ${money}`,
-        channel: 'success',
+        channel: 'update',
         data: { orderId: savedId, type: 'order_placed' },
       }).catch(() => {});
 
