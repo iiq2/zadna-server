@@ -9,6 +9,54 @@ const needsIdentity = (req, res, next) => {
   return fn ? fn(req, res, next) : next();
 };
 const { cached, invalidate, updateCached } = require('../utils/cache');
+const { quoteDelivery } = require('./zones');
+
+/* ============================================================
+   تسعير الطلب — السيرفر هو من يحسب، لا التطبيق.
+
+   كان `const orderData = req.body` يُحفظ كما ورد: لا سطر واحد يقارن
+   المبلغ بأسعار المنيو. من يعدّل التطبيق أو يرسل الطلب مباشرة يشتري
+   بشيكل واحد ما ثمنه مئتان — والرقم المزوَّر يصير هو الحقيقة المالية
+   التي تُحسب عليها عمولتك ودين المندوب ومستحق المطعم.
+
+   الآن: يرسل التطبيق الأصناف وكمياتها، والسيرفر يجلب أسعارها من
+   المنيو ويحسب المجموع، ويتجاهل أي مبلغ مرسل.
+
+   STRICT_ORDER_PRICING=1 على Render يرفض أي طلب بلا أصناف. اتركه
+   مطفأً حتى يُحدِّث الجميع تطبيقاتهم، ثم شغّله ليُغلق الباب نهائياً.
+   ============================================================ */
+const STRICT_PRICING = process.env.STRICT_ORDER_PRICING === '1';
+const r2 = (n) => Math.round(n * 100) / 100;
+
+async function priceItems(db, restaurantId, items) {
+  if (!Array.isArray(items) || items.length === 0) return null;
+
+  // مصدر الأسعار: منيو المطعم، أو مجموعة المارت لطلبات المارت
+  let priceOf = new Map();
+  const isMart = String(restaurantId) === 'mart_001';
+  if (isMart) {
+    const ids = [...new Set(items.map(i => String(i.id)))].slice(0, 60);
+    const snaps = await Promise.all(ids.map(id => db.collection('mart_products').doc(id).get()));
+    snaps.forEach(s => { if (s.exists) priceOf.set(s.id, Number(s.data().price) || 0); });
+  } else {
+    const doc = await db.collection('restaurants').doc(String(restaurantId)).get();
+    if (!doc.exists) return { error: 'المطعم غير موجود' };
+    (doc.data().menu || []).forEach(m => priceOf.set(String(m.id), Number(m.price) || 0));
+  }
+
+  let total = 0;
+  const unknown = [];
+  for (const it of items) {
+    const id = String(it.id || '');
+    const qty = Math.max(1, Math.min(99, parseInt(it.qty, 10) || 1));
+    if (!priceOf.has(id)) { unknown.push(id); continue; }
+    // الإضافات يرسلها التطبيق كمبلغ لكل وحدة؛ نقبلها ضمن سقف معقول
+    const extras = Math.max(0, Math.min(200, Number(it.extras) || 0));
+    total += (priceOf.get(id) + extras) * qty;
+  }
+  if (unknown.length) return { error: 'أصناف غير موجودة في المنيو: ' + unknown.join(', ') };
+  return { total: r2(total) };
+}
 // 5 دقائق: آمنة لأن كل إنشاء/تعديل طلب يُبطل الكاش فوراً،
 // و Socket.io يدفع التحديث للأجهزة لحظياً. الاستطلاع مجرد شبكة أمان.
 const ORDERS_TTL = 1800000;  // 30 دقيقة — الكاش يُحدَّث مكانه بعد كل كتابة
@@ -58,30 +106,108 @@ router.post('/', needsIdentity, async (req, res) => {
                   orderData.status = "READY_FOR_PICKUP";
           }
 
-      // Save to Firestore
-      await db.collection('orders').doc(orderId).set({
-              ...orderData,
-              createdAt: new Date()
-      });
+      // ===== التسعير من السيرفر =====
+      const priced = await priceItems(db, orderData.restaurantId, orderData.items);
+      if (priced && priced.error) {
+        return res.status(400).json({ success: false, error: priced.error });
+      }
+      if (priced) {
+        const claimed = Number(orderData.totalAmount) || 0;
+        if (Math.abs(claimed - priced.total) > 0.01) {
+          console.warn(`💰 مبلغ مخالف للمنيو: أرسل ${claimed} والصحيح ${priced.total} | طلب ${orderId}`);
+        }
+        orderData.totalAmount = priced.total;
+        orderData.amount = priced.total;
+      } else {
+        const msg = `طلب بلا أصناف — تعذّر التحقق من مبلغه (${orderData.totalAmount}) | ${orderId}`;
+        if (STRICT_PRICING) {
+          console.warn('⛔ ' + msg);
+          return res.status(400).json({ success: false, error: 'حدّث التطبيق لإتمام الطلب' });
+        }
+        console.warn('⚠️ ' + msg);
+      }
 
-      console.log(`✅ [Firestore] تم حفظ طلب جديد: ${orderId}`);
+      // أجرة التوصيل تُحسب هنا أيضاً — كانت تصل من التطبيق كما يشاء
+      try {
+        const q = await quoteDelivery(db, {
+          lat: orderData.customerLat, lng: orderData.customerLng,
+          restaurantId: orderData.restaurantId, zone: orderData.deliveryZone
+        });
+        if (q && q.success && Number.isFinite(Number(q.fee))) {
+          const sentFee = Number(orderData.deliveryFee) || 0;
+          if (Math.abs(sentFee - Number(q.fee)) > 0.01) {
+            console.warn(`🚚 أجرة مخالفة: أرسل ${sentFee} والصحيح ${q.fee} | طلب ${orderId}`);
+          }
+          orderData.deliveryFee = Number(q.fee);
+        }
+      } catch (e) { /* تعذّر التسعير: نُبقي المرسل ولا نُسقط الطلب */ }
+
+      // المجموع الذي يدفعه الزبون يُشتقّ ولا يُستقبل
+      orderData.grandTotal = r2((Number(orderData.totalAmount) || 0) + (Number(orderData.deliveryFee) || 0));
+
+      // Save to Firestore
+      //
+      // create لا set: كان معرّف الطلب ستّ خانات من الميلي ثانية، تتكرّر
+      // كل 16.67 دقيقة، و set تكتب فوق الموجود بصمت. عند ألف طلب يصير
+      // احتمال أن طلباً دهس طلباً 39% — زبون دفع ومندوب سلّم ولا أثر.
+      // create يرفض التكرار، فنولّد بديلاً بدل أن نمحو طلباً حقيقياً.
+      let finalId = orderId;
+      try {
+        await db.collection('orders').doc(finalId).create({ ...orderData, id: finalId, createdAt: new Date() });
+      } catch (e) {
+        if (e && (e.code === 6 || /ALREADY_EXISTS/i.test(String(e.message)))) {
+          finalId = `${orderId}-${Math.random().toString(36).slice(2, 7)}`;
+          console.warn(`⚠️ تصادم معرّف طلب — أُنقذ الطلب القديم ووُلّد بديل: ${finalId}`);
+          await db.collection('orders').doc(finalId).create({ ...orderData, id: finalId, createdAt: new Date() });
+        } else throw e;
+      }
+      const savedId = finalId;
+
+      console.log(`✅ [Firestore] تم حفظ طلب جديد: ${savedId}`);
 
       // Emit Real-time update
+      // ملاحظة: نستعمل savedId لا orderId — عند التصادم يختلفان، وبثّ
+      // الرقم القديم يجعل المندوب يفتح طلباً غير موجود.
       const io = req.app.get('socketio');
           if (io && isMart) {
                   io.emit('new_ready_order', {
-                            orderId: orderId,
+                            orderId: savedId,
                             restaurantName: orderData.restaurant || 'زادنا مارت',
                             location: { lat: 32.2211, lng: 35.2622 }
                   });
           }
 
+      /* إشعار المطعم بطلبه الجديد.
+       *
+       * كان البثّ لطلبات المارت وحدها. أما طلب المطعم فلا يُبثّ له شيء:
+       * يجلس صاحب المطعم أمام شاشته والطلب محفوظ على السيرفر منذ لحظات
+       * ولا يعلم به حتى يأتي الاستطلاع الدوري (45 ثانية) — والزبون في
+       * تلك الأثناء ينتظر ويظن أن المطعم يتجاهله.
+       *
+       * order_updated يكفي: كل التطبيقات تسمعه أصلاً وتُعيد الجلب عنده،
+       * فلا يحتاج الأمر حدثاً جديداً ولا تعديلاً في أي تطبيق. */
+      if (io && !isMart) {
+        io.emit('order_updated', {
+          orderId: savedId,
+          status: orderData.status || 'PENDING_RESTAURANT',
+          restaurantId: orderData.restaurantId || '',
+          isNew: true,
+          timestamp: new Date()
+        });
+      }
+
       // نحدّث الكاش مكانه بدل مسحه — يوفّر قراءة كاملة لكل طلب جديد
 
-      updateCached('orders:all', list => [{ ...orderData, id: orderId }, ...list].slice(0, ORDERS_LIMIT));
+      updateCached('orders:all', list => [{ ...orderData, id: savedId }, ...list].slice(0, ORDERS_LIMIT));
 
-
-      res.status(201).json({ success: true, id: orderId });
+      // نُعيد المبالغ التي أقرّها السيرفر ليعرضها التطبيق بدل أرقامه
+      res.status(201).json({
+        success: true,
+        id: savedId,
+        totalAmount: orderData.totalAmount,
+        deliveryFee: orderData.deliveryFee,
+        grandTotal: orderData.grandTotal
+      });
     } catch (error) {
           console.error('❌ خطأ Firestore:', error);
           res.status(500).json({ success: false, error: error.message });
@@ -91,11 +217,49 @@ router.post('/', needsIdentity, async (req, res) => {
 /**
  * GET /api/orders
  */
-router.get('/', async (req, res) => {
+router.get('/', needsIdentity, async (req, res) => {
     try {
         const db = getDb(req);
         if (!db) return res.json([]);
-        const { restaurantId, driverId, customerPhone } = req.query;
+        let { restaurantId, driverId, customerPhone } = req.query;
+
+        /* ===== النطاق يُفرض من التوكن، لا يُصدَّق من الاستعلام =====
+         *
+         * كان هذا المسار مفتوحاً بلا حارس، والفلاتر اختيارية: من يناديه بلا
+         * أي فلتر يحصل على كل طلبات المنصة — أسماء الزبائن وأرقامهم وعناوين
+         * بيوتهم ومبالغهم. أي متصفح، بلا حساب.
+         *
+         * الآن السيرفر يقرأ سجلّ صاحب التوكن ويشتقّ نطاقه بنفسه، ويتجاهل
+         * ما أرسله التطبيق. فحتى لو عُدِّل التطبيق ليطلب طلبات غيره، لا يصله
+         * إلا ما يخصّه. الإدارة وحدها تمرّ بلا تقييد.
+         */
+        if (!req.isAdmin) {
+            const loadUser = req.app.get('loadUser');
+            const me = loadUser ? await loadUser(req.user && req.user.userId) : null;
+            if (!me) {
+                return res.status(403).json({ success: false, error: 'تعذّر التعرّف على حسابك' });
+            }
+            const type = String(me.userType || 'customer');
+            restaurantId = driverId = customerPhone = undefined;
+
+            // المدير الداخل من التطبيق (لا من اللوحة بالمفتاح) يرى كل شيء،
+            // وإلا عُومل كزبون فلا يرى إلا طلباته هو — وشاشة الإدارة تفرغ.
+            if (type === 'manager' || type === 'admin') {
+                restaurantId = req.query.restaurantId;
+                driverId = req.query.driverId;
+                customerPhone = req.query.customerPhone;
+            } else if (type === 'driver') {
+                driverId = String(me.id);
+            } else if (type === 'restaurant') {
+                if (!me.ownedRestaurantId) {
+                    return res.json([]);   // مطعم بلا مطعم مرتبط: لا شيء يخصّه
+                }
+                restaurantId = String(me.ownedRestaurantId);
+            } else {
+                if (!me.phone) return res.json([]);   // زبون بلا رقم: لا طلبات بعد
+                customerPhone = String(me.phone);
+            }
+        }
 
         // نقرأ المجموعة كاملة مرة واحدة ونُخزّنها، ثم نفلتر في الذاكرة.
         // الفلترة داخل Firestore كانت تعني قراءة جديدة لكل مطعم ولكل استطلاع.
@@ -251,3 +415,5 @@ router.patch('/:id', needsIdentity, async (req, res) => {
 });
 
 module.exports = router;
+// مُصدَّرة للاختبار: مسار المال يستحق اختباراً مباشراً لا فحصاً بالنظر
+module.exports.priceItems = priceItems;

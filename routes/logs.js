@@ -4,6 +4,16 @@ const router = express.Router();
 const getDb = (req) => req.app.get('db');
 const MAX_KEEP = 300; // نحتفظ بآخر 300 خطأ فقط (توفير حصة Firestore)
 
+/* القراءة والمسح والتصفير للإدارة وحدها.
+   كانت هذه المسارات الثلاثة مفتوحة للعالم: سجلّ الأخطاء يحمل أرقام
+   هواتف الزبائن ومعرّفاتهم وأجهزتهم، ومسار التصفير يحذف طلبات
+   ومستخدمين. الإرسال (POST /logs) يبقى مفتوحاً لأن التطبيقات تبلّغ
+   عن أخطائها قبل تسجيل الدخول وليس معها مفتاح إدارة. */
+const adminOnly = (req, res, next) => {
+  const fn = req.app.get('requireAdmin');
+  return fn ? fn(req, res, next) : next();
+};
+
 // POST /api/logs — التطبيقات تبلّغ عن أي خطأ يواجهه المستخدم
 router.post('/logs', async (req, res) => {
   try {
@@ -34,7 +44,7 @@ router.post('/logs', async (req, res) => {
 });
 
 // GET /api/logs?limit=50&app=customer — للوحة المدير
-router.get('/logs', async (req, res) => {
+router.get('/logs', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.json([]);
@@ -50,7 +60,7 @@ router.get('/logs', async (req, res) => {
 });
 
 // DELETE /api/logs — مسح السجل (بعد المعالجة)
-router.delete('/logs', async (req, res) => {
+router.delete('/logs', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.json({ success: true, deleted: 0 });
@@ -66,7 +76,8 @@ router.delete('/logs', async (req, res) => {
 });
 
 // GET /api/diagnostics — فحص صحة النظام (استهلاك حصة ضئيل جداً)
-router.get('/diagnostics', async (req, res) => {
+// للإدارة: يكشف أي مفاتيح مضبوطة وحالة الذاكرة — معلومات تُعين مهاجماً.
+router.get('/diagnostics', adminOnly, async (req, res) => {
   const out = {
     server: 'up',
     uptimeMinutes: Math.round(process.uptime() / 60),
@@ -92,7 +103,7 @@ router.get('/diagnostics', async (req, res) => {
 });
 
 // POST /api/reset_experience — تنظيف بيانات الاختبار (آمن: يحذف المُعلَّم كتجريبي فقط)
-router.post('/reset_experience', async (req, res) => {
+router.post('/reset_experience', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });

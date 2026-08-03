@@ -7,6 +7,23 @@ const adminOnly = (req, res, next) => {
   const fn = req.app.get('requireAdmin');
   return fn ? fn(req, res, next) : next();
 };
+const needsIdentity = (req, res, next) => {
+  const fn = req.app.get('requireIdentity');
+  return fn ? fn(req, res, next) : next();
+};
+
+/* أرقامك المالية كانت مقروءة لأي زائر: إيراداتك، وديون كل مندوب،
+   ومستحقات كل مطعم. الآن: المندوب يرى محفظته هو، وصاحب المطعم يرى
+   مطعمه هو، والصورة الكاملة للإدارة وحدها.
+
+   نُبقي الرد نفسه غير مقيَّد بعد اجتياز الفحص كي لا تتغيّر التطبيقات. */
+async function selfOrAdmin(req, res, next, matches) {
+  if (req.isAdmin) return next();
+  const loadUser = req.app.get('loadUser');
+  const me = loadUser ? await loadUser(req.user && req.user.userId) : null;
+  if (me && matches(me, String(req.params.id))) return next();
+  return res.status(403).json({ success: false, error: 'لا تملك صلاحية الاطّلاع على هذه الأرقام' });
+}
 
 // ===== نموذج التحصيل =====
 // المندوب يدفع للمطعم كاش وقت الاستلام (ثمن الوجبة ناقص عمولة زادنا)
@@ -14,7 +31,10 @@ const adminOnly = (req, res, next) => {
 // المندوب يسدّد لزادنا يومياً: عمولة المطعم + عمولة التوصيل
 const RESTAURANT_COMMISSION = parseFloat(process.env.RESTAURANT_COMMISSION || '0.10');
 const DRIVER_COMMISSION     = parseFloat(process.env.DRIVER_COMMISSION || '0.10');
-const DEFAULT_DELIVERY_FEE  = parseFloat(process.env.DEFAULT_DELIVERY_FEE || '5');
+// 10 لا 5: هذا هو BASE_FEE في نظام التسعير (zones.js). كان الرقمان
+// مختلفين، فطلب بلا أجرة مسجَّلة يُحسب بنصف قيمته في كشف الحساب —
+// فتظهر على المندوب ديون أقل مما عليه، وعلى زادنا إيرادات أقل مما لها.
+const DEFAULT_DELIVERY_FEE  = parseFloat(process.env.DEFAULT_DELIVERY_FEE || '10');
 
 const orderTotal = (o) => {
   const v = o.totalAmount != null ? o.totalAmount : (o.total != null ? o.total : 0);
@@ -129,7 +149,10 @@ async function settlementsOf(db, driverId) {
 }
 
 // GET /api/wallet/driver/:id — كشف حساب المندوب (كم عليه لزادنا)
-router.get('/wallet/driver/:id', async (req, res) => {
+router.get('/wallet/driver/:id', needsIdentity,
+  (req, res, next) => selfOrAdmin(req, res, next,
+    (me, id) => String(me.id) === id || String(me.phone || '') === id),
+  async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success:false, error:'Database not connected' });
@@ -184,7 +207,10 @@ router.get('/wallet/driver/:id', async (req, res) => {
 });
 
 // GET /api/wallet/restaurant/:id — كشف المطعم (معلوماتي: المندوب يدفع مباشرة)
-router.get('/wallet/restaurant/:id', async (req, res) => {
+router.get('/wallet/restaurant/:id', needsIdentity,
+  (req, res, next) => selfOrAdmin(req, res, next,
+    (me, id) => String(me.ownedRestaurantId || '') === id),
+  async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success:false, error:'Database not connected' });
@@ -206,7 +232,7 @@ router.get('/wallet/restaurant/:id', async (req, res) => {
 });
 
 // GET /api/wallet/summary — ملخص المدير
-router.get('/wallet/summary', async (req, res) => {
+router.get('/wallet/summary', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success:false, error:'Database not connected' });
@@ -308,7 +334,7 @@ router.post('/wallet/settlement', adminOnly, async (req, res) => {
 });
 
 // GET /api/wallet/settlements — سجل التسويات
-router.get('/wallet/settlements', async (req, res) => {
+router.get('/wallet/settlements', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.json([]);

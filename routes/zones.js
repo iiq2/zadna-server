@@ -220,56 +220,67 @@ const validPoint = (lat, lng) =>
 
 // GET /api/delivery_quote?zone=z07&restaurantZone=z01 — كم أجرة هذه التوصيلة
 // أو بالمسافة: ?restaurantId=..&lat=..&lng=..  (يُفضَّل — أدق وأعدل)
+/**
+ * حساب أجرة التوصيل — المصدر الوحيد للرقم.
+ *
+ * استُخرج من مسار delivery_quote ليتمكّن مسار إنشاء الطلب من إعادة
+ * الحساب بنفسه. قبل ذلك كانت الأجرة تُحسب هنا للعرض فقط، ثم يرسل
+ * التطبيق ما يشاء عند الطلب — والسيرفر يحفظه كما ورد.
+ */
+async function quoteDelivery(db, { lat, lng, restaurantId, zone, restaurantZone }) {
+  // ——— المسار المفضَّل: مسافة حقيقية بين نقطتين ———
+  const cLat = parseFloat(lat), cLng = parseFloat(lng);
+  if (validPoint(cLat, cLng) && restaurantId && db) {
+    try {
+      const doc = await db.collection('restaurants').doc(String(restaurantId)).get();
+      const r = doc.exists ? doc.data() : null;
+      const rLat = r ? Number(r.lat) : NaN, rLng = r ? Number(r.lng) : NaN;
+      if (validPoint(rLat, rLng)) {
+        const km = haversineKm(rLat, rLng, cLat, cLng) * ROAD_FACTOR;
+        const fee = feeForKm(km);
+        return {
+          success: true, fee, baseFee: BASE_FEE, surcharge: fee - BASE_FEE,
+          distanceKm: Math.round(km * 100) / 100, method: 'distance',
+          note: `المسافة ${km.toFixed(1)} كم من ${r.name || 'المطعم'}`
+        };
+      }
+    } catch (e) { /* نسقط للمناطق */ }
+  }
+  // ——— الاحتياطي: نظام المناطق، حتى لا ينكسر الطلب بلا إحداثيات ———
+  let overrides = {};
+  if (db) {
+    try {
+      const snap = await db.collection('delivery_zones').get();
+      snap.forEach(d => { overrides[d.id] = d.data(); });
+    } catch (e) { /* حصة منتهية — نكمل بالافتراضي */ }
+  }
+  const cz = zoneById(String(zone || ''), overrides);
+  if (!cz) return { success: false, error: 'منطقة الزبون غير معروفة' };
+  let rz = null;
+  if (restaurantZone) rz = zoneById(String(restaurantZone), overrides);
+  else if (restaurantId && db) {
+    try {
+      const doc = await db.collection('restaurants').doc(String(restaurantId)).get();
+      if (doc.exists && doc.data().zoneId) rz = zoneById(String(doc.data().zoneId), overrides);
+    } catch (e) { /* تجاهل */ }
+  }
+  const q = computeFee(cz, rz);
+  return {
+    success: true, fee: q.fee, baseFee: q.baseFee, surcharge: q.surcharge, method: 'zone',
+    zoneName: cz.nameAr, restaurantZoneName: rz ? rz.nameAr : null,
+    note: q.surcharge > 0 ? `+${q.surcharge} ₪ لأن المطعم خارج وسط البلد` : null
+  };
+}
+
 router.get('/delivery_quote', async (req, res) => {
   try {
-    const db = getDb(req);
-
-    // ——— المسار المفضَّل: مسافة حقيقية بين نقطتين ———
-    const cLat = parseFloat(req.query.lat), cLng = parseFloat(req.query.lng);
-    if (validPoint(cLat, cLng) && req.query.restaurantId && db) {
-      try {
-        const doc = await db.collection('restaurants').doc(String(req.query.restaurantId)).get();
-        const r = doc.exists ? doc.data() : null;
-        const rLat = r ? Number(r.lat) : NaN, rLng = r ? Number(r.lng) : NaN;
-        if (validPoint(rLat, rLng)) {
-          const km = haversineKm(rLat, rLng, cLat, cLng) * ROAD_FACTOR;
-          const fee = feeForKm(km);
-          return res.json({
-            success: true,
-            fee,
-            baseFee: BASE_FEE,
-            surcharge: fee - BASE_FEE,
-            distanceKm: Math.round(km * 100) / 100,
-            method: 'distance',
-            note: `المسافة ${km.toFixed(1)} كم من ${r.name || 'المطعم'}`
-          });
-        }
-      } catch (e) { /* نسقط للمناطق */ }
-    }
-    // ——— الاحتياطي: نظام المناطق، حتى لا ينكسر الطلب بلا إحداثيات ———
-    let overrides = {};
-    if (db) {
-      try {
-        const snap = await db.collection('delivery_zones').get();
-        snap.forEach(d => { overrides[d.id] = d.data(); });
-      } catch (e) { /* حصة منتهية — نكمل بالافتراضي */ }
-    }
-    const cz = zoneById(String(req.query.zone || ''), overrides);
-    if (!cz) return res.status(400).json({ success: false, error: 'منطقة الزبون غير معروفة' });
-    let rz = null;
-    if (req.query.restaurantZone) rz = zoneById(String(req.query.restaurantZone), overrides);
-    else if (req.query.restaurantId && db) {
-      try {
-        const doc = await db.collection('restaurants').doc(String(req.query.restaurantId)).get();
-        if (doc.exists && doc.data().zoneId) rz = zoneById(String(doc.data().zoneId), overrides);
-      } catch (e) { /* تجاهل */ }
-    }
-    const q = computeFee(cz, rz);
-    res.json({
-      success: true, fee: q.fee, baseFee: q.baseFee, surcharge: q.surcharge,
-      zoneName: cz.nameAr, restaurantZoneName: rz ? rz.nameAr : null,
-      note: q.surcharge > 0 ? `+${q.surcharge} ₪ لأن المطعم خارج وسط البلد` : null
+    const out = await quoteDelivery(getDb(req), {
+      lat: req.query.lat, lng: req.query.lng,
+      restaurantId: req.query.restaurantId,
+      zone: req.query.zone, restaurantZone: req.query.restaurantZone
     });
+    if (!out.success) return res.status(400).json(out);
+    res.json(out);
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -320,3 +331,4 @@ router.get('/resolve_zone', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.quoteDelivery = quoteDelivery;

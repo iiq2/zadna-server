@@ -46,7 +46,12 @@ router.post('/partner_codes', adminOnly, async (req, res) => {
 });
 
 // GET /api/partner_codes — قائمة الأكواد وحالتها
-router.get('/partner_codes', async (req, res) => {
+//
+// ⛔ كان هذا المسار مفتوحاً للإنترنت كله. من يفتح الرابط يحصل على الأكواد
+// غير المستعملة ويسجّل نفسه مندوباً في زادنا — أي أن نظام «لا تسجيل إلا
+// بكود»، وهو حجر الأساس في معرفة من يحمل بضاعتك ونقودك، كان يسقط برابط
+// واحد. ويكشف أيضاً أرقام هواتف من استعمل كل كود.
+router.get('/partner_codes', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.json([]);
@@ -78,7 +83,8 @@ router.delete('/partner_codes/:code', adminOnly, async (req, res) => {
 // ==============================
 
 // GET /api/registered_partners
-router.get('/registered_partners', async (req, res) => {
+// كان يكشف أسماء كل شركائك وهواتفهم وإيميلاتهم لأي زائر.
+router.get('/registered_partners', adminOnly, async (req, res) => {
   try {
     const db = getDb(req);
     if (!db) return res.json([]);
@@ -116,6 +122,11 @@ router.post('/registered_partners/approve', adminOnly, async (req, res) => {
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
     await db.collection('users').doc(String(id)).update({ status: 'approved' });
+    // بلا هذين السطرين يبقى الاعتماد حبيس اللوحة: الشريك لا يعلم أنه اعتُمد
+    // حتى يُغلق تطبيقه ويفتحه، وكاش الحالة يظل يردّه دقيقةً كاملة.
+    const clr = req.app.get('clearStatusCache'); if (clr) clr(String(id));
+    const io0 = req.app.get('socketio');
+    if (io0) io0.emit('partner_status_changed', { id: String(id), status: 'approved', note: '' });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -132,6 +143,7 @@ router.post('/registered_partners/reject', adminOnly, async (req, res) => {
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
     const note = (req.body && req.body.note) || '';
     await db.collection('users').doc(String(id)).update({ status: 'rejected', statusNote: note, statusAt: new Date() });
+    const clr = req.app.get('clearStatusCache'); if (clr) clr(String(id));
     const io = req.app.get('socketio');
     if (io) io.emit('partner_status_changed', { id: String(id), status: 'rejected', note });
     res.json({ success: true });
@@ -151,6 +163,7 @@ router.post('/registered_partners/freeze', adminOnly, async (req, res) => {
     const note = (req.body && req.body.note) || '';
     await db.collection('users').doc(String(id)).update({ status: 'frozen', statusNote: note, statusAt: new Date() });
     // أبلغ الشريك فوراً عبر السوكت
+    const clr = req.app.get('clearStatusCache'); if (clr) clr(String(id));
     const io = req.app.get('socketio');
     if (io) io.emit('partner_status_changed', { id: String(id), status: 'frozen', note });
     res.json({ success: true, status: 'frozen' });
@@ -168,6 +181,7 @@ router.post('/registered_partners/unfreeze', adminOnly, async (req, res) => {
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
     await db.collection('users').doc(String(id)).update({ status: 'approved', statusNote: '', statusAt: new Date() });
+    const clr = req.app.get('clearStatusCache'); if (clr) clr(String(id));
     const io = req.app.get('socketio');
     if (io) io.emit('partner_status_changed', { id: String(id), status: 'approved', note: '' });
     res.json({ success: true, status: 'approved' });

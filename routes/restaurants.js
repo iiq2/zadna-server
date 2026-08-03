@@ -258,7 +258,10 @@ const REST_TTL = 600000;
 router.get('/', async (req, res) => {
     try {
           const db = getDb(req);
-          const restaurants = await cached('restaurants:raw', REST_TTL, async () => {
+          // بلا قاعدة بيانات (فشل الاتصال أو انتهاء الحصة) كان النداء ينهار
+          // بخطأ 500، فيرى الزبون شاشة فارغة ورسالة عطل. المطاعم الأساسية
+          // موجودة في الكود، فالأولى أن نعرضها بدل أن نُسقط الواجهة كلها.
+          const restaurants = !db ? [] : await cached('restaurants:raw', REST_TTL, async () => {
             const snapshot = await db.collection('restaurants').get();
             const list = [];
             snapshot.forEach(doc => list.push({ id: doc.id, ...doc.data() }));
@@ -431,7 +434,7 @@ router.patch('/:id', adminOnly, async (req, res) => {
 });
 
 // POST /api/restaurants/:id/menu — إضافة وجبة
-router.post('/:id/menu', adminOnly, async (req, res) => {
+router.post('/:id/menu', needsIdentity, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
@@ -440,11 +443,31 @@ router.post('/:id/menu', adminOnly, async (req, res) => {
     const snap = await ref.get();
     let base = snap.exists ? snap.data() : demoRestaurants.find(r => r.id === req.params.id);
     if (!base) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
-    const item = req.body || {};
-    if (!item.name) return res.status(400).json({ success: false, error: 'اسم الوجبة مطلوب' });
-    item.id = item.id || ('item_' + Date.now());
-    if (item.available === undefined) item.available = true;
+    if (!(await ownsRestaurant(db, req, req.params.id, snap.exists ? base : null))) {
+      return res.status(403).json({ success: false, error: 'هذا المطعم ليس لك' });
+    }
+    const b = req.body || {};
+    const name = String(b.name || '').trim();
+    if (!name) return res.status(400).json({ success: false, error: 'اسم الوجبة مطلوب' });
+    const price = Number(b.price);
+    if (!Number.isFinite(price) || price < 0 || price > 10000) {
+      return res.status(400).json({ success: false, error: 'سعر غير صالح' });
+    }
+    // حقول معلومة فقط — لا نشر لجسم الطلب داخل المنيو
+    const item = {
+      id:          String(b.id || ('item_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6))),
+      name:        name.slice(0, 120),
+      price:       Math.round(price * 100) / 100,
+      description: String(b.description || '').slice(0, 400),
+      emoji:       String(b.emoji || '🍽️').slice(0, 8),
+      category:    String(b.category || '').slice(0, 60),
+      imageUrl:    String(b.imageUrl || '').slice(0, 500),
+      available:   b.available === undefined ? true : !!b.available
+    };
     const menu = Array.isArray(base.menu) ? base.menu.slice() : [];
+    if (menu.some(m => String(m.id) === item.id)) {
+      return res.status(409).json({ success: false, error: 'وجبة بهذا المعرّف موجودة' });
+    }
     menu.push(item);
     await ref.set({ ...base, menu }, { merge: true });
     res.status(201).json({ success: true, item });
@@ -454,7 +477,7 @@ router.post('/:id/menu', adminOnly, async (req, res) => {
 });
 
 // PATCH /api/restaurants/:id/menu/:itemId — تعديل وجبة (سعر/توفر/وصف)
-router.patch('/:id/menu/:itemId', adminOnly, async (req, res) => {
+router.patch('/:id/menu/:itemId', needsIdentity, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
@@ -463,10 +486,29 @@ router.patch('/:id/menu/:itemId', adminOnly, async (req, res) => {
     const snap = await ref.get();
     let base = snap.exists ? snap.data() : demoRestaurants.find(r => r.id === req.params.id);
     if (!base) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
+    if (!(await ownsRestaurant(db, req, req.params.id, snap.exists ? base : null))) {
+      return res.status(403).json({ success: false, error: 'هذا المطعم ليس لك' });
+    }
     const menu = Array.isArray(base.menu) ? base.menu.slice() : [];
     const idx = menu.findIndex(m => String(m.id) === String(req.params.itemId));
     if (idx === -1) return res.status(404).json({ success: false, error: 'الوجبة غير موجودة' });
-    menu[idx] = { ...menu[idx], ...req.body, id: menu[idx].id };
+    /* حقول معلومة فقط. نشر req.body كاملاً كان يسمح بحقن أي حقل في
+       الوجبة — بما فيها حقول يقرأها التسعير — أو بإفساد شكل المنيو. */
+    const patch = {};
+    if (req.body.name        !== undefined) patch.name        = String(req.body.name).slice(0, 120);
+    if (req.body.description !== undefined) patch.description = String(req.body.description).slice(0, 400);
+    if (req.body.emoji       !== undefined) patch.emoji       = String(req.body.emoji).slice(0, 8);
+    if (req.body.category    !== undefined) patch.category    = String(req.body.category).slice(0, 60);
+    if (req.body.imageUrl    !== undefined) patch.imageUrl    = String(req.body.imageUrl).slice(0, 500);
+    if (req.body.available   !== undefined) patch.available   = !!req.body.available;
+    if (req.body.price       !== undefined) {
+      const p = Number(req.body.price);
+      if (!Number.isFinite(p) || p < 0 || p > 10000) {
+        return res.status(400).json({ success: false, error: 'سعر غير صالح' });
+      }
+      patch.price = Math.round(p * 100) / 100;   // قرشان لا أكثر
+    }
+    menu[idx] = { ...menu[idx], ...patch, id: menu[idx].id };
     await ref.set({ ...base, menu }, { merge: true });
     res.json({ success: true, item: menu[idx] });
   } catch (error) {
@@ -475,7 +517,7 @@ router.patch('/:id/menu/:itemId', adminOnly, async (req, res) => {
 });
 
 // DELETE /api/restaurants/:id/menu/:itemId — حذف وجبة
-router.delete('/:id/menu/:itemId', adminOnly, async (req, res) => {
+router.delete('/:id/menu/:itemId', needsIdentity, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
@@ -484,6 +526,9 @@ router.delete('/:id/menu/:itemId', adminOnly, async (req, res) => {
     const snap = await ref.get();
     let base = snap.exists ? snap.data() : demoRestaurants.find(r => r.id === req.params.id);
     if (!base) return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
+    if (!(await ownsRestaurant(db, req, req.params.id, snap.exists ? base : null))) {
+      return res.status(403).json({ success: false, error: 'هذا المطعم ليس لك' });
+    }
     const menu = (Array.isArray(base.menu) ? base.menu : []).filter(m => String(m.id) !== String(req.params.itemId));
     await ref.set({ ...base, menu }, { merge: true });
     res.json({ success: true });
