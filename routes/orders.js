@@ -12,15 +12,23 @@ const { cached, invalidate, updateCached } = require('../utils/cache');
 const { quoteDelivery } = require('./zones');
 const { notifyRestaurant, notifyDrivers, notifyCustomer } = require('./push');
 
-/** نصّ الحالة كما يراه الزبون في الإشعار */
+/* نصّ الحالة كما يراه الزبون في الإشعار.
+ *
+ * أربع لحظات فقط تستحق أن تُوقظ جواله. كانت تسعاً، فيصل الزبون
+ * إشعار عند كل خطوة داخلية للمندوب: قبل الطلب، وصل المطعم، استلم،
+ * في الطريق — أربعة تنبيهات لشيء واحد. من يُزعَج هكذا يُطفئ إشعارات
+ * التطبيق كلها، فنخسر حتى التنبيه المهم.
+ *
+ * والنصوص تُطمئن لا تُقلق: «بانتظار مندوب» يقرأها الزبون كأن طلبه
+ * عالق، وهو ماشٍ عادي. لا نُطلعه على تفاصيل تشغيلنا الداخلية.
+ *
+ * الحالات المحذوفة عمداً: PREPARING (يكرّر ACCEPTED) ·
+ * DRIVER_ASSIGNED و AT_RESTAURANT (شأن داخلي) · ON_THE_WAY (يكرّر PICKED_UP)
+ */
 const CUSTOMER_NOTE = {
   ACCEPTED:         ['المطعم قبل طلبك ✅', 'جارٍ تحضير طلبك الآن'],
-  PREPARING:        ['قيد التحضير 👨‍🍳', 'طلبك تحت التحضير'],
-  READY_FOR_PICKUP: ['طلبك جاهز 📦', 'بانتظار مندوب ليستلمه'],
-  DRIVER_ASSIGNED:  ['المندوب قبل طلبك 🛵', 'في طريقه إلى المطعم'],
-  PICKED_UP:        ['المندوب استلم طلبك 🚀', 'في الطريق إليك'],
-  ON_THE_WAY:       ['المندوب في الطريق 🛵', 'اقترب من عندك'],
-  AT_RESTAURANT:    ['المندوب وصل المطعم 📍', 'يستلم طلبك الآن'],
+  READY_FOR_PICKUP: ['طلبك جاهز 📦', 'المندوب في طريقه لاستلامه'],
+  PICKED_UP:        ['المندوب استلم طلبك 🚀', 'في الطريق إليك الآن'],
   DELIVERED:        ['تم التوصيل ✅', 'صحتين وعافية — شكراً لطلبك من زادنا'],
   CANCELLED:        ['أُلغي الطلب ❌', 'تواصل معنا إن كان هناك خطأ'],
 };
@@ -451,8 +459,11 @@ router.patch('/:id', needsIdentity, async (req, res) => {
         // الزبون: نصّ مفهوم لكل حالة، ونغمة تناسبها
         const note = CUSTOMER_NOTE[status];
         if (note && cur.customerPhone) {
+          // success للتسليم (أغنية زادنا) · arrived للحظة خروج المندوب
+          // إليه · update للباقي. كانت arrived تُستعمل لـ«في الطريق»
+          // وهي نغمة جرس الباب — تُوهم الزبون أن أحداً على بابه.
           const ch = status === 'DELIVERED' ? 'success'
-                   : (status === 'ON_THE_WAY' || status === 'PICKED_UP') ? 'arrived'
+                   : status === 'PICKED_UP' ? 'arrived'
                    : 'update';
           notifyCustomer(req.app, cur.customerPhone, {
             title: note[0], body: note[1], channel: ch,
