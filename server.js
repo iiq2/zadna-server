@@ -1090,6 +1090,9 @@ app.use('/api', cleanupRouter);
 const reportsRouter = require('./routes/reports');
 app.use('/api', reportsRouter);
 
+const pushRouter = require('./routes/push');
+app.use('/api', pushRouter);
+
 // =====================
 // Routes - General
 // =====================
