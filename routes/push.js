@@ -30,14 +30,27 @@ const CHANNELS = {
   success: { id: 'zadna_success', sound: 'zadna_success', priority: 'high' },
 };
 
-/* ===== حفظ رموز الأجهزة ===== */
-// المستخدم قد يملك أكثر من جهاز (جوال وتابلت)، فالرموز مصفوفة.
+/* ===== حفظ رموز الأجهزة =====
 
-// POST /api/fcm_token  { token }
+   المستخدم قد يملك أكثر من جهاز (جوال وتابلت)، فالرموز مصفوفة.
+
+   ويملك أيضاً أكثر من تطبيق: صاحب المطعم يطلب عشاءه من تطبيق الزبون،
+   والمندوب يطلب لأهله. وكلها تُحفظ تحت حسابٍ واحد.
+
+   فلو لم نُميّز مصدر الرمز، ذهب كل إشعار إلى كل أجهزته: نجاح طلبه
+   كزبون — بأغنية زادنا — يرنّ على لوحة تحكم مطعمه، وإنذار «طلب جديد
+   وصلك» يرنّ في يده وهو جالس زبوناً. لذلك نحفظ مع كل رمز التطبيق
+   الذي جاء منه.
+   ===================================================================== */
+
+const APPS = new Set(['customer', 'captain', 'merchant']);
+
+// POST /api/fcm_token  { token, app }
 router.post('/fcm_token', needsIdentity, async (req, res) => {
   try {
     const db = getDb(req);
     const token = String((req.body && req.body.token) || '').trim();
+    const app = String((req.body && req.body.app) || '').trim();
     const uid = String((req.user && req.user.userId) || '');
     if (!db || !uid) return res.status(400).json({ success: false, error: 'لا يمكن تسجيل الجهاز' });
     if (token.length < 20) return res.status(400).json({ success: false, error: 'رمز جهاز غير صالح' });
@@ -46,10 +59,22 @@ router.post('/fcm_token', needsIdentity, async (req, res) => {
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ success: false, error: 'الحساب غير موجود' });
 
-    const cur = Array.isArray(snap.data().fcmTokens) ? snap.data().fcmTokens : [];
-    if (!cur.includes(token)) {
+    const d = snap.data();
+    const cur = Array.isArray(d.fcmTokens) ? d.fcmTokens : [];
+    // fcmDevices هو المرجع الجديد؛ fcmTokens يبقى لتوافق النسخ القديمة
+    const devs = Array.isArray(d.fcmDevices) ? d.fcmDevices : [];
+    const known = devs.find(x => x && x.token === token);
+
+    // نُعيد الكتابة أيضاً إن تغيّر وسم التطبيق: جهازٌ سُجّل بنسخة قديمة
+    // بلا وسم يُصحَّح أول ما يفتح التطبيق المحدَّث، فلا يبقى مجهولاً.
+    if (!known || (APPS.has(app) && known.app !== app)) {
+      const rest = devs.filter(x => x && x.token !== token);
+      const entry = { token, app: APPS.has(app) ? app : null, at: Date.now() };
       // نُبقي آخر 5 أجهزة فقط — أكثر من ذلك يعني أجهزة قديمة لم تُحذف
-      await ref.update({ fcmTokens: [token, ...cur].slice(0, 5) });
+      await ref.update({
+        fcmDevices: [entry, ...rest].slice(0, 5),
+        fcmTokens: [token, ...cur.filter(t => t !== token)].slice(0, 5),
+      });
     }
     res.json({ success: true });
   } catch (e) {
@@ -68,8 +93,13 @@ router.delete('/fcm_token', needsIdentity, async (req, res) => {
     const ref = db.collection('users').doc(uid);
     const snap = await ref.get();
     if (!snap.exists) return res.json({ success: true });
-    const cur = Array.isArray(snap.data().fcmTokens) ? snap.data().fcmTokens : [];
-    await ref.update({ fcmTokens: cur.filter(t => t !== token) });
+    const d = snap.data();
+    const cur = Array.isArray(d.fcmTokens) ? d.fcmTokens : [];
+    const devs = Array.isArray(d.fcmDevices) ? d.fcmDevices : [];
+    await ref.update({
+      fcmTokens: cur.filter(t => t !== token),
+      fcmDevices: devs.filter(x => x && x.token !== token),
+    });
     res.json({ success: true });
   } catch (e) {
     res.json({ success: true });   // فشل الإزالة لا يمنع الخروج
@@ -78,15 +108,33 @@ router.delete('/fcm_token', needsIdentity, async (req, res) => {
 
 /* ===== الإرسال ===== */
 
-async function tokensOf(db, userIds) {
+/**
+ * رموز أجهزة هؤلاء المستخدمين — لتطبيقٍ بعينه إن طُلب.
+ *
+ * `wantApp` هو ما يمنع تسرّب الإشعار بين تطبيقات الشخص الواحد.
+ * والجهاز غير الموسوم (سُجّل بنسخة سابقة لهذا الإصلاح) يُقبل دائماً:
+ * إقصاؤه يعني أن يصمت جوّال كل من لم يُحدّث بعد — وصمت الإشعارات
+ * أسوأ من تسرّبها.
+ */
+async function tokensOf(db, userIds, wantApp) {
   const ids = [...new Set(userIds.filter(Boolean).map(String))];
   if (!ids.length) return [];
   const snaps = await Promise.all(ids.map(id => db.collection('users').doc(id).get()));
   const out = [];
   snaps.forEach(s => {
     if (!s.exists) return;
-    const t = s.data().fcmTokens;
-    if (Array.isArray(t)) out.push(...t);
+    const d = s.data();
+    const devs = Array.isArray(d.fcmDevices) ? d.fcmDevices : null;
+    if (devs && devs.length) {
+      devs.forEach(x => {
+        if (!x || !x.token) return;
+        if (wantApp && x.app && x.app !== wantApp) return;   // تطبيق آخر لنفس الشخص
+        out.push(x.token);
+      });
+      return;
+    }
+    // لا سجلّ أجهزة بعد — نرجع للمصفوفة القديمة كما كانت
+    if (Array.isArray(d.fcmTokens)) out.push(...d.fcmTokens);
   });
   return [...new Set(out)];
 }
@@ -137,8 +185,11 @@ async function cleanupDeadTokens(db, dead) {
   const snap = await db.collection('users').where('fcmTokens', 'array-contains-any', dead.slice(0, 10)).get();
   const jobs = [];
   snap.forEach(d => {
-    const keep = (d.data().fcmTokens || []).filter(t => !dead.includes(t));
-    jobs.push(d.ref.update({ fcmTokens: keep }));
+    const v = d.data();
+    jobs.push(d.ref.update({
+      fcmTokens: (v.fcmTokens || []).filter(t => !dead.includes(t)),
+      fcmDevices: (v.fcmDevices || []).filter(x => x && !dead.includes(x.token)),
+    }));
   });
   await Promise.all(jobs);
   console.log(`🧹 حُذف ${dead.length} رمز جهاز ميت`);
@@ -159,7 +210,8 @@ async function notifyRestaurant(app, restaurantId, { title, body, data }) {
       const us = await db.collection('users').where('ownedRestaurantId', '==', String(restaurantId)).get();
       us.forEach(u => ownerIds.push(u.id));
     }
-    const tokens = await tokensOf(db, ownerIds);
+    // تطبيق المطعم وحده — لا تطبيق الزبون على نفس الجوّال
+    const tokens = await tokensOf(db, ownerIds, 'merchant');
     return await push(db, tokens, { title, body, channel: 'alert', data });
   } catch (e) { console.warn('⚠️ إشعار المطعم:', e.message); }
 }
@@ -238,7 +290,7 @@ async function notifyDrivers(app, { title, body, data, restaurantLat, restaurant
       if (near.length) console.log('🛵 أقرب المناديب:', near.join(' · '));
     }
 
-    const tokens = await tokensOf(db, ids);
+    const tokens = await tokensOf(db, ids, 'captain');
     return await push(db, tokens, { title, body, channel: 'alert', data });
   } catch (e) { console.warn('⚠️ إشعار المناديب:', e.message); }
 }
@@ -250,7 +302,8 @@ async function notifyCustomer(app, customerPhone, { title, body, channel = 'upda
   try {
     const snap = await db.collection('users').where('phone', '==', String(customerPhone)).limit(1).get();
     if (snap.empty) return;
-    const tokens = await tokensOf(db, [snap.docs[0].id]);
+    // أغنية زادنا تذهب لتطبيق الزبون وحده — لا للوحة تحكم مطعمه
+    const tokens = await tokensOf(db, [snap.docs[0].id], 'customer');
     return await push(db, tokens, { title, body, channel, data });
   } catch (e) { console.warn('⚠️ إشعار الزبون:', e.message); }
 }
