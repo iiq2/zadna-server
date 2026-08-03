@@ -290,6 +290,8 @@ router.get('/', needsIdentity, async (req, res) => {
          * ما أرسله التطبيق. فحتى لو عُدِّل التطبيق ليطلب طلبات غيره، لا يصله
          * إلا ما يخصّه. الإدارة وحدها تمرّ بلا تقييد.
          */
+        // هل يتصفّح بصلاحية إدارة؟ (بمفتاح الإدارة أو بحساب مدير)
+        let asManager = !!req.isAdmin;
         if (!req.isAdmin) {
             const loadUser = req.app.get('loadUser');
             const me = loadUser ? await loadUser(req.user && req.user.userId) : null;
@@ -314,6 +316,7 @@ router.get('/', needsIdentity, async (req, res) => {
              * الأمان محفوظ: لا يُقبل إلا ما يطابق هويتك المسجّلة.
              */
             if (type === 'manager' || type === 'admin') {
+                asManager = true;
                 restaurantId = q.restaurantId; driverId = q.driverId; customerPhone = q.customerPhone;
             } else {
                 if (q.driverId && (String(q.driverId) === myId || (myPhone && String(q.driverId) === myPhone))) {
@@ -388,10 +391,30 @@ router.get('/', needsIdentity, async (req, res) => {
             rests.forEach(r => { if (r.phone) phoneById[String(r.id)] = String(r.phone); });
         } catch (e) { /* بلا أرقام أفضل من فشل الطلب كله */ }
 
-        const orders = filtered.map(o => ({
-            ...o,
-            restaurantPhone: o.restaurantPhone || phoneById[String(o.restaurantId)] || ''
-        }));
+        /* ============================================================
+           رقم الزبون للمندوب وحده.
+
+           المطعم والسوبرماركت لا يتّصلان بالزبون — التواصل رسائل، وما
+           استُشكل يأتي للإدارة. وشاشاتهما لا تعرض الرقم فعلاً، لكن
+           السيرفر كان **يرسله في الاستجابة**: موجود في ذاكرة التطبيق،
+           وفي أي أداة تُراقب الشبكة، وفي أي نسخة معدَّلة من التطبيق.
+           إخفاؤه في الواجهة ليس حمايةً — الحماية أن لا يُرسَل.
+
+           والقرار على **النطاق الممنوح لا على نوع الحساب**: صاحب حساب
+           «مطعم» يعمل مندوباً — وهي حالتك — يرى الرقم حين يتصفّح
+           كمندوب، ولا يراه حين يتصفّح كمطعم. الدور لحظتها هو الفيصل،
+           لا ما كُتب في سجلّه.
+           ============================================================ */
+        const hideCustomerPhone = !asManager && !!restaurantId && !driverId && !customerPhone;
+
+        const orders = filtered.map(o => {
+            const out = {
+                ...o,
+                restaurantPhone: o.restaurantPhone || phoneById[String(o.restaurantId)] || ''
+            };
+            if (hideCustomerPhone) delete out.customerPhone;
+            return out;
+        });
 
         res.json(orders);
     } catch (error) {
