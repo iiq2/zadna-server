@@ -11,6 +11,17 @@ const needsIdentity = (req, res, next) => {
 const { cached, invalidate, updateCached } = require('../utils/cache');
 const { quoteDelivery } = require('./zones');
 const { notifyRestaurant, notifyDrivers, notifyCustomer } = require('./push');
+const { priceMartItems } = require('./mart');
+
+/* رسالة الخطأ للزبون: عربية ومفيدة، والتفصيل يُسجَّل عندنا لا يُرسَل إليه.
+   نأخذها من السيرفر ليكون لسان المنصّة واحداً في كل مسار. */
+const fail = (req, res, error, what) => {
+  const fn = req.app.get('failJson');
+  if (fn) return fn(res, error, what);
+  console.error(`❌ ${what}:`, error && error.message);
+  return res.status(500).json({ success: false, error: 'تعذّر إتمام العملية — أعد المحاولة' });
+};
+
 
 /* نصّ الحالة كما يراه الزبون في الإشعار.
  *
@@ -54,17 +65,27 @@ async function priceItems(db, restaurantId, items) {
   if (!Array.isArray(items) || items.length === 0) return null;
 
   // مصدر الأسعار: منيو المطعم، أو مجموعة المارت لطلبات المارت
-  let priceOf = new Map();
-  const isMart = String(restaurantId) === 'mart_001';
+  const doc = await db.collection('restaurants').doc(String(restaurantId)).get();
+  if (!doc.exists) return { error: 'المحل غير موجود' };
+  const partner = doc.data() || {};
+
+  /* السوبرماركت يُسعَّر من كتالوجه هو.
+   *
+   * كان الشرط `restaurantId === 'mart_001'` وحده — أي مارت واحد في
+   * الدنيا، وأسعاره في مجموعة عامة يكتب فيها الجميع فوق الجميع.
+   * الآن لكل محلّ كتالوجه، ولكل صنف وحداته وأسعاره التي وضعها صاحبه.
+   *
+   * والفرق الجوهري عن المطعم: هناك سعر واحد للصنف، وهنا سعر لكل
+   * وحدة — كيلو البندورة غير حبّتها. لذلك مسار حساب مستقلّ لا شرط
+   * داخل المسار نفسه. */
+  const isMart = String(partner.partnerType || '') === 'market'
+    || String(restaurantId) === 'mart_001';
   if (isMart) {
-    const ids = [...new Set(items.map(i => String(i.id)))].slice(0, 60);
-    const snaps = await Promise.all(ids.map(id => db.collection('mart_products').doc(id).get()));
-    snaps.forEach(s => { if (s.exists) priceOf.set(s.id, Number(s.data().price) || 0); });
-  } else {
-    const doc = await db.collection('restaurants').doc(String(restaurantId)).get();
-    if (!doc.exists) return { error: 'المطعم غير موجود' };
-    (doc.data().menu || []).forEach(m => priceOf.set(String(m.id), Number(m.price) || 0));
+    return await priceMartItems(db, restaurantId, items);
   }
+
+  const priceOf = new Map();
+  (partner.menu || []).forEach(m => priceOf.set(String(m.id), Number(m.price) || 0));
 
   let total = 0;
   const unknown = [];
@@ -266,8 +287,7 @@ router.post('/', needsIdentity, async (req, res) => {
         grandTotal: orderData.grandTotal
       });
     } catch (error) {
-          console.error('❌ خطأ Firestore:', error);
-          res.status(500).json({ success: false, error: error.message });
+          return fail(req, res, error, 'إنشاء طلب');
     }
 });
 
@@ -418,8 +438,7 @@ router.get('/', needsIdentity, async (req, res) => {
 
         res.json(orders);
     } catch (error) {
-        console.error('❌ خطأ GET Firestore:', error);
-        res.status(500).json({ success: false, error: error.message });
+        return fail(req, res, error, 'جلب الطلبات');
     }
 });
 
@@ -541,11 +560,190 @@ router.patch('/:id', needsIdentity, async (req, res) => {
 
       res.json({ success: true });
     } catch (error) {
-          console.error('❌ Error updating order:', error);
-          res.status(500).json({ success: false, error: error.message });
+          return fail(req, res, error, 'تحديث طلب');
     }
 });
+
+/* ============================================================
+   إلغاء الطلب — للزبون.
+
+   لم يكن له سبيل. من ضغط بالخطأ، أو ندم بعد ثانيتين، أو طلب من
+   المطعم الخطأ — لا زرّ أمامه. يتصل بك أنت وتفتح اللوحة وتُلغيه بيدك.
+   وهذا يعمل بثلاثة زبائن، لا بثلاثمئة.
+
+   والقاعدة عدلٌ بين طرفين:
+     • ما دام المطعم لم يقبل → الإلغاء حقّ للزبون بلا سؤال.
+     • بعد أن يقبل → المطبخ اشتغل والمال صُرف، فلا يُلغى إلا عبر
+       الإدارة. من يسمح بالإلغاء بعد الطبخ يُخسّر شركاءه ويفقدهم.
+     • واستثناء واحد: مهلة تسعين ثانية من لحظة الطلب. النقرة الخاطئة
+       تُكتشف في ثوانٍ، وقد يقبل المطعم في أقلّ منها — فلا نترك الزبون
+       بلا مخرج لأن المطعم كان سريعاً.
+   ============================================================ */
+const GRACE_MS = 90 * 1000;
+
+router.post('/:id/cancel', needsIdentity, async (req, res) => {
+  try {
+    const db = getDb(req);
+    const { id } = req.params;
+    if (!db) return res.status(500).json({ success: false, error: 'لا قاعدة بيانات' });
+
+    const ref = db.collection('orders').doc(String(id));
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+    const o = snap.data() || {};
+
+    // صاحب الطلب وحده — أو الإدارة
+    if (!req.isAdmin) {
+      const loadUser = req.app.get('loadUser');
+      const samePhone = req.app.get('samePhone') || ((a, b) => String(a) === String(b));
+      const me = loadUser ? await loadUser(req.user && req.user.userId) : null;
+      const myId = String((me && me.id) || (req.user && req.user.userId) || '');
+      const myType = String((me && me.userType) || '');
+      const isManager = myType === 'manager' || myType === 'admin';
+      const mine = (o.customerId && String(o.customerId) === myId)
+        || samePhone(o.customerPhone, me && me.phone);
+      if (!mine && !isManager) {
+        return res.status(403).json({ success: false, error: 'هذا ليس طلبك' });
+      }
+    }
+
+    const status = String(o.status || '');
+    if (status === 'CANCELLED') return res.json({ success: true, already: true });
+    if (status === 'DELIVERED') {
+      return res.status(400).json({ success: false, error: 'الطلب سُلّم — لا يمكن إلغاؤه' });
+    }
+
+    const createdMs = o.createdAt && o.createdAt.toDate
+      ? o.createdAt.toDate().getTime()
+      : Date.parse(o.createdAt || 0) || 0;
+    const inGrace = createdMs && (Date.now() - createdMs) < GRACE_MS;
+    const beforeAccept = status === 'PENDING_RESTAURANT';
+
+    if (!req.isAdmin && !beforeAccept && !inGrace) {
+      return res.status(409).json({
+        success: false,
+        error: 'المطعم بدأ تحضير طلبك — راسل الإدارة إن كان لا بدّ من الإلغاء'
+      });
+    }
+
+    const reason = String((req.body && req.body.reason) || '').slice(0, 200).trim();
+    await ref.update({
+      status: 'CANCELLED',
+      statusAr: STATUS_AR.CANCELLED,
+      cancelledBy: req.isAdmin ? 'admin' : 'customer',
+      cancelReason: reason,
+      cancelledAt: new Date(),
+    });
+    updateCached('orders:all', list =>
+      list.map(x => (String(x.id) === String(id) ? { ...x, status: 'CANCELLED' } : x)));
+
+    const io = req.app.get('socketio');
+    if (io) io.emit('order_updated', { orderId: String(id), status: 'CANCELLED', timestamp: new Date() });
+
+    // المطعم يجب أن يعرف فوراً — قد يكون بدأ فعلاً رغم أن حالته لم تتغيّر
+    if (o.restaurantId) {
+      notifyRestaurant(req.app, o.restaurantId, {
+        title: 'أُلغي طلب ❌',
+        body: `${o.itemsSummary || 'طلب'} — ألغاه الزبون`,
+        data: { orderId: String(id), type: 'order_cancelled' },
+      }).catch(() => {});
+    }
+
+    console.log(`❌ أُلغي الطلب ${id} — ${req.isAdmin ? 'الإدارة' : 'الزبون'}${reason ? ' · ' + reason : ''}`);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('❌ إلغاء طلب:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/* ============================================================
+   مهلة ردّ المطعم — لا طلب يعلّق إلى الأبد.
+
+   صاحب المطعم قد يكون نائماً، أو جواله مغلق، أو نسي. والطلب يبقى
+   «بانتظار موافقة المطعم» إلى ما لا نهاية: الزبون ينتظر ولا خبر،
+   وأنت لا تعلم، ولا أحد يُغلق الدائرة. وهذا أسوأ ما يُروى عن تطبيق
+   توصيل في أسبوعه الأول.
+
+   ثلاث مراحل مقصودة — لا إلغاء فوريّ:
+     ٥ دقائق  → تذكير للمطعم (ربّما لم يسمع الأول)
+     ١٠ دقائق → إبلاغك أنت، وطمأنة الزبون بصدق
+     ٢٠ دقيقة → إلغاء تلقائي، فانتظارٌ بلا نهاية أسوأ من «لا»
+
+   وتُقرأ من الكاش لا من Firestore — فلا تكلّف قراءة واحدة إضافية.
+   ============================================================ */
+const NUDGE_MS  = Number(process.env.REST_NUDGE_MIN  || 5)  * 60000;
+const ALERT_MS  = Number(process.env.REST_ALERT_MIN  || 10) * 60000;
+const EXPIRE_MS = Number(process.env.REST_EXPIRE_MIN || 20) * 60000;
+
+const _staleSeen = new Map();   // معرّف الطلب → آخر مرحلة أُبلغ عنها
+
+function startRestaurantTimeout(app) {
+  const tick = async () => {
+    try {
+      const db = app.get('db');
+      if (!db) return;
+      // نقرأ الكاش نفسه الذي يستعمله GET — بلا استعلام جديد
+      const list = await cached('orders:all', ORDERS_TTL, async () => []);
+      if (!Array.isArray(list) || !list.length) return;
+      const now = Date.now();
+
+      for (const o of list) {
+        if (String(o.status || '') !== 'PENDING_RESTAURANT') { _staleSeen.delete(String(o.id)); continue; }
+        const created = o.createdAt && o.createdAt.toDate
+          ? o.createdAt.toDate().getTime()
+          : Date.parse(o.createdAt || 0) || 0;
+        if (!created) continue;
+        const age = now - created;
+        const id = String(o.id);
+        const stage = _staleSeen.get(id) || 0;
+
+        if (age >= EXPIRE_MS && stage < 3) {
+          _staleSeen.set(id, 3);
+          await db.collection('orders').doc(id).update({
+            status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
+            cancelledBy: 'system', cancelReason: 'لم يردّ المطعم', cancelledAt: new Date(),
+          });
+          updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED' } : x)));
+          const io = app.get('socketio');
+          if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
+          notifyCustomer(app, o.customerPhone, {
+            title: 'اعتذارنا — أُلغي طلبك',
+            body: 'المطعم لم يردّ. لم يُخصم منك شيء، وجرّب مطعماً آخر',
+            channel: 'update', data: { orderId: id, type: 'status', status: 'CANCELLED' },
+          }).catch(() => {});
+          console.warn(`⏰ أُلغي الطلب ${id} — المطعم ${o.restaurantId} لم يردّ خلال ${EXPIRE_MS / 60000} دقيقة`);
+
+        } else if (age >= ALERT_MS && stage < 2) {
+          _staleSeen.set(id, 2);
+          // الصدق أفضل من الصمت: الزبون ينتظر ويستحق أن يعرف
+          notifyCustomer(app, o.customerPhone, {
+            title: 'طلبك ما زال بانتظار المطعم',
+            body: 'نحاول الوصول إليهم — سنُبلغك فوراً',
+            channel: 'update', data: { orderId: id, type: 'status', status: 'PENDING_RESTAURANT' },
+          }).catch(() => {});
+          console.warn(`⚠️ الطلب ${id} بلا ردّ منذ ${Math.round(age / 60000)} دقيقة · مطعم ${o.restaurantId}`);
+
+        } else if (age >= NUDGE_MS && stage < 1) {
+          _staleSeen.set(id, 1);
+          notifyRestaurant(app, o.restaurantId, {
+            title: '⏰ طلب ينتظر ردّك',
+            body: `${o.itemsSummary || 'طلب'} — زبونك ينتظر`,
+            data: { orderId: id, type: 'new_order' },
+          }).catch(() => {});
+        }
+      }
+      if (_staleSeen.size > 500) _staleSeen.clear();
+    } catch (e) {
+      console.warn('⚠️ مهلة المطعم:', e.message);
+    }
+  };
+  const t = setInterval(tick, 60000);
+  if (t.unref) t.unref();
+  console.log(`⏰ مهلة ردّ المطعم مفعّلة — تذكير ${NUDGE_MS / 60000}د · إبلاغ ${ALERT_MS / 60000}د · إلغاء ${EXPIRE_MS / 60000}د`);
+}
 
 module.exports = router;
 // مُصدَّرة للاختبار: مسار المال يستحق اختباراً مباشراً لا فحصاً بالنظر
 module.exports.priceItems = priceItems;
+module.exports.startRestaurantTimeout = startRestaurantTimeout;
