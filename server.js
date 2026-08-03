@@ -927,6 +927,22 @@ async function chatIdentityOf(req) {
   return { senderId: String(me.id), senderRole: 'customer', senderName: 'الزبون' };
 }
 
+/* توحيد صيغة الهاتف قبل المقارنة.
+ *
+ * الرقم الواحد يُكتب عندنا بأربع صور: 0599123456 و +970599123456
+ * و 00970599123456 و 059-912-3456. والمقارنة الحرفية تعتبرها أربعة
+ * أشخاص. وهذا ما كان يمنع الزبون من دخول شات طلبه هو. */
+function samePhone(a, b) {
+  const norm = (p) => {
+    let s = String(p || '').replace(/[\s\-()]/g, '');
+    s = s.replace(/^\+?9(70|72)/, '0').replace(/^00 ?9(70|72)/, '0');
+    return s;
+  };
+  const x = norm(a), y = norm(b);
+  return !!x && x === y;
+}
+app.set('samePhone', samePhone);
+
 /** هل لصاحب الطلب حقّ الدخول إلى هذه الغرفة؟ */
 async function canAccessRoom(req, roomId) {
   if (req.isAdmin) return true;
@@ -969,19 +985,43 @@ async function canAccessRoom(req, roomId) {
     return myType === 'driver' || myType === 'restaurant' || myType === 'manager';
   }
 
-  // غرفة طلب: لا يدخلها إلا أطرافه
+  /* غرفة طلب: لا يدخلها إلا أطرافه.
+   *
+   * وحين نمنع، نقول في السجلّ لماذا. المنع الصامت هنا كلّف ساعات:
+   * الزبون والمندوب يكتبان ولا تصل رسالة، والشاشة لا تُظهر سبباً،
+   * فلا يُعرف أهو رقم هاتف مختلف عن المسجَّل، أم معرّف طلب لا يطابق
+   * مستنده، أم حساب بلا هاتف أصلاً. سطرٌ واحد في السجلّ يحسم هذا. */
   try {
     if (!db) return false;
     const snap = await db.collection('orders').doc(roomId).get();
-    if (!snap.exists) return false;
+    if (!snap.exists) {
+      console.warn(`🔒 شات: لا يوجد طلب بالمعرّف "${roomId}" — الطالب ${myId}/${myType}`);
+      return false;
+    }
     const o = snap.data() || {};
     const drv = (o.driver && typeof o.driver === 'object')
       ? String(o.driver.id || o.driver.phone || '') : String(o.driverId || '');
-    if (drv && (drv === myId || drv === myPhone)) return true;
-    if (myPhone && String(o.customerPhone || '') === myPhone) return true;
+    if (drv && (drv === myId || samePhone(drv, myPhone))) return true;
+
+    /* الزبون: بمعرّفه أولاً ثم برقمه.
+     *
+     * المطابقة بالرقم وحده كانت تكسر شات الزبون مع مندوبه: صفحة
+     * الدفع تسمح بتعديل الرقم («تعديل ✏️»)، فمن كتب رقم زوجته أو
+     * رقماً بصيغة أخرى صار — في نظر الحارس — شخصاً غريباً عن طلبه.
+     * يكتب فلا تصل، ويكتب المندوب فلا يرى. المعرّف لا يتغيّر. */
+    if (o.customerId && String(o.customerId) === myId) return true;
+    if (samePhone(o.customerPhone, myPhone)) return true;
+
     if (me && me.ownedRestaurantId && String(o.restaurantId || '') === String(me.ownedRestaurantId)) return true;
+
+    console.warn(
+      `🔒 شات مرفوض · طلب ${roomId} · الطالب id=${myId} phone=${myPhone || '—'} type=${myType}` +
+      ` · على الطلب: مندوب=${drv || '—'} زبون=${o.customerPhone || '—'} مطعم=${o.restaurantId || '—'}` +
+      ` · مطعمي=${(me && me.ownedRestaurantId) || '—'}`
+    );
     return false;
   } catch (e) {
+    console.warn(`🔒 شات: تعثّر فحص الصلاحية للطلب ${roomId} — ${e.message}`);
     return false;
   }
 }
