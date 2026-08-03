@@ -27,8 +27,75 @@ app.set('socketio', io);
 // Middleware
 // =====================
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// جسم الطلب محدود بـ 256 كيلوبايت: لا حاجة لأكثر في أي مسار عندنا،
+// وبلا حدّ يستطيع أحدهم إرسال جسم بحجم ميغابايتات فيخنق ذاكرة السيرفر.
+app.use(express.json({ limit: '256kb' }));
+app.use(express.urlencoded({ extended: true, limit: '256kb' }));
+
+/* ============================================================
+   حدّ معدّل الطلبات — مكتوب هنا بلا حزمة خارجية عن قصد:
+   كل حزمة جديدة خطر على النشر، والسيرفر نسخة واحدة على Render
+   فالعدّ في الذاكرة كافٍ ودقيق.
+
+   كان لا يوجد أي حدّ إطلاقاً:
+     · تخمين كلمات المرور بلا مانع
+     · سكربت واحد يستهلك حصة Firestore (50 ألف قراءة) في دقائق
+       فتتوقف المنصة كلها — وهي حصة تصارعها أصلاً
+   ============================================================ */
+const _hits = new Map();
+setInterval(() => {                      // كنس دوري كي لا تكبر الخريطة بلا حد
+  const now = Date.now();
+  for (const [k, v] of _hits) if (now > v.reset) _hits.delete(k);
+}, 60000).unref();
+
+function rateLimit({ windowMs, max, key = 'g', message }) {
+  return (req, res, next) => {
+    const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+            || req.socket.remoteAddress || 'unknown';
+    const id = key + ':' + ip;
+    const now = Date.now();
+    let e = _hits.get(id);
+    if (!e || now > e.reset) { e = { count: 0, reset: now + windowMs }; _hits.set(id, e); }
+    e.count++;
+    if (e.count > max) {
+      const secs = Math.ceil((e.reset - now) / 1000);
+      res.set('Retry-After', String(secs));
+      console.warn('⏱️ تجاوز الحدّ:', id, req.method, req.originalUrl);
+      return res.status(429).json({
+        success: false,
+        error: message || `طلبات كثيرة جداً — حاول بعد ${secs} ثانية`
+      });
+    }
+    next();
+  };
+}
+
+// تسجيل الدخول والتسجيل: الهدف منع تخمين كلمات المرور
+app.use(['/api/auth/login', '/api/auth/register', '/api/auth/google'],
+  rateLimit({ windowMs: 300000, max: 20, key: 'auth',
+              message: 'محاولات دخول كثيرة — انتظر خمس دقائق' }));
+
+// إنشاء الطلبات: زبون حقيقي لا يرسل أكثر من بضعة طلبات في الدقيقة
+app.use('/api/orders',
+  (req, res, next) => req.method === 'POST'
+    ? rateLimit({ windowMs: 60000, max: 10, key: 'neworder' })(req, res, next)
+    : next());
+
+// فحص كود الانضمام: الصيغة ZADNA-DRV-XXXX أربعة أرقام = 9000 احتمال فقط.
+// بلا حدّ ضيّق يُخمَّن الكود كله في دقائق ويصير المخمِّن مندوباً عندك.
+// 10 محاولات في الساعة تكفي أي شريك حقيقي وتجعل التخمين مستحيلاً عملياً.
+app.use('/api/partner_codes',
+  (req, res, next) => /\/verify$/.test(req.path)
+    ? rateLimit({ windowMs: 3600000, max: 10, key: 'verify',
+                  message: 'محاولات كثيرة — تواصل مع إدارة زادنا للحصول على كودك' })(req, res, next)
+    : next());
+
+// سقف عام يحمي حصة Firestore من الاستنزاف.
+//
+// 600/دقيقة = 10 طلبات في الثانية من عنوان واحد. رقم مرتفع عن قصد: شبكات
+// الجوال في فلسطين تضع مشتركين كثيرين خلف عنوان واحد (CGNAT)، فحدّ ضيّق
+// يقطع الخدمة عن زبائن أبرياء. السكربت المُسيء يتجاوز هذا الرقم بأضعاف.
+app.use('/api', rateLimit({ windowMs: 60000, max: 600, key: 'all' }));
 
 // =====================
 // Firebase Configuration
@@ -143,6 +210,74 @@ function authMiddleware(req, res, next) {
  */
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
+/* ============================================================
+   حالة الحساب الحيّة — قلب التجميد الفوري.
+
+   كان التجميد يُفحص عند تسجيل الدخول وحده، والتوكن يعيش 90 يوماً.
+   فالمندوب الذي تجمّده اليوم يواصل استقبال الطلبات وتحصيل الكاش من
+   الزبائن ثلاثة أشهر، لأنه لن يسجّل دخولاً جديداً أبداً. زرّ التجميد
+   في لوحتك كان يقول «تم» ولا يفعل شيئاً — وهذا أسوأ أنواع الأعطال:
+   أداة سيطرة تبدو أنها تعمل.
+
+   الآن تُفحص الحالة عند كل طلب. والكاش (60 ثانية) ضروري: بدونه
+   يصير كل نداء قراءةً من Firestore فتُلتهم الحصة المجانية.
+   ============================================================ */
+const _statusCache = new Map();   // userId -> { status, at }
+const STATUS_TTL = 60000;
+
+async function accountBlockedReason(userId) {
+  if (!userId || !db) return null;
+  const hit = _statusCache.get(userId);
+  if (hit && (Date.now() - hit.at) < STATUS_TTL) return hit.reason;
+
+  let reason = null;
+  try {
+    const snap = await db.collection('users').doc(String(userId)).get();
+    if (snap.exists) {
+      const u = snap.data() || {};
+      if (u.isFrozen === true || u.status === 'frozen') {
+        reason = 'حسابك مجمّد من الإدارة ⛔ تواصل معنا لإعادة التفعيل';
+      } else if (u.isRejected === true || u.status === 'rejected') {
+        reason = 'تم رفض حسابك من الإدارة ❌';
+      } else if (u.status === 'pending' && (u.userType === 'driver' || u.userType === 'restaurant')) {
+        reason = 'حسابك قيد المراجعة — بانتظار موافقة الإدارة ⏳';
+      }
+    }
+  } catch (e) {
+    // تعذّرت القراءة: لا نُسقط الخدمة ولا نمنع مستخدماً سليماً بسبب عطل شبكة
+    console.warn('⚠️ تعذّر فحص حالة الحساب:', userId, e.message);
+    return null;
+  }
+  _statusCache.set(userId, { reason, at: Date.now() });
+  return reason;
+}
+
+/** تُنادى بعد كل تجميد/رفض/اعتماد ليسري المفعول في نفس اللحظة لا بعد دقيقة. */
+function clearStatusCache(userId) {
+  if (userId) _statusCache.delete(String(userId)); else _statusCache.clear();
+}
+app.set('clearStatusCache', clearStatusCache);
+
+/* سجلّ المستخدم مُكاشاً — تحتاجه المسارات لتعرف نطاق صاحب الطلب
+   (هاتفه، مطعمه) فتفرضه بنفسها بدل أن تصدّق ما يرسله التطبيق. */
+const _userCache = new Map();
+const USER_TTL = 120000;
+async function loadUser(userId) {
+  if (!userId || !db) return null;
+  const hit = _userCache.get(userId);
+  if (hit && (Date.now() - hit.at) < USER_TTL) return hit.user;
+  try {
+    const snap = await db.collection('users').doc(String(userId)).get();
+    const user = snap.exists ? { id: snap.id, ...snap.data() } : null;
+    _userCache.set(userId, { user, at: Date.now() });
+    return user;
+  } catch (e) {
+    console.warn('⚠️ تعذّرت قراءة سجلّ المستخدم:', userId, e.message);
+    return null;
+  }
+}
+app.set('loadUser', loadUser);
+
 function requireIdentity(req, res, next) {
   const adminKey = req.headers['x-admin-key'];
   if (ADMIN_KEY && adminKey === ADMIN_KEY) { req.isAdmin = true; return next(); }
@@ -164,7 +299,19 @@ function requireIdentity(req, res, next) {
     return res.status(401).json({ success: false, error: 'انتهت جلستك — سجّل دخولك من جديد' });
   }
   req.user = decoded;
-  next();
+
+  // حساب المدير من متغيّرات البيئة ليس في مجموعة users — لا حالة تُفحص له
+  if (decoded.userId === 'admin_root') { req.isAdmin = true; return next(); }
+
+  accountBlockedReason(decoded.userId)
+    .then(reason => {
+      if (reason) {
+        console.warn('⛔ حساب موقوف حاول العمل:', decoded.userId, '|', req.method, req.originalUrl);
+        return res.status(403).json({ success: false, error: reason, accountBlocked: true });
+      }
+      next();
+    })
+    .catch(() => next());   // عطل في الفحص لا يمنع مستخدماً سليماً
 }
 
 /** عمليات لا يجوز إلا للإدارة: التسويات، الأسعار، الاعتماد والتجميد. */
@@ -730,16 +877,105 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
 /**
  * POST /api/driver_chats
  */
-app.post('/api/driver_chats', async (req, res) => {
+/* ============================================================
+   قواعد هوية الشات — تُفرض هنا، لا في التطبيق.
+
+   كان هذا المسار مفتوحاً ويكتب `{...chatData}` كما وردت. أي شخص يرسل
+   senderName: "📢 الإدارة" فينتحل شخصيتك أمام مناديبك ويأمرهم بما شاء.
+   وقواعد الخصوصية التي وضعناها (الزبون بلا اسم، المندوب باسمه) كانت
+   مكتوبة في التطبيق وحده — والتطبيق ليس حارساً، فمن يعدّله يتجاوزها.
+
+   الآن السيرفر يشتقّ الاسم والدور من التوكن ويتجاهل ما يرسله العميل.
+   ============================================================ */
+async function chatIdentityOf(req) {
+  if (req.isAdmin) return { senderId: 'admin_root', senderRole: 'manager', senderName: '📢 الإدارة' };
+  const loadUser = req.app.get('loadUser');
+  const me = loadUser ? await loadUser(req.user && req.user.userId) : null;
+  if (!me) return null;
+  const t = String(me.userType || 'customer');
+  if (t === 'driver')     return { senderId: String(me.id), senderRole: 'driver',     senderName: (me.name || 'كابتن زادنا') };
+  if (t === 'restaurant') return { senderId: String(me.id), senderRole: 'restaurant', senderName: (me.name || 'المطعم') };
+  if (t === 'manager')    return { senderId: String(me.id), senderRole: 'manager',    senderName: '📢 الإدارة' };
+  // الزبون بلا اسم — حمايةً لخصوصيته أمام المندوب وأمام أي قارئ لاحق للسجل
+  return { senderId: String(me.id), senderRole: 'customer', senderName: 'الزبون' };
+}
+
+/** هل لصاحب الطلب حقّ الدخول إلى هذه الغرفة؟ */
+async function canAccessRoom(req, roomId) {
+  if (req.isAdmin) return true;
+
+  /* الهوية من التوكن أولاً، وسجلّ المستخدم إثراءٌ لا شرط.
+     كان الاعتماد على قراءة السجلّ وحده يعني أن أي تعثّر — نفاد حصة
+     Firestore، انقطاع لحظي، سجلّ لم يُنشأ بعد — يُقفل الشات في وجه
+     المندوب وهو يرى الغرفة أمامه فيظن أن التطبيق تعطّل. والتوكن موقَّع
+     ومُتحقَّق منه، فهو مصدر كافٍ للمعرّف والدور. */
+  const tokenId   = String((req.user && req.user.userId) || '');
+  const tokenType = String((req.user && req.user.userType) || '');
+  if (!tokenId) return false;
+
+  const loadUser = req.app.get('loadUser');
+  const me = loadUser ? await loadUser(tokenId) : null;
+  const myId = String((me && me.id) || tokenId);
+  const myPhone = String((me && me.phone) || '');
+  const myType = String((me && me.userType) || tokenType);
+
+  // غرفة الإدارة الخاصة بمندوب: admin_driver_<معرّف المندوب>
+  if (roomId.startsWith('admin_driver_')) {
+    const key = roomId.slice('admin_driver_'.length);
+    return key === myId || (myPhone && key === myPhone);
+  }
+  // الغرف العامة: للمناديب والإدارة فقط.
+  //
+  // لا بد من ذكر الأسماء الثلاثة جميعاً: التطبيق يفتح global_driver_chat
+  // من زرّ «غرفة الكباتن»، واللوحة تبثّ عليها، بينما global_zadna_chat هي
+  // القيمة الاحتياطية داخل ChatRepository. إغفال أيّها يردّ المندوب بـ403
+  // على غرفة يراها أمامه ويظن أن الشات تعطّل.
+  if (roomId === 'global_driver_chat' || roomId === 'global_zadna_chat' || roomId === 'manager_monitor') {
+    return myType === 'driver';
+  }
+
+  // غرفة طلب: لا يدخلها إلا أطرافه
+  try {
+    if (!db) return false;
+    const snap = await db.collection('orders').doc(roomId).get();
+    if (!snap.exists) return false;
+    const o = snap.data() || {};
+    const drv = (o.driver && typeof o.driver === 'object')
+      ? String(o.driver.id || o.driver.phone || '') : String(o.driverId || '');
+    if (drv && (drv === myId || drv === myPhone)) return true;
+    if (myPhone && String(o.customerPhone || '') === myPhone) return true;
+    if (me && me.ownedRestaurantId && String(o.restaurantId || '') === String(me.ownedRestaurantId)) return true;
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+app.post('/api/driver_chats', requireIdentity, async (req, res) => {
   try {
     const db = req.app.get('db');
-    const chatData = req.body;
-    const orderId = chatData.orderId || 'global_zadna_chat';
+    const orderId = String((req.body && req.body.orderId) || 'global_zadna_chat');
+
+    if (!(await canAccessRoom(req, orderId))) {
+      return res.status(403).json({ success: false, error: 'لا تملك صلاحية الكتابة في هذه المحادثة' });
+    }
+    const who = await chatIdentityOf(req);
+    if (!who) return res.status(403).json({ success: false, error: 'تعذّر التعرّف على حسابك' });
+
+    const text = String((req.body && req.body.text) || '').slice(0, 2000).trim();
+    if (!text) return res.status(400).json({ success: false, error: 'الرسالة فارغة' });
 
     if (db) {
+      // نكتب حقولاً معلومة فقط — لا نشر لجسم الطلب، فلا يستطيع أحد
+      // حقن حقول تُغيّر شكل المحادثة أو تنتحل هوية.
       await db.collection('chats').doc(orderId).collection('messages').add({
-        ...chatData,
-        createdAt: new Date()
+        orderId,
+        text,
+        senderId:   who.senderId,
+        senderName: who.senderName,
+        senderRole: who.senderRole,
+        timestamp:  (req.body && req.body.timestamp) || Date.now(),
+        createdAt:  new Date()
       });
     }
 
@@ -753,10 +989,15 @@ app.post('/api/driver_chats', async (req, res) => {
 /**
  * GET /api/driver_chats
  */
-app.get('/api/driver_chats', async (req, res) => {
+app.get('/api/driver_chats', requireIdentity, async (req, res) => {
   try {
     const db = req.app.get('db');
-    const orderId = req.query.orderId || 'global_zadna_chat';
+    const orderId = String(req.query.orderId || 'global_zadna_chat');
+
+    // كان أي شخص يقرأ أي محادثة بمجرد معرفة رقم الطلب — والأرقام من ستّ خانات
+    if (!(await canAccessRoom(req, orderId))) {
+      return res.status(403).json({ success: false, error: 'لا تملك صلاحية قراءة هذه المحادثة' });
+    }
 
     if (!db) return res.json([]);
 
@@ -802,6 +1043,12 @@ app.use('/api', logsRouter);
 const zonesRouter = require('./routes/zones');
 app.use('/api', zonesRouter);
 
+const cleanupRouter = require('./routes/cleanup');
+app.use('/api', cleanupRouter);
+
+const reportsRouter = require('./routes/reports');
+app.use('/api', reportsRouter);
+
 // =====================
 // Routes - General
 // =====================
@@ -839,28 +1086,41 @@ app.get('/api/app-info', (req, res) => {
 // =====================
 // Socket.io Events
 // =====================
-io.on('connection', (socket) => {
-  console.log('✅ مستخدم متصل بـ Real-time:', socket.id);
-  
-  // تحديث حالة الطلب في الـ real-time
-  socket.on('order_status_update', (data) => {
-    console.log('🔄 تحديث حالة طلب:', data.orderId, '→', data.status);
+/* نقرأ التوكن من المصافحة ونعلّق الهوية على الاتصال نفسه.
+   لا نرفض غير الموثَّق: التطبيق يتصل عند الإقلاع قبل الدخول، ويحتاج
+   الاستماع للأحداث العامة. لكن أي فعل باسم أحد يتطلب هوية مثبتة. */
+io.use((socket, next) => {
+  try {
+    const a = socket.handshake.auth || {};
+    const q = socket.handshake.query || {};
 
-    // إذا أصبح الطلب جاهزاً، نخبر جميع المناديب
-    if (data.status === 'ready_for_pickup' || data.status === 'ready') {
-      io.emit('new_ready_order', {
-        orderId: data.orderId,
-        restaurantName: data.restaurantName || 'زادنا مارت',
-        location: data.location || { lat: 32.2211, lng: 35.2622 }
-      });
+    // لوحة المدير تطبيق سطح مكتب لا يسجّل دخولاً بتوكن، بل تُثبت هويتها
+    // بمفتاح الإدارة — كما تفعل في نداءات HTTP. بدون هذا الفرع كان تعميم
+    // المدير على المناديب يُرفض بصمت ولا يصل أحداً فوراً.
+    const k = a.adminKey || q.adminKey;
+    if (k && ADMIN_KEY && String(k) === ADMIN_KEY) {
+      socket.data.user = { userId: 'admin_root', userType: 'manager' };
+      return next();
     }
 
-    io.emit('order_updated', {
-      orderId: data.orderId,
-      status: data.status,
-      timestamp: new Date()
-    });
-  });
+    const t = a.token || q.token;
+    if (t) {
+      const decoded = verifyToken(String(t));
+      if (decoded) socket.data.user = decoded;
+    }
+  } catch (e) { /* اتصال بلا هوية — مسموح للاستماع فقط */ }
+  next();
+});
+
+io.on('connection', (socket) => {
+  console.log('✅ مستخدم متصل بـ Real-time:', socket.id,
+              socket.data.user ? '| موثَّق: ' + socket.data.user.userId : '| بلا هوية');
+
+  /* أُزيل المستمع order_status_update.
+     لم يكن أي تطبيق يبثّه إطلاقاً (التطبيقات تمرّ عبر PATCH /orders/:id
+     الذي يفحص الصلاحية ثم يبثّ بنفسه)، بينما كان يسمح لأي متصل بالسوكت
+     أن يبثّ للناس كلهم أن طلباً صار جاهزاً أو تغيّرت حالته — إشعارات
+     كاذبة لكل المناديب بلا أي تحقق. مستمع ميت وباب مفتوح في آن. */
 
   // تحديث موقع المندوب
   socket.on('driver_location_update', (data) => {
@@ -875,6 +1135,12 @@ io.on('connection', (socket) => {
       console.warn('⚠️ موقع مندوب بلا إحداثيات صالحة:', data && data.driverId);
       return;
     }
+    // بلا هوية لا يُقبل موقع: وإلا بثّ أي شخص موقعاً باسم أي مندوب،
+    // فتُظهر خريطتك مندوباً في مكان ليس فيه وتوزّع الطلبات على أساسه.
+    const su = socket.data && socket.data.user;
+    if (!su) { console.warn('🔒 موقع من اتصال بلا هوية — رُفض'); return; }
+    // نتجاهل driverId المُرسل ونعتمد صاحب التوكن
+    data = Object.assign({}, data, { driverId: String(su.userId) });
     console.log('📍 تحديث موقع المندوب:', data.driverId, lat, lng);
     io.emit('driver_location', {
       driverId: data.driverId,
@@ -900,15 +1166,46 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_message', async (data) => {
-    console.log(`📩 New message in ${data.orderId}: ${data.text}`);
+    /* الهوية من التوكن لا من الرسالة.
+     *
+     * كان senderName يُؤخذ كما أُرسل، فيكتب أي متصل «📢 الإدارة» وينتحل
+     * شخصيتك أمام مناديبك — يأمرهم بتسليم طلب لعنوان آخر أو بترك موقعهم.
+     * وكانت قاعدة إخفاء اسم الزبون مطبَّقة في التطبيق وحده، فمن يعدّل
+     * التطبيق يكشف اسم كل زبون يكلّمه. الآن يشتقّها السيرفر ويفرضها. */
+    const u = socket.data && socket.data.user;
+    if (!u) {
+      console.warn('🔒 رسالة شات من اتصال بلا هوية — رُفضت');
+      return socket.emit('message_rejected', { error: 'انتهت جلستك — سجّل خروج ودخول' });
+    }
+
+    let who;
+    if (u.userId === 'admin_root' || u.userType === 'manager') {
+      who = { senderId: String(u.userId), senderRole: 'manager', senderName: '📢 الإدارة' };
+    } else {
+      const me = await loadUser(u.userId);
+      if (!me) return socket.emit('message_rejected', { error: 'تعذّر التعرّف على حسابك' });
+      const t = String(me.userType || 'customer');
+      who = {
+        senderId: String(me.id),
+        senderRole: t === 'driver' ? 'driver' : t === 'restaurant' ? 'restaurant' : 'customer',
+        senderName: t === 'driver'     ? (me.name || 'كابتن زادنا')
+                  : t === 'restaurant' ? (me.name || 'المطعم')
+                  : 'الزبون'      // الزبون بلا اسم — خصوصيته أمام المندوب وأمام السجل
+      };
+    }
+
+    const text = String(data && data.text || '').slice(0, 2000).trim();
+    if (!text) return;
+
+    console.log(`📩 رسالة في ${data.orderId} من ${who.senderRole}`);
 
     const messagePayload = {
       id: Date.now().toString(),
       orderId: data.orderId || 'global_zadna_chat',
-      senderId: data.senderId,
-      senderRole: data.senderRole,
-      senderName: data.senderName,
-      text: data.text,
+      senderId: who.senderId,
+      senderRole: who.senderRole,
+      senderName: who.senderName,
+      text,
       timestamp: new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' }),
       createdAt: new Date()
     };
@@ -918,14 +1215,15 @@ io.on('connection', (socket) => {
     const isGlobal = GLOBAL_ROOMS.includes(messagePayload.orderId);
     const targetRoom = isGlobal ? messagePayload.orderId : `order_room_${messagePayload.orderId}`;
 
-    // Save to Firestore if available
-    if (db) {
-      try {
-        await db.collection('chats').doc(messagePayload.orderId).collection('messages').add(messagePayload);
-      } catch (err) {
-        console.error('Error saving chat to firestore:', err);
-      }
-    }
+    /* لا نكتب هنا في Firestore.
+     *
+     * التطبيق يرسل كل رسالة مرتين: POST /api/driver_chats للحفظ، ثم
+     * send_message عبر السوكت للتوصيل الفوري. وكان كلاهما يكتب — فكل
+     * رسالة مخزَّنة نسختين: ضِعف استهلاك الحصة، وتكرار ظاهر في سجلّ
+     * المحادثة عند تحميله.
+     *
+     * تقسيم المسؤولية الآن: HTTP يحفظ (ويردّ بنتيجة يفحصها التطبيق
+     * فيعرف إن لم تصل رسالته)، والسوكت يوصِّل فوراً. */
 
     // Broadcast to specific order room (Customer/Driver sync)
     io.to(targetRoom).emit('receive_message', messagePayload);
