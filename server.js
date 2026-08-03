@@ -11,10 +11,53 @@ const Joi = require('joi');
 // كاش مشترك — يحمي حصة Firestore المجانية (٥٠ ألف قراءة/يوم)
 const { cached, invalidate } = require('./utils/cache');
 
+/* ============================================================
+   ردّ الخطأ للمستخدم.
+
+   ثلاث علل كانت في كل مسار:
+
+   ١) «حدث خطأ داخلي في السيرفر» — جملة تقنية باردة. الزبون يقرؤها
+      وهو يحاول التسجيل أول مرة، فلا يفهم ما جرى ولا ماذا يفعل،
+      فيحذف التطبيق ولا يعود. وهذا أول ما يلمسه كل مستخدم جديد.
+
+   ٢) وأسوأ: أحدها كان يُرسل `error.message` حرفياً — أي تفاصيل
+      قاعدة بياناتنا الداخلية إلى أي أحد يجرّب التسجيل. من يقرؤها
+      يعرف ما نستعمل وأين نتعثّر، وهي نصف طريق المهاجم.
+
+   ٣) ولا تُفرّق بين «عندنا خلل» و«الخدمة مضغوطة الآن». والفرق
+      يهمّ المستخدم: الأولى لا يفعل حيالها شيئاً، والثانية تكفيها
+      إعادة محاولة بعد دقيقة.
+
+   القاعدة: المستخدم يرى سبباً بالعربية وخطوة يفعلها، والتفصيل
+   الكامل يُسجَّل عندنا. لا نُخفي المعلومة، بل نضعها عند من يقرؤها.
+   ============================================================ */
+function failJson(res, error, what) {
+  const msg = String((error && error.message) || '');
+  const code = (error && error.code);
+  // 8 = RESOURCE_EXHAUSTED · 14 = UNAVAILABLE · 4 = DEADLINE_EXCEEDED
+  const busy = code === 8 || code === 14 || code === 4
+    || /RESOURCE_EXHAUSTED|Quota exceeded|UNAVAILABLE|DEADLINE_EXCEEDED/i.test(msg);
+
+  console.error(`❌ ${what}:`, msg);
+
+  if (busy) {
+    return res.status(503).json({
+      success: false, busy: true,
+      error: 'الخدمة مضغوطة الآن — أعد المحاولة بعد دقيقة',
+    });
+  }
+  return res.status(500).json({
+    success: false,
+    error: 'تعذّر إتمام العملية — أعد المحاولة، وإن تكرّر تواصل معنا',
+  });
+}
+
 dotenv.config();
 
 // إنشاء تطبيق Express
 const app = express();
+// تُشارَك مع المسارات في routes/ — رسالة واحدة في كل المنصّة، لا لهجات
+app.set('failJson', failJson);
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
@@ -534,11 +577,9 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
   } catch (error) {
-    console.error('❌ خطأ في التسجيل:', error);
-    return res.status(500).json({
-      success: false,
-      error: `حدث خطأ داخلي: ${error.message}`
-    });
+    /* الرسالة الداخلية لم تعد تُرسَل للمستخدم — كانت تكشف تفاصيلنا
+       لأي أحد يجرّب التسجيل. المستخدم يرى عربية، ونحن نرى التفصيل. */
+    return failJson(res, error, 'التسجيل');
   }
 });
 
@@ -621,8 +662,7 @@ app.post('/api/auth/google', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('❌ خطأ بدخول جوجل:', error);
-    return res.status(500).json({ success: false, error: 'خطأ داخلي — حاول مجدداً' });
+    return failJson(res, error, 'الدخول بجوجل');
   }
 });
 
@@ -799,11 +839,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
   } catch (error) {
-    console.error('❌ خطأ في الدخول:', error);
-    return res.status(500).json({
-      success: false,
-      error: 'حدث خطأ داخلي في السيرفر'
-    });
+    return failJson(res, error, 'تسجيل الدخول');
   }
 });
 
@@ -894,8 +930,7 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
     return res.json({ success: true, user: { id: userId, ...fresh } });
 
   } catch (error) {
-    console.error('❌ خطأ بتحديث الحساب:', error);
-    return res.status(500).json({ success: false, error: 'حدث خطأ داخلي' });
+    return failJson(res, error, 'تحديث الحساب');
   }
 });
 
@@ -1083,8 +1118,7 @@ app.post('/api/driver_chats', requireIdentity, async (req, res) => {
       return res.status(503).json({ success: false, busy: true,
         error: 'الخدمة مشغولة الآن — رسالتك لم تُرسَل، أعد المحاولة بعد قليل' });
     }
-    console.error('❌ Error saving chat:', error);
-    res.status(500).json({ success: false, error: error.message });
+    return failJson(res, error, 'حفظ رسالة');
   }
 });
 
@@ -1153,8 +1187,7 @@ app.get('/api/driver_chats', requireIdentity, async (req, res) => {
       return res.status(503).json({ success: false, busy: true,
         error: 'الخدمة مشغولة الآن — أعد المحاولة بعد قليل' });
     }
-    console.error('❌ Error fetching chats:', error);
-    res.status(500).json({ success: false, error: error.message });
+    return failJson(res, error, 'جلب المحادثة');
   }
 });
 
@@ -1169,9 +1202,15 @@ app.use('/api/restaurants', restaurantsRouter);
 // =====================
 const ordersRouter = require('./routes/orders');
 app.use('/api/orders', ordersRouter);
+// حارس الطلبات المعلّقة: مطعم لا يردّ لا يترك زبوناً ينتظر بلا نهاية
+if (ordersRouter.startRestaurantTimeout) ordersRouter.startRestaurantTimeout(app);
 
 const martRouter = require('./routes/mart');
 app.use('/api/mart_products', martRouter);
+
+// النسخة الاحتياطية — تُنزَّل على جهاز المدير، ولا تُحفظ على السيرفر
+const backupRouter = require('./routes/backup');
+app.use('/api/backup', backupRouter);
 
 const partnersRouter = require('./routes/partners');
 app.use('/api', partnersRouter);
@@ -1474,6 +1513,7 @@ const PORT = process.env.PORT || 5000;
 // ===== التقاط أخطاء السيرفر تلقائياً =====
 app.use((err, req, res, next) => {
   console.error(`🐞 [server/${req.method} ${req.path}] ${err.message}`);
+  // لا نُرسل تفاصيلنا للمستخدم — تُسجَّل عندنا وتُعرض له بالعربية
   if (db) { db.collection('error_logs').add({ level:'error', app:'server', screen:`${req.method} ${req.path}`, message:String(err.message).slice(0,500), detail:String(err.stack||'').slice(0,1500), createdAt:new Date() }).catch(()=>{}); }
   res.status(500).json({ success: false, error: 'حدث خطأ داخلي' });
 });
