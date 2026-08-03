@@ -968,13 +968,22 @@ app.post('/api/driver_chats', requireIdentity, async (req, res) => {
     if (db) {
       // نكتب حقولاً معلومة فقط — لا نشر لجسم الطلب، فلا يستطيع أحد
       // حقن حقول تُغيّر شكل المحادثة أو تنتحل هوية.
+      /* الوقت نصاً بنفس صيغة مسار السوكت بالضبط.
+       *
+       * كنت أخزّنه هنا رقماً (Date.now) بينما السوكت يخزّنه نصاً
+       * «04:29 ص». فنتج عطلان ظاهران للمستخدم:
+       *   · يظهر الوقت في الشاشة هكذا: 1.785720442168E12
+       *   · وتتكرّر كل رسالة مرتين، لأن التطبيق يمنع التكرار بمطابقة
+       *     (النص + الوقت + الاسم) — واختلاف صيغة الوقت يجعله يظنّ
+       *     النسختين رسالتين مختلفتين.
+       * createdAt يبقى تاريخاً حقيقياً للترتيب. */
       await db.collection('chats').doc(orderId).collection('messages').add({
         orderId,
         text,
         senderId:   who.senderId,
         senderName: who.senderName,
         senderRole: who.senderRole,
-        timestamp:  (req.body && req.body.timestamp) || Date.now(),
+        timestamp:  new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' }),
         createdAt:  new Date()
       });
     }
@@ -1007,8 +1016,13 @@ app.get('/api/driver_chats', requireIdentity, async (req, res) => {
       .orderBy('createdAt', 'asc')
       .get();
 
+    // نُرفق معرّف المستند مع كل رسالة.
+    //
+    // بدونه لا يملك التطبيق وسيلة يقينية ليعرف أن الرسالة القادمة من
+    // السيرفر هي نفسها التي عرضها عبر السوكت، فيقارن بالنص والوقت —
+    // وأي اختلاف بسيط في صيغة الوقت يُظهر الرسالة مرّتين.
     const messages = [];
-    snapshot.forEach(doc => messages.push(doc.data()));
+    snapshot.forEach(doc => messages.push({ id: doc.id, ...doc.data() }));
     res.json(messages);
   } catch (error) {
     console.error('❌ Error fetching chats:', error);
