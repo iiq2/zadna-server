@@ -112,6 +112,15 @@ router.post('/', needsIdentity, async (req, res) => {
           const db = getDb(req);
           const orderData = req.body;
 
+      /* صاحب الطلب — من التوكن لا من الجسم.
+       *
+       * الرقم وحده لا يكفي هويةً: صفحة الدفع تسمح بتعديله، فيطلب
+       * الزبون برقم زوجته أو بصيغة أخرى، ثم يُمنع من شات طلبه هو
+       * لأن الحارس لا يعرفه. والمعرّف من التوكن لا يُنتحل ولا يتبدّل.
+       *
+       * ولا نقبله من الجسم: من يرسله بنفسه ينسب طلبه لغيره. */
+      orderData.customerId = String((req.user && req.user.userId) || '');
+
       // Ensure ID is set
       const orderId = orderData.id || 'ORD_' + Date.now();
 
