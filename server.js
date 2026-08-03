@@ -663,17 +663,44 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
+    /* ===== الدخول بالرقم أو بالبريد =====
+     *
+     * كان البحث بالبريد وحده. والمندوب في نابلس ينسى بريده وقد لا يملك
+     * بريداً يستعمله أصلاً، بينما رقم جواله يحفظه عن ظهر قلب — وهو الرقم
+     * نفسه الذي سجّله عندنا ونحاسبه عليه.
+     *
+     * كلمة السر تبقى كلمته هو، لا تمرّ عبر واتساب ولا يعرفها أحد سواه.
+     */
+    const idRaw = String(email || '').trim();
+    // 059… أو 0568… أو بصيغة دولية +970 / 00972
+    const digits = idRaw.replace(/[\s\-()]/g, '');
+    const asLocalPhone =
+      /^\+?9(70|72)\d{9}$/.test(digits) ? '0' + digits.replace(/^\+?9(70|72)/, '')
+      : /^00 ?9(70|72)\d{9}$/.test(digits) ? '0' + digits.replace(/^00 ?9(70|72)/, '')
+      : /^0\d{9}$/.test(digits) ? digits
+      : null;
+
     // إذا كان Firebase متصل
     if (db) {
-      const userSnapshot = await db.collection('users')
-        .where('email', '==', email)
-        .limit(1)
-        .get();
+      let userSnapshot;
+      if (asLocalPhone) {
+        userSnapshot = await db.collection('users')
+          .where('phone', '==', asLocalPhone)
+          .limit(1)
+          .get();
+      } else {
+        userSnapshot = await db.collection('users')
+          .where('email', '==', idRaw)
+          .limit(1)
+          .get();
+      }
 
       if (userSnapshot.empty) {
         return res.status(401).json({
           success: false,
-          error: 'البريد الإلكتروني أو كلمة السر غير صحيحة'
+          error: asLocalPhone
+            ? 'رقم الجوال أو كلمة السر غير صحيحة'
+            : 'البريد الإلكتروني أو كلمة السر غير صحيحة'
         });
       }
 
