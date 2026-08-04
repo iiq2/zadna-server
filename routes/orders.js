@@ -320,6 +320,7 @@ router.get('/', needsIdentity, async (req, res) => {
          */
         // هل يتصفّح بصلاحية إدارة؟ (بمفتاح الإدارة أو بحساب مدير)
         let asManager = !!req.isAdmin;
+        let myUserId = '';   // يُملأ بعد التعرّف — يُطابَق به الطلب حين يختلف شكل الرقم
         if (!req.isAdmin) {
             const loadUser = req.app.get('loadUser');
             const me = loadUser ? await loadUser(req.user && req.user.userId) : null;
@@ -328,6 +329,7 @@ router.get('/', needsIdentity, async (req, res) => {
             }
             const type = String(me.userType || 'customer');
             const myId = String(me.id), myPhone = String(me.phone || '');
+            myUserId = myId;
             const myRest = String(me.ownedRestaurantId || '');
             const q = req.query;
             restaurantId = driverId = customerPhone = undefined;
@@ -353,7 +355,10 @@ router.get('/', needsIdentity, async (req, res) => {
                 if (q.restaurantId && myRest && String(q.restaurantId) === myRest) {
                     restaurantId = myRest;
                 }
-                if (q.customerPhone && myPhone && String(q.customerPhone) === myPhone) {
+                // مقارنة مُطبَّعة: التطبيق قد يرسل الرقم بصيغة تختلف عن
+                // المحفوظة في الحساب، فيسقط النطاق ويُحرم صاحبه من طلباته
+                const sp = req.app.get('samePhone') || ((a, b) => String(a) === String(b));
+                if (q.customerPhone && myPhone && sp(q.customerPhone, myPhone)) {
                     customerPhone = myPhone;
                 }
                 // لم يطلب نطاقاً صالحاً؟ نُعطيه نطاقه الافتراضي حسب نوعه
@@ -396,9 +401,21 @@ router.get('/', needsIdentity, async (req, res) => {
             filtered = filtered.filter(o => o.restaurantId === restaurantId);
         }
         if (customerPhone) {
-            // بدونها كان كل زبون يرى طلبات كل زبائن المنصة بأسمائهم وأرقامهم
+            /* بدونها كان كل زبون يرى طلبات كل زبائن المنصة بأسمائهم وأرقامهم.
+             *
+             * لكن المطابقة كانت **نصّية حرفية**، فكل طلب حُفظ برقمٍ بصيغة
+             * مختلفة (‎+970‎ · ‎00972‎ · شرطة · مسافة) يسقط من سجلّ صاحبه —
+             * فيرى الزبون تاريخه وقد مُحي، ويظنّ أننا حذفنا طلباته.
+             * والطلب لم يُمسّ: هو في قاعدة البيانات ولا يُطابَق.
+             *
+             * نطابق الآن بمعرّف الحساب أولاً — وهو لا يتغيّر شكله — ثم
+             * بالرقم مُطبَّعاً. `samePhone` هي نفسها التي يستعملها الدخول. */
+            const samePhone = req.app.get('samePhone') || ((a, b) => String(a).trim() === String(b).trim());
             const want = String(customerPhone).trim();
-            filtered = filtered.filter(o => String(o.customerPhone || '').trim() === want);
+            filtered = filtered.filter(o =>
+                (myUserId && o.customerId && String(o.customerId) === myUserId)
+                || samePhone(o.customerPhone, want)
+            );
         }
         if (driverId) {
             // كان أي مندوب يرى طلبات كل المناديب ويستطيع تعليمها "تم التوصيل"
