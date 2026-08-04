@@ -407,14 +407,30 @@ router.post('/', adminOnly, async (req, res) => {
   }
 });
 
-// PATCH /api/restaurants/:id — تعديل بيانات المطعم
-router.patch('/:id', adminOnly, async (req, res) => {
+/* PATCH /api/restaurants/:id — تعديل بيانات المطعم
+ *
+ * كان `adminOnly`: مفتاح الإدارة وحده. فصاحب المطعم يرفع صورة واجهته
+ * بنجاح ثم يُرفض عند حفظ الرابط — «رُفعت الصورة ولم تُحفظ». ولا يفهم
+ * لماذا، لأن الرفض جاء من بابٍ لا يعرف أنه يقف أمامه.
+ *
+ * وهذا نفس العطل الذي أصلحناه في المنيو سابقاً («بصلاحية المالك لا
+ * الإدارة») — ونجا هذا المسار منه لأنه لم يُختبر بيد صاحب مطعم.
+ *
+ * `needsIdentity` تُثبت الهوية، و`ownsRestaurant` تتحقق أن المطعم مطعمه
+ * — بالاتجاهين: المطعم يعرف مالكه، والمستخدم يعرف مطعمه. والإدارة تمرّ
+ * كما كانت (`req.isAdmin` أول سطر في `ownsRestaurant`).
+ */
+router.patch('/:id', needsIdentity, async (req, res) => {
   try {
     invalidate('restaurants:raw');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const ref = db.collection('restaurants').doc(String(req.params.id));
-    if (!(await ref.get()).exists) {
+    const cur = await ref.get();
+    if (!(await ownsRestaurant(db, req, req.params.id, cur.exists ? cur.data() : null))) {
+      return res.status(403).json({ success: false, error: 'هذا المطعم ليس لك' });
+    }
+    if (!cur.exists) {
       const demo = demoRestaurants.find(r => r.id === req.params.id);
       if (demo) { await ref.set({ ...demo, ...req.body, id: demo.id, status: 'approved' }); return res.json({ success: true, created: true }); }
       return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
