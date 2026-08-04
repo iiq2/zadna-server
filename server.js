@@ -500,7 +500,14 @@ app.post('/api/auth/register', async (req, res) => {
       const newUser = {
         name,
         email,
-        phone,
+        /* الرقم يُطبَّع هنا لا عند المقارنة.
+         * كان يُحفظ كما كتبه صاحبه، فيصير الشخص الواحد أربعة أشخاص في
+         * نظر أي مقارنة نصّية — وهي عائلة الأعطال التي طاردناها طويلاً. */
+        phone: normPhone(phone),
+        /* تحضيرٌ للتحقق بالرسائل. يبقى `false` حتى تُفعَّل Firebase
+         * Phone Auth؛ ووجودُه من اليوم يعني أننا لا نُهاجر بيانات
+         * ألف مستخدم يوم نُفعّلها، ونستطيع تمييز المؤكَّد من غيره. */
+        phoneVerified: false,
         userType,
         ownedRestaurantId: ownedRestaurantId || null,
         ...(fbUid
@@ -1110,18 +1117,18 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
       // نُطبّع الرقم قبل التحقق: الزبون قد يكتبه بصيغ كثيرة
       // (+970 / 00970 / +972 / 0592… / 592…) وكلها لنفس الجوال.
       // تخزينها كما كُتبت يعني أن نفس الزبون يظهر برقمين مختلفين.
-      let p = phone.trim().replace(/[\s-]/g, '');
-      p = p.replace(/^(\+?970|00970|\+?972|00972)/, '');
-      if (!p.startsWith('0')) p = '0' + p;
-
-      // القاعدة نفسها المستعملة في التطبيق (PhoneValidator):
-      // 059/056 فلسطينية، و050/052/053/054/058 إسرائيلية يستعملها كثيرون
-      // في الضفة. السيرفر لا يجوز أن يكون أضيق من التطبيق، وإلا قَبِل الطلب
-      // ورفض حفظ رقم صاحبه — فيبقى الزبون بلا رقم في حسابه بلا سبب ظاهر.
-      if (!/^05[0234689]\d{7}$/.test(p)) {
+      // التطبيع والتحقق من utils/phone.js — نفس القاعدة في كل مسار.
+      // كانت مكرَّرة هنا بصيغة تختلف قليلاً عن `samePhone`، وأي فرقٍ
+      // بينهما يعني رقماً يُقبل في مسار ويُرفض في آخر.
+      const p = normPhone(phone);
+      if (!isValidMobile(p)) {
         return res.status(400).json({ success: false, error: 'رقم الجوال غير صحيح' });
       }
       updates.phone = p;
+      /* الرقم تغيّر — فالتحقق السابق (إن وُجد) لم يعد يخصّه.
+       * بدون هذا السطر يستطيع من أكّد رقماً أن يبدّله برقم غيره
+       * ويبقى «مؤكَّداً» — وهو ما يُبطل التحقق كلّه يوم نُفعّله. */
+      updates.phoneVerified = false;
     }
 
     if (Object.keys(updates).length === 0) {
@@ -1180,16 +1187,12 @@ async function chatIdentityOf(req) {
  * الرقم الواحد يُكتب عندنا بأربع صور: 0599123456 و +970599123456
  * و 00970599123456 و 059-912-3456. والمقارنة الحرفية تعتبرها أربعة
  * أشخاص. وهذا ما كان يمنع الزبون من دخول شات طلبه هو. */
-function samePhone(a, b) {
-  const norm = (p) => {
-    let s = String(p || '').replace(/[\s\-()]/g, '');
-    s = s.replace(/^\+?9(70|72)/, '0').replace(/^00 ?9(70|72)/, '0');
-    return s;
-  };
-  const x = norm(a), y = norm(b);
-  return !!x && x === y;
-}
+/* المنطق انتقل إلى utils/phone.js — مصدر واحد للتطبيع والتحقق معاً.
+ * كان مكرَّراً هنا وفي مسار تحديث الملف الشخصي بصيغتين مختلفتين قليلاً،
+ * وأي فرقٍ بينهما يعني رقماً يُقبل في مسار ويُرفض في آخر. */
+const { normPhone, isValidMobile, samePhone } = require('./utils/phone');
 app.set('samePhone', samePhone);
+app.set('normPhone', normPhone);
 
 /** هل لصاحب الطلب حقّ الدخول إلى هذه الغرفة؟ */
 async function canAccessRoom(req, roomId) {
