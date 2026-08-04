@@ -474,7 +474,44 @@ async function notifyChatPeer(app, { orderId, senderId, senderName, senderRole, 
   }
 }
 
+/* ============================================================
+   إشعار الإدارة — لأن السوكت لا يعمل واللوحة مغلقة.
+
+   كان طلب الانضمام يُبثّ على السوكت وحده (`new_partner_request`).
+   وذلك يصل **فقط** إن كانت لوحتك مفتوحة على مكتبك في تلك اللحظة.
+   فشريكٌ يسجّل ليلاً أو وأنت في الطريق لا يصلك خبره إطلاقاً، ويبقى
+   ينتظر اعتماداً لا يعلم أحدٌ أنه مطلوب — وهو ما وقع فعلاً.
+
+   الآن يصلك على جوالك مثل أي إشعار. ويُرسَل لكل حساب نوعه `manager`،
+   فتستطيع أن تُشرك معك من يتابع الاعتمادات دون أن يملك لوحتك.
+
+   وبقناة «الشريك» لا قناة الكابتن: هذا خبرٌ يُقرأ لا إنذارٌ يوقظ.
+   ============================================================ */
+async function notifyManagers(app, { title, body, data = {} }) {
+  const db = app.get('db');
+  if (!db) return;
+  try {
+    const snap = await db.collection('users').where('userType', '==', 'manager').get();
+    const ids = [];
+    snap.forEach(d => ids.push(d.id));
+    if (!ids.length) {
+      console.warn('📭 لا حساب إدارة (userType=manager) — لن يصل إشعار طلب الانضمام لأي جوال');
+      return;
+    }
+    // بلا تقييد بتطبيق: المدير قد يستعمل أيّاً من الثلاثة
+    const tokens = await tokensOf(db, ids);
+    if (!tokens.length) {
+      console.warn('📭 حساب الإدارة موجود بلا رمز جهاز — سجّل دخولاً من التطبيق مرّة');
+      return;
+    }
+    await push(db, tokens, { title, body, channel: 'partner', data });
+  } catch (e) {
+    console.warn('⚠️ إشعار الإدارة:', e.message);
+  }
+}
+
 module.exports = router;
+module.exports.notifyManagers = notifyManagers;
 module.exports.notifyRestaurant = notifyRestaurant;
 module.exports.notifyDrivers = notifyDrivers;
 module.exports.notifyCustomer = notifyCustomer;
