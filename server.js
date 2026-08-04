@@ -144,6 +144,24 @@ app.use('/api/partner_codes',
 // يقطع الخدمة عن زبائن أبرياء. السكربت المُسيء يتجاوز هذا الرقم بأضعاف.
 app.use('/api', rateLimit({ windowMs: 60000, max: 600, key: 'all' }));
 
+/* ============================================================
+   وسمُ الإدارة — لا حراسة.
+
+   `requireIdentity` تضبط `req.isAdmin` لكنها لا تعمل إلا على المسارات
+   المحروسة. ومسارات القراءة المفتوحة (المطاعم مثلاً) تحتاج أن تعرف
+   «أهذا مدير؟» لتقرّر ماذا تعرض — لا لتقبل أو ترفض.
+
+   بدون هذه الوسيطة كان `?all=1` سيصير مغلقاً على الجميع بمن فيهم أنت،
+   لأن `req.isAdmin` تبقى undefined على مسار بلا حارس.
+
+   وهي لا ترفض أحداً: من لا يحمل المفتاح يمرّ زائراً عادياً.
+   ============================================================ */
+app.use('/api', (req, res, next) => {
+  const k = req.headers['x-admin-key'];
+  if (ADMIN_KEY && k && k === ADMIN_KEY) req.isAdmin = true;
+  next();
+});
+
 // =====================
 // Firebase Configuration
 // =====================
@@ -330,9 +348,25 @@ app.set('loadUser', loadUser);
 function requireIdentity(req, res, next) {
   const adminKey = req.headers['x-admin-key'];
   if (ADMIN_KEY && adminKey === ADMIN_KEY) { req.isAdmin = true; return next(); }
+
+  /* ============================================================
+     سيرفرٌ بلا ADMIN_KEY لا يُعطي صلاحية إدارة لأحد.
+
+     كان السطر السابق يقول: إن لم يُضبط المفتاح، فأيّ طلب يحمل ترويسة
+     `x-admin-key` بأي قيمة يمرّ كمدير. أي أن **خطأً إملائياً واحداً في
+     اسم المتغيّر على Render** يفتح التسويات والحذف والتجميد لأي أحد
+     على الإنترنت — والتحذير يُكتب في سجلٍّ لن يقرأه أحد وقت الحادثة.
+
+     الآن يُرفض الطلب برسالة تقول ما ينقص بالضبط. الفشل مغلقٌ لا مفتوح:
+     لوحةٌ لا تعمل حتى تضبط متغيّراً أهونُ من منصّةٍ مكشوفة.
+     ============================================================ */
   if (!ADMIN_KEY && adminKey) {
-    console.warn('⚠️ ADMIN_KEY غير مضبوط على السيرفر — طلب إدارة مرّ بلا تحقق:', req.method, req.originalUrl);
-    req.isAdmin = true; return next();
+    console.error('🚨 ADMIN_KEY غير مضبوط على السيرفر — رُفض طلب إدارة:', req.method, req.originalUrl);
+    return res.status(503).json({
+      success: false,
+      error: 'مفتاح الإدارة غير مضبوط على السيرفر. اضبط ADMIN_KEY في Environment على Render ثم أعد النشر.',
+      adminKeyMissing: true
+    });
   }
 
   const token = req.headers.authorization?.split(' ')[1];
