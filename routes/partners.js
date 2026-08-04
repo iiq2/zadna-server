@@ -8,6 +8,9 @@ const adminOnly = (req, res, next) => {
   return fn ? fn(req, res, next) : next();
 };
 const { cached, invalidate } = require('../utils/cache');
+// عدّاد القراءات — قراءةٌ لا تُحصى تجعل مقياس الحصة يكذب، والمقياس
+// الذي لا يُصدَّق أسوأ من غياب المقياس.
+const meter = require('../utils/meter');
 // 5 دقائق: أي اعتماد أو تجميد أو تسجيل جديد يُبطل الكاش فوراً.
 const PARTNERS_TTL = 300000;
 
@@ -22,10 +25,16 @@ router.post('/partner_codes', adminOnly, async (req, res) => {
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const { type, code } = req.body || {};
-    if (!['driver', 'restaurant'].includes(type)) {
+    /* `market` نوعٌ ثالث — والسوبرماركت شريك في نفس مجموعة المطاعم
+     * بحقل `partnerType='market'`، فيرث الطلبات والمحفظة والشات
+     * والإشعارات والفتح والإغلاق بلا سطر إضافي. الكود وحده يميّزه،
+     * ليعرف السيرفر ماذا يُنشئ عند التسجيل. */
+    if (!['driver', 'restaurant', 'market'].includes(type)) {
       return res.status(400).json({ success: false, error: 'نوع الشريك غير صحيح' });
     }
-    const prefix = type === 'driver' ? 'ZADNA-DRV' : 'ZADNA-RST';
+    const prefix = type === 'driver' ? 'ZADNA-DRV'
+                 : type === 'market' ? 'ZADNA-MKT'
+                 : 'ZADNA-RST';
     const finalCode = String(code || (prefix + '-' + Math.floor(1000 + Math.random() * 9000))).toUpperCase().trim();
     const ref = db.collection('partner_codes').doc(finalCode);
     const existing = await ref.get();
@@ -90,6 +99,31 @@ router.get('/registered_partners', adminOnly, async (req, res) => {
     if (!db) return res.json([]);
     const partners = await cached('partners:all', PARTNERS_TTL, async () => {
       const list = [];
+
+      /* ============================================================
+         نوع المحلّ — مطعم أم سوبرماركت.
+
+         السوبرماركت يُسجَّل حسابه بنوع `restaurant` عمداً: يرث الطلبات
+         والمحفظة والشات والفتح والإغلاق بلا تكرار أي مسار. والفرق كلّه
+         على مستند محلّه بحقل `partnerType`.
+
+         وبدون هذه القراءة تعرض لوحتك «🏠 مطعم شريك» لصاحب ماركت،
+         فتعتمده وأنت تظنّه مطعماً، ثم لا تفهم لماذا لا يظهر في تبويب
+         المطاعم عند الزبون — لأنه ليس مطعماً، وللماركت تبويبه.
+
+         نقرأ المحلّات مرّة واحدة لا مرّة لكل شريك: الحلقة داخل الحلقة
+         تعني قراءةً لكل شريك في كل تحديث للوحة، وحصّة Firestore خمسون
+         ألفاً في اليوم.
+         ============================================================ */
+      const kindOf = {};
+      try {
+        const rs = await db.collection('restaurants').get();
+        rs.forEach(d => { kindOf[d.id] = String((d.data() || {}).partnerType || 'restaurant'); });
+        meter.addReads(rs.size, 'أنواع المحلّات');
+      } catch (e) {
+        console.warn('⚠️ تعذّرت قراءة أنواع المحلّات:', e.message);
+      }
+
       for (const t of ['driver', 'restaurant']) {
         const snap = await db.collection('users').where('userType', '==', t).get();
         snap.forEach(doc => {
@@ -100,6 +134,9 @@ router.get('/registered_partners', adminOnly, async (req, res) => {
             phone: u.phone || '',
             email: u.email || '',
             type: t,
+            // للمندوب يبقى فارغاً — لا محلّ له
+            partnerType: t === 'restaurant' ? (kindOf[String(u.ownedRestaurantId || '')] || 'restaurant') : '',
+            ownedRestaurantId: u.ownedRestaurantId || '',
             status: u.status || 'approved',
             date: (u.createdAt && u.createdAt._seconds) ? new Date(u.createdAt._seconds * 1000).toLocaleString('ar-EG') : ''
           });

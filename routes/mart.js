@@ -118,6 +118,128 @@ function cleanProduct(body) {
 /* ===== القراءة ===== */
 
 // GET /api/mart_products/categories — أقسام المحل
+/* ============================================================
+   GET /api/mart_products/nearest?lat=&lng=
+   أقرب ماركت **مفتوح** للزبون، ومعه كتالوجه.
+
+   القرار التجاري وراء هذا المسار: الزبون لا يختار بين ماركتات، بل
+   يُوجَّه إلى أقربها. وسببه أن توحيد أسماء المنتجات بين محلّات مختلفة
+   مشروعٌ بحدّ ذاته — «زيت زيتون ١ لتر» عند واحد و«زيت زيتون فلسطيني
+   لتر» عند الآخر — وشركات كبرى تقضي فيه سنوات. ماركتٌ واحد في اللحظة
+   الواحدة يتجاوز المسألة كلّها: لا مقارنة، ولا تضارب أسعار، ولا قوائم
+   متداخلة.
+
+   وميزةٌ ثانية: الأقرب هو الأرخص توصيلاً، لأن الأجرة تُحسب بالمسافة.
+   فالاختيار يخدم الزبون ومحفظته معاً.
+
+   ثلاث قواعد:
+     · المغلق يُتخطّى إلى التالي فوراً — لا شاشة فارغة نصف اليوم.
+     · لا حدّ صارم للمسافة: نبقى مع الزبون البعيد، لكنه يدفع أجرة
+       المسافة كاملة (١٠ ثم +٥ لكل كيلومترين). المدى الأقصى حارسٌ
+       من الخطأ لا سياسة تسعير.
+     · بلا موقع لا نُخمّن: نطلب منه تحديده بدل أن نُريه بضاعة قد لا
+       تصله.
+
+   وما يجب أن تقوله لشركائك مكتوباً من أول يوم: الزبون يُوجَّه لأقرب
+   ماركت. شريكٌ في حيّ مزدحم سيأخذ أكثر، وآخر أقلّ — ومن يكتشفها
+   بنفسه بعد شهر يظنّ أنك تُفضّل غيره.
+   ============================================================ */
+const MART_MAX_KM = 25;      // حارس خطأ: أبعد من هذا ليس زبوناً لنابلس
+const NEAREST_TTL = 120000;  // دقيقتان — الفتح والإغلاق يتغيّران خلال اليوم
+
+function martDistKm(aLat, aLng, bLat, bLng) {
+  const R = 6371, rad = (d) => d * Math.PI / 180;
+  const dLat = rad(bLat - aLat), dLng = rad(bLng - aLng);
+  const h = Math.sin(dLat / 2) ** 2 +
+            Math.cos(rad(aLat)) * Math.cos(rad(bLat)) * Math.sin(dLng / 2) ** 2;
+  // ١٫٣٥ التفاف الطرق مقابل الخط المستقيم — نفس معامل التسعير في zones.js
+  return 2 * R * Math.asin(Math.sqrt(h)) * 1.35;
+}
+
+router.get('/nearest', async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.json({ success: false, error: 'الخدمة غير متاحة الآن', markets: 0 });
+
+    const lat = parseFloat(req.query.lat);
+    const lng = parseFloat(req.query.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({
+        success: false, needsLocation: true,
+        error: 'حدّد موقعك أولاً لنعرف أقرب سوبرماركت إليك'
+      });
+    }
+
+    const markets = await cached('markets:list', NEAREST_TTL, async () => {
+      const snap = await db.collection('restaurants').where('partnerType', '==', 'market').get();
+      const out = [];
+      snap.forEach(d => {
+        const m = d.data() || {};
+        out.push({
+          id: d.id,
+          name: m.name || 'سوبرماركت',
+          emoji: m.emoji || '🛒',
+          imageUrl: m.imageUrl || '',
+          phone: m.phone || '',
+          address: m.address || '',
+          lat: Number(m.lat) || 0,
+          lng: Number(m.lng) || 0,
+          isOpen: m.isOpen !== false,
+          status: String(m.status || 'approved'),
+        });
+      });
+      meter.addReads(snap.size, 'قائمة الماركتات');
+      return out;
+    });
+
+    /* المعتمد وحده، وصاحب الإحداثيات وحده.
+     * ماركت بلا موقع لا يُحسب له قرب — ولا يُعرض، لأن أجرته ستُحسب
+     * بالتقريب والمندوب لن يجد بابه. يظهر لك في اللوحة ناقصاً. */
+    const usable = markets.filter(m => m.status === 'approved' && m.lat && m.lng);
+    const ranked = usable
+      .map(m => ({ ...m, km: Math.round(martDistKm(lat, lng, m.lat, m.lng) * 10) / 10 }))
+      .filter(m => m.km <= MART_MAX_KM)
+      .sort((a, b) => a.km - b.km);
+
+    if (!ranked.length) {
+      return res.json({
+        success: false, outOfRange: true, markets: usable.length,
+        error: 'ما في سوبرماركت شريك يخدم منطقتك بعد — قريباً إن شاء الله'
+      });
+    }
+
+    // المغلق يُتخطّى فوراً. وإن كانوا كلهم مغلقين نقول ذلك صراحةً
+    // ونذكر اسم الأقرب، فيعرف الزبون أن الخدمة موجودة لا مفقودة.
+    const open = ranked.find(m => m.isOpen);
+    if (!open) {
+      return res.json({
+        success: false, allClosed: true, nearestName: ranked[0].name,
+        error: `${ranked[0].name} مغلق الآن — جرّب بعد قليل`
+      });
+    }
+
+    const products = await cached(`mart:${open.id}`, CATALOG_TTL, async () => {
+      const snap = await db.collection('restaurants').doc(open.id).collection('products').get();
+      const out = [];
+      snap.forEach(d => out.push({ id: d.id, ...d.data() }));
+      meter.addReads(snap.size, 'كتالوج المارت');
+      return out;
+    });
+
+    res.json({
+      success: true,
+      market: { id: open.id, name: open.name, emoji: open.emoji, imageUrl: open.imageUrl,
+                address: open.address, lat: open.lat, lng: open.lng, km: open.km },
+      // الزبون لا يرى ما نفد؛ صاحب المحل يراه في تطبيقه ليُعيده
+      products: products.filter(p => p.available !== false),
+      alternatives: ranked.length - 1,   // كم ماركت آخر ضمن المدى — لعلمك لا لعرضه
+    });
+  } catch (e) {
+    console.error('❌ أقرب ماركت:', e.message);
+    res.status(500).json({ success: false, error: 'تعذّر جلب السوبرماركت — أعد المحاولة' });
+  }
+});
+
 router.get('/categories', (req, res) => res.json(MART_CATEGORIES));
 
 /* GET /api/mart_products/suggestions?q=&categoryId=
@@ -137,7 +259,19 @@ router.get('/suggestions', needsIdentity, (req, res) => {
 
    لا نُرجع كل شيء بلا معرّف: كان مارت واحد فكان مقبولاً، وبعشرة
    محلات يصير الردّ آلاف الأصناف مختلطة لا يعرف الزبون من أيّها. */
-router.get('/', async (req, res) => {
+/* حارس مشروط: التوكن يُفكّ حين يُطلب `all=1` وحده.
+ *
+ * `ownsMarket` تقرأ `req.user`، و`req.user` لا تُملأ إلا داخل
+ * `requireIdentity`. وهذا المسار بلا حارس (الزبون يتصفّح بلا توكن)،
+ * فكانت `ownsMarket` تُرجع `false` **دائماً** و`all=1` بلا أثر:
+ * صاحب المحلّ يُطفئ صنفاً نفد فيختفي عنه عند أوّل تحديث ولا يستطيع
+ * إعادته — ويبقى ينقص من بضاعته كل يوم بلا أن يفهم لماذا.
+ *
+ * والحارس مقيَّد بـ`all=1` عمداً: تصفّح الزبون يبقى مفتوحاً بلا توكن.
+ * نفس أسلوب حارس رفع الصور في server.js. */
+router.get('/', (req, res, next) =>
+  String(req.query.all || '') === '1' ? needsIdentity(req, res, next) : next(),
+async (req, res) => {
   try {
     const db = getDb(req);
     const marketId = String(req.query.marketId || '').trim();

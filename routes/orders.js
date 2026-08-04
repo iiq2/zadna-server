@@ -162,14 +162,39 @@ router.post('/', needsIdentity, async (req, res) => {
       // طلبات المارت تذهب للمناديب مباشرة — لا مطعم يوافق عليها.
       // كان الفحص بالمعرّف فقط بينما التطبيق يفحص الاسم أيضاً؛ أي اختلاف
       // بينهما يترك طلب مارت عالقاً في "بانتظار موافقة المطعم" إلى الأبد.
-      const restNameRaw = String(orderData.restaurant || orderData.restaurantName || '');
-      const isMart = orderData.restaurantId === 'mart_001'
-        || restNameRaw.includes('مارت')
-        || restNameRaw.toLowerCase().includes('mart');
-          if (isMart) {
-                  orderData.statusAr = "جاهز للتسليم 📦";
-                  orderData.status = "READY_FOR_PICKUP";
-          }
+      /* ============================================================
+         «أهذا طلب ماركت؟» — يُسأل المستند لا الاسم.
+
+         كان الفحص بالمعرّف `mart_001` وبكلمة «مارت» في الاسم. وكلاهما
+         سقط يوم صار لكل سوبرماركت معرّفه (`mkt_...`) واسمه الحقيقي
+         («سوبرماركت الأمين» لا تحوي كلمة مارت).
+
+         وأثر السقوط أن طلب الماركت يُحفظ `PENDING_RESTAURANT` — أي
+         بانتظار موافقة محلٍّ قد لا يفتح تطبيقه أصلاً، فيعلق الطلب ولا
+         يصل مندوباً ولا يعرف الزبون لماذا.
+
+         الحقيقة في `partnerType` على مستند المحلّ — وهو ما يقرؤه
+         التسعير في هذا الملفّ نفسه. نقرأه مرّة ونستعمله للاثنين.
+         ============================================================ */
+      let isMart = false;
+      if (orderData.restaurantId) {
+        try {
+          const pDoc = await db.collection('restaurants').doc(String(orderData.restaurantId)).get();
+          isMart = pDoc.exists && String((pDoc.data() || {}).partnerType || '') === 'market';
+        } catch (e) {
+          console.warn('⚠️ تعذّر تمييز نوع الشريك:', e.message);
+        }
+      }
+      // معرّف المارت القديم يبقى مقبولاً للطلبات المحفوظة قبل التحوّل
+      if (orderData.restaurantId === 'mart_001') isMart = true;
+
+      if (isMart) {
+        /* الماركت لا يوافق: بضاعته على الرفّ لا في المطبخ. الطلب يذهب
+         * للمناديب مباشرة، والمندوب يلتقط الأصناف ويوصّلها. */
+        orderData.statusAr = "جاهز للتسليم 📦";
+        orderData.status = "READY_FOR_PICKUP";
+        orderData.isMarketOrder = true;   // يقرؤه التطبيق فلا يقول «ننتظر موافقة المطعم»
+      }
 
       /* ============================================================
          المطعم المغلق لا يستقبل طلباً.
