@@ -39,7 +39,10 @@ const needsIdentity = (req, res, next) => {
  * وقناة `partner` كانت غائبة هنا أصلاً: المطعم كان يُرسَل له على قناة
  * الكابتن، فيصله — إن وصله — بصوت الكابتن. */
 const CHANNELS = {
-  alert:   { id: 'zadna_alert_v2',   sound: 'zadna_alert',   priority: 'high' },
+  // v3 للكابتن وحده: صوت منبّه واهتزاز أطول وإيقاظ شاشة — إعدادات
+  // القناة تتجمّد عند إنشائها فلا ترقية إلا باسم جديد. **يستلزم بناء
+  // تطبيق الكابتن مع هذا النشر** وإلا سقط إشعاره على قناة غير موجودة.
+  alert:   { id: 'zadna_alert_v3',   sound: 'zadna_alert',   priority: 'high' },
   partner: { id: 'zadna_partner_v2', sound: 'zadna_partner', priority: 'high' },
   update:  { id: 'zadna_update_v2',  sound: 'zadna_update',  priority: 'default' },
   arrived: { id: 'zadna_arrived_v2', sound: 'zadna_arrived', priority: 'high' },
