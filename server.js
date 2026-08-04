@@ -1411,6 +1411,17 @@ app.use('/api', reportsRouter);
 const pushRouter = require('./routes/push');
 app.use('/api', pushRouter);
 
+/* رفع صور المنتجات — بهوية مُثبَتة.
+ * مسار رفع مفتوح يعني حصةً تُستنزف في ليلة، وصوراً لا نعرف من وضعها.
+ *
+ * والحارس مقيَّد بهذا المسار وحده عمداً: `app.use('/api', requireIdentity, …)`
+ * يسري على كل ما يصل بعده، و`/api/health` و`/api/app-info` مُعرَّفان أدناه —
+ * فيسقط فحص الصحة ونبضةُ إبقاء السيرفر صاحياً معاً. */
+const uploadRouter = require('./routes/upload');
+app.use('/api', (req, res, next) =>
+  req.path === '/upload_image' ? requireIdentity(req, res, next) : next(),
+  uploadRouter);
+
 /* ============================================================
    إبقاء السيرفر صاحياً.
 
