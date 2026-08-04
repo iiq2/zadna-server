@@ -597,9 +597,39 @@ router.post('/migrate', needsIdentity, async (req, res) => {
    واحد بسعرين. من يطلب الكيلو ويُحاسَب سعر الحبة يسرقنا، والعكس
    يسرقه هو. لذلك نطابق الوحدة المطلوبة بوحدة مسجّلة عند المحلّ،
    ونرفض ما لا يطابق بدل أن نخمّن. */
+/* ============================================================
+   فكّ معرّف السلة المركّب.
+
+   تطبيق الزبون يبني معرّف صنف السلة هكذا (MartScreen.kt:769):
+       id = "${product.id}__${unit.label}"     →  p_1785…__كيلو
+
+   وله سببٌ وجيه: «بندورة — كيلو» و«بندورة — حبّة» يجب أن يكونا سطرين
+   مستقلّين في السلة، ولو تشاركا المعرّف لداس أحدهما الآخر. لكنّ
+   المعرّف المركّب يُرسَل إلى السيرفر كما هو، والسيرفر يبحث عن مستند
+   اسمه `p_1785…__كيلو` في كتالوج المحلّ — ولا وجود له. فيردّ 400
+   «أصناف غير موجودة في المحل»، ويرى الزبون «تعذّر إرسال الطلب».
+
+   أي أنّ **زادنا مارت كان لا يقبل طلباً واحداً**. خمس محاولات في سجلّ
+   الأخطاء، كلّها 400، ولا صنف يمرّ.
+
+   ونفكّه هنا لا في التطبيق عمداً: الإصلاح في السيرفر يسري على كل جهاز
+   مثبَّت الآن بلا بناء ولا تحديث ينتظره الناس. ونقبل الصورتين معاً —
+   المركّبة والمنفصلة — فلا ينكسر شيء حين يُصلَح التطبيق يوماً.
+
+   والوحدة المستخرَجة لا تُستعمل إلا إن لم يُرسل التطبيق `unit` صراحةً:
+   ما يقوله الحقل المخصّص أوثق ممّا نستنبطه من نصّ.
+   ============================================================ */
+const SEP = '__';
+function splitCartId(raw) {
+  const s = String(raw || '');
+  const at = s.indexOf(SEP);
+  if (at < 0) return { id: s, unit: '' };
+  return { id: s.slice(0, at), unit: s.slice(at + SEP.length).trim() };
+}
+
 async function priceMartItems(db, marketId, items) {
   if (!Array.isArray(items) || !items.length) return null;
-  const ids = [...new Set(items.map(i => String((i && i.id) || '')).filter(Boolean))].slice(0, 120);
+  const ids = [...new Set(items.map(i => splitCartId(i && i.id).id).filter(Boolean))].slice(0, 120);
   if (!ids.length) return { error: 'أصناف بلا معرّفات' };
 
   const col = db.collection('restaurants').doc(String(marketId)).collection('products');
@@ -610,12 +640,13 @@ async function priceMartItems(db, marketId, items) {
   let total = 0;
   const unknown = [], gone = [], badUnit = [];
   for (const it of items) {
-    const id = String((it && it.id) || '');
+    const parsed = splitCartId(it && it.id);
+    const id = parsed.id;
     const p = byId.get(id);
     if (!p) { unknown.push(id); continue; }
     if (p.available === false) { gone.push(p.nameAr || id); continue; }
 
-    const wanted = String((it && (it.unit || it.unitLabel)) || '').trim();
+    const wanted = String((it && (it.unit || it.unitLabel)) || parsed.unit || '').trim();
     const units = Array.isArray(p.units) ? p.units : [];
     // بلا وحدة مطلوبة نأخذ الأولى — وهي التي يعرضها التطبيق افتراضياً
     const u = wanted ? units.find(x => x && x.label === wanted) : units[0];
