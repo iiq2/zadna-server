@@ -241,11 +241,50 @@ async function push(db, tokens, { title, body, channel = 'update', data = {} }) 
      `notification` كانت ستصله صامتة على أي حال فلا تُوقظه.
      ============================================================ */
   const message = {
+    /* ============================================================
+       الصيغة المزدوجة — تصحيحٌ لنصف صواب.
+
+       ليلة أمس حذفتُ `notification` كلياً لأن الخليط كان يمنع
+       `onMessageReceived` من العمل في الخلفية. وكان التشخيص صحيحاً
+       والعلاج ناقصاً: رسالة البيانات الخالصة تحتاج أن **يوقظ النظام
+       التطبيق** ليرسم الإشعار بنفسه — وهواتف شاومي وأوبو وهواوي (وهي
+       أغلب السوق هنا) تمنع ذلك بمدير البطارية. فصار الإنذار يعمل
+       والتطبيق مفتوح، ويصمت وهو مغلق. أي أنّي نقلتُ الصمت من مكان
+       إلى مكان.
+
+       والصواب أن الاثنين ليسا بديلين — بل طبقتان تتكاملان:
+
+         · **التطبيق مفتوح**: أندرويد لا يرسم حمولة `notification`
+           ويسلّمها لـ`onMessageReceived` — فيعمل كودنا كاملاً:
+           مجرى المنبّه، والرنين الذي لا يسكت (FLAG_INSISTENT)،
+           والشاشة الكاملة.
+
+         · **التطبيق مغلق أو الجهاز يخنقه**: النظام يرسم الإشعار
+           بنفسه بلا حاجة لإيقاظ أحد — **وصوته من القناة لا منّا**.
+           وقناة `zadna_alert_v3` مضبوطة على مجرى المنبّه وتتجاوز
+           «عدم الإزعاج»، فيرنّ رنّة الكابتن كاملةً. يفوتنا الرنينُ
+           المتكرّر وحده — وهذا خسارةٌ مقبولة أمام صمتٍ تامّ.
+
+       أي أنّ الإشعار يصل في الحالتين، ويرنّ في الحالتين، وأشدّ ما
+       يمكن في كلٍّ منهما.
+       ============================================================ */
+    notification: { title, body },
     data: Object.fromEntries(
       Object.entries({ ...data, title, body, channel: ch.id })
         .map(([k, v]) => [k, String(v == null ? '' : v)])
     ),
     android: {
+      notification: {
+        /* القناة هي كل شيء على أندرويد ٨+: الصوت والاهتزاز وتجاوز
+         * «عدم الإزعاج» تُقرأ منها لا من هذه الرسالة. و`sound` هنا
+         * للأجهزة الأقدم وحدها. */
+        channelId: ch.id,
+        sound: ch.sound,
+        // طلب الكابتن يُعامَل معاملة المكالمة: يوقظ الشاشة ولا يُؤجَّل
+        ...(channel === 'alert'
+          ? { priority: 'max', visibility: 'public', defaultVibrateTimings: false }
+          : {}),
+      },
       // 'high' يوقظ الجهاز من Doze ويُسلّم رسالة البيانات فوراً.
       // بـ'normal' يؤجّلها النظام إلى نافذة الصيانة التالية — وقد تكون
       // بعد ربع ساعة. وطلبٌ يصل بعد ربع ساعة ليس طلباً.
@@ -401,26 +440,47 @@ async function notifyDrivers(app, { title, body, data, restaurantLat, restaurant
     });
     if (!ids.length) return;
 
+    /* ============================================================
+       الترتيب زينةٌ، والإرسال فريضة — فلا يُسقط الأولُ الثاني.
+
+       كان هذا كلّه داخل `try` واحد يلفّ الإرسال معه. ومعناه أنّ أي
+       تعثّر في **ترتيب** المناديب — وهو تحسين لا أكثر — يقفز إلى
+       `catch` الخارجي فلا يصل الطلبُ مندوباً واحداً.
+
+       وليس افتراضاً: سجلّك يحمل `FAILED_PRECONDITION: The query
+       requires an index` من قراءة الطلبات، وهي بعينها القراءة التي
+       تناديها `activeLoadByDriver` هنا لتعرف المشغول. فالفهرس الناقص
+       — وهو أمرٌ تجميلي — كان قادراً على إسكات إنذار الرزق كلّه.
+
+       القاعدة: كل ما هو تحسين يُعزَل في `try` خاصّ به. إن فشل الترتيب
+       أُرسل للجميع بالتساوي وكُتب سببه — ولا يُحرم أحدٌ من طلبه.
+       ============================================================ */
     const haveGeo = Number.isFinite(Number(restaurantLat)) && Number.isFinite(Number(restaurantLng));
     if (haveGeo) {
-      const locs = app.get('lastDriverLocation') || new Map();
-      const load = await activeLoadByDriver(db);
-      const scored = ids.map(id => {
-        const l = locs.get(String(id));
-        // من لا نعرف موقعه يُوضع بعد من نعرفهم لا يُحرَم
-        const km = l ? distKm(Number(restaurantLat), Number(restaurantLng), l.lat, l.lng) : 999;
-        const busy = (load[String(id)] || 0) >= BUSY_LIMIT ? 1 : 0;
-        return { id, km, busy };
-      });
-      scored.sort((a, b) => (a.busy - b.busy) || (a.km - b.km));
-      ids.length = 0;
-      scored.forEach(s => ids.push(s.id));
-      const near = scored.filter(s => s.km < 900).slice(0, 3)
-        .map(s => `${s.id.slice(0, 6)}:${s.km.toFixed(1)}كم${s.busy ? '(مشغول)' : ''}`);
-      if (near.length) console.log('🛵 أقرب المناديب:', near.join(' · '));
+      try {
+        const locs = app.get('lastDriverLocation') || new Map();
+        const load = await activeLoadByDriver(db);
+        const scored = ids.map(id => {
+          const l = locs.get(String(id));
+          // من لا نعرف موقعه يُوضع بعد من نعرفهم لا يُحرَم
+          const km = l ? distKm(Number(restaurantLat), Number(restaurantLng), l.lat, l.lng) : 999;
+          const busy = (load[String(id)] || 0) >= BUSY_LIMIT ? 1 : 0;
+          return { id, km, busy };
+        });
+        scored.sort((a, b) => (a.busy - b.busy) || (a.km - b.km));
+        ids.length = 0;
+        scored.forEach(s => ids.push(s.id));
+        const near = scored.filter(s => s.km < 900).slice(0, 3)
+          .map(s => `${s.id.slice(0, 6)}:${s.km.toFixed(1)}كم${s.busy ? '(مشغول)' : ''}`);
+        if (near.length) console.log('🛵 أقرب المناديب:', near.join(' · '));
+      } catch (e) {
+        console.warn('⚠️ تعذّر ترتيب المناديب — يُرسل للجميع بالتساوي:', e.message);
+      }
     }
 
     const tokens = await tokensOf(db, ids, 'captain');
+    // من نُبّه وكم جهازاً — يجيب «هل أُرسل أصلاً؟» بلا تخمين
+    console.log(`🛵 مناديب مؤهّلون: ${ids.length} · أجهزة captain: ${tokens.length}`);
     return await push(db, tokens, { title, body, channel: 'alert', data });
   } catch (e) { console.warn('⚠️ إشعار المناديب:', e.message); }
 }
