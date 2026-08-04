@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const meter = require('../utils/meter');
 
 const getDb = (req) => req.app.get('db');
 const MAX_KEEP = 300; // نحتفظ بآخر 300 خطأ فقط (توفير حصة Firestore)
@@ -86,13 +87,20 @@ router.get('/diagnostics', adminOnly, async (req, res) => {
     firestoreError: null,
     jwtSecretSet: !!process.env.JWT_SECRET,
     firebaseKeySet: !!process.env.FIREBASE_SERVICE_ACCOUNT,
-    memoryMB: Math.round(process.memoryUsage().heapUsed / 1048576)
+    memoryMB: Math.round(process.memoryUsage().heapUsed / 1048576),
+    /* الاستهلاك — وهو ما كان غائباً عن كل شاشة.
+     *
+     * ليلةٌ كاملة ضاعت ونحن نجهل أنّ استعلاماً واحداً يلتهم الحصة.
+     * لم يكن العطل خفيّاً بل **غير مرئي**: لا رقم في أي مكان يقول
+     * «أنت تقرأ ألفاً في الدقيقة»، فلا يُكتشف حتى يتوقّف كل شيء. */
+    usage: meter.stats()
   };
   try {
     const db = getDb(req);
     if (!db) { out.firestore = 'not_connected'; return res.json(out); }
     // قراءة مستند واحد فقط للفحص
     await db.collection('orders').limit(1).get();
+    meter.addReads(1, 'فحص الصحة');
     out.firestore = 'ok';
   } catch (e) {
     const msg = String(e.message || e);
