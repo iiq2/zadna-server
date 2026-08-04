@@ -15,7 +15,7 @@ const { priceMartItems } = require('./mart');
 const meter = require('../utils/meter');
 /* المصدر الوحيد لكل رقم مالي. التطبيقات الثلاثة واللوحة تعرض ما يأتي
  * من هنا ولا يحسب أيٌّ منها شيئاً — انظر utils/money.js. */
-const { breakdown } = require('../utils/money');
+const { breakdown, applyPayment } = require('../utils/money');
 
 /* رسالة الخطأ للزبون: عربية ومفيدة، والتفصيل يُسجَّل عندنا لا يُرسَل إليه.
    نأخذها من السيرفر ليكون لسان المنصّة واحداً في كل مسار. */
@@ -146,6 +146,15 @@ router.post('/', needsIdentity, async (req, res) => {
        * ولا نقبله من الجسم: من يرسله بنفسه ينسب طلبه لغيره. */
       orderData.customerId = String((req.user && req.user.userId) || '');
 
+      /* رقم الزبون يُطبَّع قبل الحفظ.
+       * صفحة الدفع تسمح بتعديل الرقم، فيُكتب بأربع صور مختلفة لنفس
+       * الجوال. وطلبٌ حُفظ بصيغة غير صيغة حساب صاحبه يسقط من سجلّه،
+       * ولا يصله إشعاره، ويُردّ عن شات طلبه. نُوحّده هنا مرّة واحدة. */
+      const normPhoneFn = req.app.get('normPhone');
+      if (normPhoneFn && orderData.customerPhone) {
+        orderData.customerPhone = normPhoneFn(orderData.customerPhone);
+      }
+
       // Ensure ID is set
       const orderId = orderData.id || 'ORD_' + Date.now();
 
@@ -246,7 +255,21 @@ router.post('/', needsIdentity, async (req, res) => {
        *   ١ · النِّسَب قد تتغيّر على Render، وطلبٌ سُلّم بنسبة قديمة يجب
        *       أن يبقى محاسَباً بها — وإلا اختلفت التسوية عن يوم التسليم.
        *   ٢ · اللوحة والتطبيقات تقرأ الرقم نفسه حرفياً، فلا مجال لخلاف. */
-      const m = breakdown(orderData);
+      /* طريقة الدفع تُثبَّت من السيرفر لا من التطبيق.
+       *
+       * كلّها `cash` اليوم — البوابة لم تُربط بعد. لكن الحقول تُكتب من
+       * الآن كي لا نُهاجر بيانات ألف طلب يوم تُربط. ولا نقبل `paid` من
+       * التطبيق أبداً: من يقول «دفعتُ» هو مزوّد الدفع عبر مساره الخاص،
+       * لا الجهاز الذي بيد الزبون. */
+      const askedMethod = String(orderData.paymentMethod || 'cash');
+      orderData.paymentMethod = ['cash', 'wallet', 'card'].includes(askedMethod) ? askedMethod : 'cash';
+      orderData.paymentStatus = 'pending';
+      orderData.paidOnline = false;
+      // الخصم صفرٌ حتى تُبنى الكوبونات — والحقل موجود ليُحسب صحيحاً حين تُبنى
+      orderData.discount = 0;
+      orderData.discountBy = 'restaurant';   // العروض من المطاعم — قرار العمل
+
+      const m = applyPayment(breakdown(orderData), orderData);
       orderData.grandTotal = m.grandTotal;
       orderData.money = m;
 
@@ -517,7 +540,7 @@ router.get('/', needsIdentity, async (req, res) => {
                 /* الطلبات التي أُنشئت قبل وحدة المال لا تحمل الحقل، فنحسبه
                  * لحظة الإرجاع. الجديدة تحمله مخزَّناً فنُبقيه كما هو —
                  * لأن طلباً سُلّم بنسبة قديمة يجب أن يبقى محاسَباً بها. */
-                money: o.money || breakdown(o)
+                money: o.money || applyPayment(breakdown(o), o)
             };
             if (hideCustomerPhone) delete out.customerPhone;
             return out;
