@@ -1748,9 +1748,85 @@ io.on('connection', (socket) => {
     } catch (e) { /* الخريطة زينة لا شرط — لا تُسقط تحديث الموقع */ }
   });
 
-  socket.on('join_chat', (roomName) => {
-    socket.join(roomName);
-    console.log(`💬 مستخدم انضم للغرفة: ${roomName}`);
+  /* ============================================================
+     الانضمام إلى غرفة يُفحص كما يُفحص الدخول إليها بـHTTP.
+
+     كان `socket.join(roomName)` بلا سطر تحقّق واحد، والاتصال نفسه
+     مسموحٌ بلا توكن («للاستماع فقط»). فمن يفتح متصفّحاً ويكتب سطرين:
+
+         io('https://…').emit('join_chat', 'manager_monitor')
+
+     يستقبل **كل رسالة على المنصّة** — لأننا ننسخ إليها كل شات —
+     و**كل موقع مندوب لحظياً**. بلا حساب، وبلا أن يُسجَّل شيء.
+
+     والإرسال كان محروساً بالتوكن؛ الثغرة في **الاستماع** وحده. وهي
+     أخطر: من يُرسل يُكتشف، ومن يستمع لا يُرى.
+
+     نفس قواعد `canAccessRoom` في HTTP بالضبط — أطراف الطلب وحدهم،
+     والغرف العامة للشركاء، وغرفة المراقبة للإدارة.
+     ============================================================ */
+  socket.on('join_chat', async (roomName) => {
+    const room = String(roomName || '').trim();
+    if (!room) return;
+
+    const u = socket.data && socket.data.user;
+    if (!u) {
+      console.warn(`🔒 انضمام مرفوض (بلا هوية) للغرفة ${room} — ${socket.id}`);
+      return socket.emit('join_rejected', { room, error: 'سجّل دخولك أولاً' });
+    }
+
+    const isAdmin = u.userId === 'admin_root' || u.userType === 'manager';
+    let allowed = false;
+
+    try {
+      if (isAdmin) {
+        allowed = true;                       // الإدارة ترى كل شيء بحكم دورها
+      } else {
+        const me = await loadUser(u.userId);
+        const myId = String((me && me.id) || u.userId);
+        const myPhone = String((me && me.phone) || '');
+        const myType = String((me && me.userType) || u.userType || 'customer');
+
+        if (room === 'manager_monitor') {
+          allowed = false;                    // غرفة المراقبة للإدارة وحدها
+        } else if (room.startsWith('admin_driver_')) {
+          const key = room.slice('admin_driver_'.length);
+          allowed = key === myId || (!!myPhone && key === myPhone);
+        } else if (room === 'global_driver_chat' || room === 'global_zadna_chat') {
+          // غرفة الشركاء: مندوب أو مطعم — لا زبون
+          allowed = myType === 'driver' || myType === 'restaurant';
+        } else if (room.startsWith('order_room_')) {
+          const orderId = room.slice('order_room_'.length);
+          if (db && orderId) {
+            const snap = await db.collection('orders').doc(orderId).get();
+            if (snap.exists) {
+              const o = snap.data() || {};
+              const drv = (o.driver && typeof o.driver === 'object')
+                ? String(o.driver.id || o.driver.phone || '') : String(o.driverId || '');
+              allowed =
+                (!!drv && (drv === myId || samePhone(drv, myPhone)))
+                || (!!o.customerId && String(o.customerId) === myId)
+                || samePhone(o.customerPhone, myPhone)
+                || (!!(me && me.ownedRestaurantId)
+                    && String(o.restaurantId || '') === String(me.ownedRestaurantId));
+            }
+          }
+        }
+      }
+    } catch (e) {
+      /* عجزٌ عن الفحص ≠ إذن. الاستماع يبقى مغلقاً حتى نتيقّن —
+       * وأسوأ ما فيه تأخّرُ رسالةٍ إلى الاستطلاع التالي. */
+      console.warn(`🔒 تعثّر فحص الانضمام للغرفة ${room} — ${e.message}`);
+      allowed = false;
+    }
+
+    if (!allowed) {
+      console.warn(`🔒 انضمام مرفوض · غرفة ${room} · ${u.userId}/${u.userType || '—'}`);
+      return socket.emit('join_rejected', { room, error: 'لا تملك صلاحية هذه المحادثة' });
+    }
+
+    socket.join(room);
+    console.log(`💬 انضمّ للغرفة ${room}: ${u.userId}`);
   });
 
   socket.on('send_message', async (data) => {
