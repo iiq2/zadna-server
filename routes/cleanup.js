@@ -86,17 +86,32 @@ async function classify(db) {
     /* مطاعم البذرة: حقيقية بأسمائها لكن بلا مالك ولا منيو — واجهة فارغة
        تُحبط الزبون إن ضغطها. ليست بيانات تجريبية بالمعنى الضار، فتُترك
        الفئة غير مؤشَّرة افتراضياً ويقرّر المدير. */
-    seedRestaurants: {
-      title: 'مطاعم بلا مالك ولا منيو',
-      note: 'مطاعم نابلس الحقيقية التي لم تنضم بعد — احذفها إن أردت بداية نظيفة، أو أبقها كواجهة',
-      items: restaurants
-        .filter(r => !PROTECTED_RESTAURANTS.has(r.id) && !r.ownerId && (r.menu || []).length <= 1)
-        .map(r => `${r.name} · ${(r.menu || []).length} صنف · ${r.status || '—'}`),
-      ids: restaurants
-        .filter(r => !PROTECTED_RESTAURANTS.has(r.id) && !r.ownerId && (r.menu || []).length <= 1)
-        .map(r => r.id),
-      collection: 'restaurants',
-    },
+    seedRestaurants: (() => {
+      /* المعيار: **لا مالك**. لا عدد الأصناف.
+       *
+       * كان الشرط يضيف `menu.length <= 1`، فنجا كل مطعم بذرة وُضع له
+       * صنفان — بقي `Veranda Cafe` في القائمة بينما زميله ذو الصنف
+       * الواحد يُحذف. وحدُّ الصنف رقمٌ اعتباطي لا يقول شيئاً عن حقيقة
+       * المطعم.
+       *
+       * وغياب `ownerId` علامةٌ قاطعة: لا حساب يملك هذا المطعم، فلا أحد
+       * في الدنيا يستطيع الدخول إليه ولا استقبال طلب منه ولا تحديث
+       * منيوه. واجهةٌ لا يقف خلفها أحد.
+       *
+       * والعكس محفوظ: من له مالك لا يُمسّ مهما كان منيوه فارغاً — فقد
+       * يكون شريكاً سجّل للتوّ ولم يُدخل أصنافه بعد. */
+      const seeds = restaurants.filter(r =>
+        !PROTECTED_RESTAURANTS.has(r.id) && !r.ownerId
+      );
+      return {
+        title: 'مطاعم بلا مالك (لا أحد يديرها)',
+        note: 'لا حساب يملكها فلا تستقبل طلباً ولا يُحدَّث منيوها — واجهة فارغة تُحبط من يضغطها',
+        items: seeds.map(r =>
+          `${r.name} · ${(r.menu || []).length} صنف · ${r.status || '—'}`),
+        ids: seeds.map(r => r.id),
+        collection: 'restaurants',
+      };
+    })(),
   };
 }
 
