@@ -76,6 +76,35 @@ function zoneById(id, overrides = {}) {
   return base || null;
 }
 
+/* ============================================================
+   المنطقة تُقبل بمعرّفها **وباسمها** — وهذا سدّ ثغرة مالية.
+
+   التطبيق يرسل في الطلب اسم المنطقة كما يراه الزبون:
+   «وسط البلد (الدوار والمحيط)» — بينما البحث هنا كان بالمعرّف
+   (`z01`) وحده. فكل نداء من التطبيق يرتدّ «منطقة غير معروفة».
+
+   ولماذا هي ثغرة مال لا مجرد رسالة خطأ؟ لأن هذا هو **المسار
+   الاحتياطي**: يُنادى حين يتعذّر التسعير بالمسافة — مطعمٌ بلا
+   إحداثيات مثلاً. فحين يفشل الاثنان معاً يستسلم السيرفر ويُبقي
+   أجرة التوصيل **كما أرسلها التطبيق**، أي كما قرّرها جهاز الزبون.
+   ضمانة «السيرفر يعيد حساب الأجرة» كانت تسقط بالضبط في الحالة
+   التي بُني الاحتياطي من أجلها.
+
+   القاعدة المعتادة عندنا: ما قاله الطرفان بصيغتين هو شيء واحد —
+   نطبّع ونطابق، لا نرفض. المطابقة بالاسم الكامل ثم بجذعه قبل
+   القوس، فـ«وسط البلد (الدوار والمحيط)» و«وسط البلد» سواء.
+   ============================================================ */
+function zoneByIdOrName(key, overrides = {}) {
+  const k = String(key || '').trim();
+  if (!k) return null;
+  const direct = zoneById(k, overrides);
+  if (direct) return direct;
+  const stem = (s) => String(s || '').split('(')[0].trim();
+  const wanted = stem(k);
+  const hit = DEFAULT_ZONES.find(z => z.nameAr === k || stem(z.nameAr) === wanted);
+  return hit ? zoneById(hit.id, overrides) : null;
+}
+
 // حساب أجرة التوصيل: منطقة الزبون + بُعد المطعم
 function computeFee(customerZone, restaurantZone) {
   if (!customerZone) return null;
@@ -254,10 +283,10 @@ async function quoteDelivery(db, { lat, lng, restaurantId, zone, restaurantZone 
       snap.forEach(d => { overrides[d.id] = d.data(); });
     } catch (e) { /* حصة منتهية — نكمل بالافتراضي */ }
   }
-  const cz = zoneById(String(zone || ''), overrides);
+  const cz = zoneByIdOrName(String(zone || ''), overrides);
   if (!cz) return { success: false, error: 'منطقة الزبون غير معروفة' };
   let rz = null;
-  if (restaurantZone) rz = zoneById(String(restaurantZone), overrides);
+  if (restaurantZone) rz = zoneByIdOrName(String(restaurantZone), overrides);
   else if (restaurantId && db) {
     try {
       const doc = await db.collection('restaurants').doc(String(restaurantId)).get();

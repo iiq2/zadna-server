@@ -211,31 +211,45 @@ router.post('/', needsIdentity, async (req, res) => {
          الإخفاء واجهة؛ وهذا هو المنع. والفحص هنا لأن السيرفر هو الوحيد
          الذي يعرف الحالة لحظةَ الطلب لا لحظةَ فتح الشاشة.
 
-         المارت مستثنى: لا مطعم يوافق عليه أصلاً.
+         والمارت **يمرّ من هنا أيضاً** — وكان مستثنى، وكانت ثغرةً لا
+         استثناءً: عبارة «لا مطعم يوافق عليه» صحيحةٌ عن الموافقة، لكن
+         الفحص هنا ليس موافقة — هو بوابة المغلق والمجمّد. فماركتٌ
+         جمّدتَه من اللوحة، أو أغلقه صاحبه ومشى، كان يواصل استقبال
+         الطلبات وتذهب `READY_FOR_PICKUP` مباشرة: المندوب يُساق إلى
+         بابٍ مقفل، والزبون ينتظر بضاعة من محلٍّ لا يعمل.
+
+         (شاشة «أقرب ماركت» تعرض المفتوح فقط — لكنها لقطةُ لحظةِ الفتح:
+         من فتحها قبل الإغلاق بدقيقة تبقى سلّته حيّةً وتُرسل.)
+
+         ونحتفظ بمستند المحلّ في `shopDoc` — إحداثياته تلزم بعد أسطر
+         لترتيب «أقرب مندوب أولاً»، فلا نقرأ المستند مرّتين.
          ============================================================ */
-      if (!isMart && orderData.restaurantId) {
+      let shopDoc = null;
+      if (orderData.restaurantId) {
         try {
           const rDoc = await db.collection('restaurants').doc(String(orderData.restaurantId)).get();
           if (!rDoc.exists) {
-            return res.status(404).json({ success: false, error: 'هذا المطعم لم يعد موجوداً' });
+            return res.status(404).json({ success: false, error: 'هذا المحلّ لم يعد موجوداً' });
           }
           const r = rDoc.data() || {};
+          shopDoc = r;
+          const kindAr = isMart ? 'السوبرماركت' : 'المطعم';
           if (r.isOpen === false) {
             return res.status(409).json({
               success: false, restaurantClosed: true,
-              error: `${r.name || 'المطعم'} مغلق الآن ولا يستقبل طلبات. جرّب مطعماً آخر أو عُد لاحقاً.`
+              error: `${r.name || kindAr} مغلق الآن ولا يستقبل طلبات. ${isMart ? 'جرّب لاحقاً — أو حدّث الشاشة ليظهر الأقرب المفتوح.' : 'جرّب مطعماً آخر أو عُد لاحقاً.'}`
             });
           }
           if (r.status && r.status !== 'approved') {
             return res.status(409).json({
               success: false, restaurantClosed: true,
-              error: 'هذا المطعم غير متاح حالياً'
+              error: `هذا ${kindAr} غير متاح حالياً`
             });
           }
         } catch (e) {
-          /* عطلٌ في القراءة لا يُسقط طلباً سليماً — الأصل أن المطعم
+          /* عطلٌ في القراءة لا يُسقط طلباً سليماً — الأصل أن المحلّ
            * مفتوح، وهذه الحالة نادرة ومسجَّلة كي تُرى إن تكرّرت. */
-          console.warn('⚠️ تعذّر فحص حالة المطعم قبل الطلب:', e.message);
+          console.warn('⚠️ تعذّر فحص حالة المحلّ قبل الطلب:', e.message);
         }
       }
 
@@ -354,11 +368,30 @@ router.post('/', needsIdentity, async (req, res) => {
        * صاحب المطعم في المطبخ. لذلك الإشعار هو القناة الحقيقية. */
       const money = `${orderData.grandTotal || orderData.totalAmount || 0} ₪`;
       if (isMart) {
-        // طلب مارت يذهب للمناديب مباشرة — لا مطعم يوافق عليه
+        /* طلب مارت يذهب للمناديب مباشرة — لا موافقة تسبقه.
+         *
+         * ومعه إحداثيات المحلّ (من `shopDoc` الذي قرأته البوابة
+         * أعلاه): كانت تُغفَل هنا وحدها، فيتعطّل ترتيب «الأقرب أولاً»
+         * لطلبات المارت بالذات ويُقصف كل المناديب بالتساوي. */
         notifyDrivers(req.app, {
           title: 'طلب جاهز للاستلام 📦',
           body: `${orderData.restaurant || 'زادنا مارت'} — ${money}`,
           data: { orderId: savedId, type: 'new_ready_order' },
+          restaurantLat: shopDoc ? Number(shopDoc.lat) : undefined,
+          restaurantLng: shopDoc ? Number(shopDoc.lng) : undefined,
+        }).catch(() => {});
+
+        /* وصاحب الماركت يُخطَر — وكان لا يُخطَر إطلاقاً.
+         *
+         * «لا موافقة عليه» صارت تُقرأ «لا إشعار له»، وهما شيئان:
+         * لا يوافق، لكنه **يجهّز**. بدون هذا الإشعار لا يعلم بالطلب
+         * إلا إن صادف تطبيقه مفتوحاً على السوكت — فيصل المندوب إلى
+         * الرفوف ولا أحد جمع شيئاً، وينتظر واقفاً ما كان يجب أن
+         * يكون جاهزاً قبل وصوله. */
+        notifyRestaurant(req.app, orderData.restaurantId, {
+          title: 'طلب جديد — جهّز الأصناف 🛒',
+          body: `${orderData.itemsSummary || 'طلب'} — ${money} · المندوب في الطريق`,
+          data: { orderId: savedId, type: 'new_order' },
         }).catch(() => {});
       } else {
         notifyRestaurant(req.app, orderData.restaurantId, {
@@ -782,12 +815,27 @@ router.post('/:id/cancel', needsIdentity, async (req, res) => {
       ? o.createdAt.toDate().getTime()
       : Date.parse(o.createdAt || 0) || 0;
     const inGrace = createdMs && (Date.now() - createdMs) < GRACE_MS;
-    const beforeAccept = status === 'PENDING_RESTAURANT';
+
+    /* «قبل أن يلتزم أحد» — لكلٍّ من النوعين معناه.
+     *
+     * المطعم يلتزم حين يقبل: `PENDING_RESTAURANT` وحدها قبل الالتزام.
+     * والمارت لا موافقة فيه — طلبه يولد `READY_FOR_PICKUP`، والملتزم
+     * الأول فيه هو **المندوب** حين يلتقطه.
+     *
+     * وكان الفحص يعرف المطاعم وحدها، فطلبُ مارت عمره دقيقتان ولم
+     * يلمسه أحد يُرفض إلغاؤه بنصّ «المطعم بدأ تحضير طلبك» — لا مطعم
+     * ولا تحضير ولا مندوب، ورسالةٌ يعرف الزبون أنها غير صحيحة تهدم
+     * ثقته بكل رسالة بعدها. */
+    const hasDriver = !!(o.driver && (o.driver.id || o.driver.phone)) || !!o.driverId;
+    const beforeAccept = status === 'PENDING_RESTAURANT'
+      || (status === 'READY_FOR_PICKUP' && !hasDriver);
 
     if (!req.isAdmin && !beforeAccept && !inGrace) {
       return res.status(409).json({
         success: false,
-        error: 'المطعم بدأ تحضير طلبك — راسل الإدارة إن كان لا بدّ من الإلغاء'
+        error: hasDriver
+          ? 'المندوب استلم طلبك وهو في الطريق — راسل الإدارة إن كان لا بدّ من الإلغاء'
+          : 'المطعم بدأ تحضير طلبك — راسل الإدارة إن كان لا بدّ من الإلغاء'
       });
     }
 
@@ -843,6 +891,78 @@ const EXPIRE_MS = Number(process.env.REST_EXPIRE_MIN || 20) * 60000;
 
 const _staleSeen = new Map();   // معرّف الطلب → آخر مرحلة أُبلغ عنها
 
+/* ============================================================
+   الوجه الثاني للمهلة: طلبٌ جاهز لا يلتقطه مندوب.
+
+   المهلة الأولى عالجت «مطعماً لا يردّ». وبقي توأمها مكشوفاً: طلبٌ
+   صار `READY_FOR_PICKUP` — مارت من أول ثانية، أو مطعمٌ أنهى الطبخ —
+   ولا مندوب يلتقطه. كان يبقى معلّقاً **إلى الأبد**: الزبون يحدّق في
+   شاشة تتبّع لا تتحرك، ولا أحد في المنصّة كلها يعلم أن هناك مشكلة.
+
+   ثلاث درجات كما في الأولى — لكل درجة فعلٌ لا رسالة قلق فقط:
+     · ٥ دقائق:  يُعاد نداء المناديب. الرنّة الأولى تفوت من كان
+                 على الدراجة — الثانية بابُها.
+     · ١٢ دقيقة: يُصارَح الزبون («نبحث لك عن مندوب») وتُصرخ اللوحة.
+     · ٣٥ دقيقة: طلب **المارت وحده** يُلغى بصدق — بضاعته على الرفّ
+                 لم يخسر أحدٌ شيئاً. أمّا طلب المطعم فطعامه مطبوخ
+                 وإلغاؤه آلياً يعني خسارة الشريك مالاً بقرار روبوت —
+                 يبقى مفتوحاً وتصرخ اللوحة، والقرار لصاحب المنصّة.
+   ============================================================ */
+const READY_NUDGE_MS  = Number(process.env.READY_NUDGE_MIN  || 5)  * 60000;
+const READY_ALERT_MS  = Number(process.env.READY_ALERT_MIN  || 12) * 60000;
+const MART_EXPIRE_MS  = Number(process.env.MART_EXPIRE_MIN  || 35) * 60000;
+
+const _readySeen = new Map();   // معرّف الطلب → آخر مرحلة أُبلغ عنها
+
+async function sweepReadyUnclaimed(app, db, o) {
+  const id = String(o.id);
+  const created = o.createdAt && o.createdAt.toDate
+    ? o.createdAt.toDate().getTime()
+    : Date.parse(o.createdAt || 0) || 0;
+  if (!created) return;
+  const age = Date.now() - created;
+  const stage = _readySeen.get(id) || 0;
+  const isMart = o.isMarketOrder === true;
+
+  if (isMart && age >= MART_EXPIRE_MS && stage < 3) {
+    _readySeen.set(id, 3);
+    await db.collection('orders').doc(id).update({
+      status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
+      cancelledBy: 'system', cancelReason: 'لا مندوب متاح', cancelledAt: new Date(),
+    });
+    updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED' } : x)));
+    const io = app.get('socketio');
+    if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
+    notifyCustomer(app, o.customerPhone, {
+      title: 'اعتذارنا — أُلغي طلبك',
+      body: 'لا مندوب متاحاً الآن. لم يُخصم منك شيء — جرّب بعد قليل',
+      channel: 'update', data: { orderId: id, type: 'status', status: 'CANCELLED' },
+    }).catch(() => {});
+    console.warn(`⏰ أُلغي طلب المارت ${id} — لا مندوب التقطه خلال ${MART_EXPIRE_MS / 60000} دقيقة`);
+
+  } else if (age >= READY_ALERT_MS && stage < 2) {
+    _readySeen.set(id, 2);
+    notifyCustomer(app, o.customerPhone, {
+      title: 'طلبك جاهز — نبحث لك عن مندوب',
+      body: 'كل المناديب مشغولون الآن. سنُبلغك فور انطلاق أحدهم إليك',
+      channel: 'update', data: { orderId: id, type: 'status', status: 'READY_FOR_PICKUP' },
+    }).catch(() => {});
+    const io = app.get('socketio');
+    if (io) io.to('manager_monitor').emit('order_stuck', {
+      orderId: id, restaurant: o.restaurant || '', minutes: Math.round(age / 60000),
+    });
+    console.warn(`🆘 الطلب ${id} جاهز بلا مندوب منذ ${Math.round(age / 60000)} دقيقة · ${o.restaurant || o.restaurantId}`);
+
+  } else if (age >= READY_NUDGE_MS && stage < 1) {
+    _readySeen.set(id, 1);
+    notifyDrivers(app, {
+      title: 'طلب ما زال بانتظار مندوب 📦',
+      body: `${o.restaurant || 'محلّ'} — ${o.grandTotal || o.totalAmount || 0} ₪`,
+      data: { orderId: id, type: 'new_ready_order' },
+    }).catch(() => {});
+  }
+}
+
 function startRestaurantTimeout(app) {
   const tick = async () => {
     try {
@@ -854,7 +974,15 @@ function startRestaurantTimeout(app) {
       const now = Date.now();
 
       for (const o of list) {
-        if (String(o.status || '') !== 'PENDING_RESTAURANT') { _staleSeen.delete(String(o.id)); continue; }
+        const st = String(o.status || '');
+        const hasDrv = !!(o.driver && (o.driver.id || o.driver.phone)) || !!o.driverId;
+        // «جاهز بلا مندوب» له مكنسته الخاصة — مارت كان أو مطعماً أنهى الطبخ
+        if (st === 'READY_FOR_PICKUP' && !hasDrv) {
+          _staleSeen.delete(String(o.id));
+          await sweepReadyUnclaimed(app, db, o);
+          continue;
+        }
+        if (st !== 'PENDING_RESTAURANT') { _staleSeen.delete(String(o.id)); _readySeen.delete(String(o.id)); continue; }
         const created = o.createdAt && o.createdAt.toDate
           ? o.createdAt.toDate().getTime()
           : Date.parse(o.createdAt || 0) || 0;

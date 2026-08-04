@@ -621,10 +621,20 @@ router.delete('/:id', adminOnly, async (req, res) => {
 // POST /api/restaurants/:id/approve — اعتماد المطعم من المدير
 router.post('/:id/approve', adminOnly, async (req, res) => {
   try {
-    invalidate('restaurants:raw');
+    // كاشات المارت أيضاً — الماركت المعتمد من هذا الزرّ كان يبقى
+    // محجوباً عن «أقرب ماركت» حتى تنتهي مدّة كاشها
+    invalidate('restaurants:raw', 'markets:list', 'mart:all');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
-    await db.collection('restaurants').doc(String(req.params.id)).update({ status: 'approved', isActive: true });
+    /* `isOpen: true` — الباب الثاني لعطل «معتمد وغير مرئي».
+     *
+     * المحلّ يُنشأ عند التسجيل مغلقاً (`isOpen:false`)، وهذا المسار
+     * كان يكتب `status` و`isActive` ويترك `isOpen` — فتقول اللوحة
+     * «يعمل بنشاط 🟢» (تقرأ الأولين) ويبقى المحلّ ساقطاً من قائمة
+     * الزبون ومن أقرب ماركت (يقرآن الثالث). نفس عطل زرّ الاعتماد
+     * في جدول الشركاء الذي أُصلح الليلة — من بابٍ آخر. */
+    await db.collection('restaurants').doc(String(req.params.id))
+      .update({ status: 'approved', isActive: true, isOpen: true });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -722,10 +732,13 @@ router.patch('/:id/open', needsIdentity, async (req, res) => {
 // POST /api/restaurants/:id/freeze — تجميد المطعم
 router.post('/:id/freeze', adminOnly, async (req, res) => {
   try {
-    invalidate('restaurants:raw');
+    // كاشات المارت: «سيتوقف فوراً» كانت تعني «بعد دقيقتين» للماركت
+    invalidate('restaurants:raw', 'markets:list', 'mart:all');
     const db = getDb(req);
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
-    await db.collection('restaurants').doc(String(req.params.id)).update({ status: 'frozen', isActive: false });
+    // `isOpen:false` — التجميد يُغلق الباب لا يطفئ اللافتة فقط
+    await db.collection('restaurants').doc(String(req.params.id))
+      .update({ status: 'frozen', isActive: false, isOpen: false });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });

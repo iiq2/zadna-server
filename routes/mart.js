@@ -627,10 +627,31 @@ function splitCartId(raw) {
   return { id: s.slice(0, at), unit: s.slice(at + SEP.length).trim() };
 }
 
+/* الطلب المكتوب بخطّ الزبون — بطاقة «اكتب طلبك 🛒».
+ *
+ * التطبيق يبنيه بمعرّف مصطنع `custom_grocery_<وقت>` وسعرٍ صفر، لأن
+ * الزبون كتب «نص كيلو زيتون وخبزتين» ولا سعر لهذا في أي كتالوج.
+ *
+ * وكان التسعير يبحث عن هذا المعرّف في مستندات المحلّ فلا يجده →
+ * «أصناف غير موجودة» → 400. أي أن أبرز بطاقة في تبويب المارت
+ * **لم تُنتج طلباً ناجحاً واحداً منذ كتابتها**.
+ *
+ * القاعدة: الصنف الحرّ يُقبل ويساهم صفراً في المجموع. ليس تسامحاً
+ * محاسبياً بل توصيفاً صادقاً: ثمنه غير معلوم لحظة الطلب، والمندوب
+ * يدفعه على الرفّ ويحصّله نقداً مع التسليم — خارج مجموعنا المحسوب،
+ * كما لو اشترى الزبون بنفسه. وعمولة زادنا على هذا الجزء صفر بالبناء،
+ * وهذا قرار تجاري ظاهر هنا لا عطل مدفون. */
+const isCustomItem = (id) => String(id || '').startsWith('custom_grocery');
+
 async function priceMartItems(db, marketId, items) {
   if (!Array.isArray(items) || !items.length) return null;
-  const ids = [...new Set(items.map(i => splitCartId(i && i.id).id).filter(Boolean))].slice(0, 120);
-  if (!ids.length) return { error: 'أصناف بلا معرّفات' };
+  const ids = [...new Set(
+    items.map(i => splitCartId(i && i.id).id).filter(id => id && !isCustomItem(id))
+  )].slice(0, 120);
+  // سلة كلها أصناف حرّة: مشروعة — مجموع بضاعتها صفر وأجرة التوصيل تُحسب بعدنا
+  if (!ids.length && !items.some(i => isCustomItem(splitCartId(i && i.id).id))) {
+    return { error: 'أصناف بلا معرّفات' };
+  }
 
   const col = db.collection('restaurants').doc(String(marketId)).collection('products');
   const snaps = await Promise.all(ids.map(id => col.doc(id).get()));
@@ -642,6 +663,7 @@ async function priceMartItems(db, marketId, items) {
   for (const it of items) {
     const parsed = splitCartId(it && it.id);
     const id = parsed.id;
+    if (isCustomItem(id)) continue;   // مكتوب بخطّ الزبون: يمرّ، ثمنه على الرفّ لا هنا
     const p = byId.get(id);
     if (!p) { unknown.push(id); continue; }
     if (p.available === false) { gone.push(p.nameAr || id); continue; }

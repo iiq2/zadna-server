@@ -260,6 +260,42 @@ router.post('/registered_partners/reconcile_shops', adminOnly, async (req, res) 
   }
 });
 
+/* ============================================================
+   مصير المحلّ يتبع مصير صاحبه — في كل الأزرار لا في الاعتماد وحده.
+
+   جولة الفحص كشفت أنّ عطل الاعتماد الذي أُصلح الليلة مكرَّرٌ بعينه
+   في التجميد والرفض والحذف: كلّها تكتب على `users/{id}` وحده، بينما
+   الزبون والطلبات وأقرب ماركت تقرأ من مستند المحلّ في `restaurants`.
+
+   فماذا كان يحدث عند «تجميد مؤقت ⛔»؟ حساب الشريك يُجمَّد فعلاً —
+   يُحجب بـ403 عن كل نداء — لكن محلّه يبقى `approved` ومفتوحاً: يظهر
+   لكل زبون ويستقبل الطلبات، وصاحبه **ممنوعٌ حتى من رفضها**. فيعلق
+   الطلب عشرين دقيقة ثم يُلغى تلقائياً، والزبون ينتظر طعاماً لن يُطبخ،
+   والشريك يُتَّهم بإهمال طلبات لم يُسمح له برؤيتها.
+
+   والرفض النهائي أسوأ: شريك أنهيتَ تعاونه يبقى محلّه يبيع باسم زادنا.
+   والحذف أسوأهما: محلٌّ حيّ بلا مالك — واجهة تقبل طلبات لا أحد يفتحها.
+
+   هذه الدالة الواحدة تُغلق الباب في المواضع الأربعة: كل حكم على
+   الحساب يسري على المحلّ في نفس السطر، وتُمحى الكاشات الأربعة التي
+   كانت تُبقي المحلّ ظاهراً دقائق بعد «فوراً».
+   ============================================================ */
+async function syncShopWithOwner(req, db, userId, patch) {
+  try {
+    const uDoc = await db.collection('users').doc(String(userId)).get();
+    const shopId = String(((uDoc.data() || {}).ownedRestaurantId) || '');
+    if (!shopId) return null;                       // مندوب أو زبون — لا محلّ له
+    await db.collection('restaurants').doc(shopId).update({ ...patch, statusAt: new Date() });
+    invalidate('restaurants:raw', 'markets:list', 'mart:all', 'partners:all');
+    return shopId;
+  } catch (e) {
+    /* لا نُسقط الحكم على الحساب لأن المحلّ تعثّر — لكن نصرخ:
+     * حسابٌ محكوم ومحلٌّ طليق هو بالضبط العطل الذي نسدّه. */
+    console.error('⚠️ حُكم على الحساب ولم يُمسّ محلّه:', userId, e.message);
+    return null;
+  }
+}
+
 // POST /api/registered_partners/reject
 router.post('/registered_partners/reject', adminOnly, async (req, res) => {
   try {
@@ -270,6 +306,8 @@ router.post('/registered_partners/reject', adminOnly, async (req, res) => {
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
     const note = (req.body && req.body.note) || '';
     await db.collection('users').doc(String(id)).update({ status: 'rejected', statusNote: note, statusAt: new Date() });
+    // المحلّ يُوقف مع صاحبه — لا واجهة تبيع باسم شريكٍ أنهيتَ تعاونه
+    await syncShopWithOwner(req, db, id, { status: 'rejected', isActive: false, isOpen: false, statusNote: note });
     const clr = req.app.get('clearStatusCache'); if (clr) clr(String(id));
     const io = req.app.get('socketio');
     if (io) io.emit('partner_status_changed', { id: String(id), status: 'rejected', note });
@@ -289,6 +327,8 @@ router.post('/registered_partners/freeze', adminOnly, async (req, res) => {
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
     const note = (req.body && req.body.note) || '';
     await db.collection('users').doc(String(id)).update({ status: 'frozen', statusNote: note, statusAt: new Date() });
+    // «لن يستقبل طلبات حتى تفكّ التجميد» — الآن صادقة: المحلّ يُغلق معه
+    await syncShopWithOwner(req, db, id, { status: 'frozen', isActive: false, isOpen: false, statusNote: note });
     // أبلغ الشريك فوراً عبر السوكت
     const clr = req.app.get('clearStatusCache'); if (clr) clr(String(id));
     const io = req.app.get('socketio');
@@ -308,6 +348,8 @@ router.post('/registered_partners/unfreeze', adminOnly, async (req, res) => {
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
     await db.collection('users').doc(String(id)).update({ status: 'approved', statusNote: '', statusAt: new Date() });
+    // فكّ التجميد يفتح المحلّ كما أغلقه التجميد — بابٌ واحد للاثنين
+    await syncShopWithOwner(req, db, id, { status: 'approved', isActive: true, isOpen: true, statusNote: '' });
     const clr = req.app.get('clearStatusCache'); if (clr) clr(String(id));
     const io = req.app.get('socketio');
     if (io) io.emit('partner_status_changed', { id: String(id), status: 'approved', note: '' });
@@ -325,8 +367,29 @@ router.post('/registered_partners/delete', adminOnly, async (req, res) => {
     if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
+
+    /* ترتيب السطور هنا مقصود ولا يُقلب:
+     *
+     * ١) المحلّ أولاً — الدالة تقرأ `ownedRestaurantId` من مستند
+     *    المستخدم، فلو حُذف المستند أولاً ضاع الرابط إلى المحلّ
+     *    للأبد وبقي حيّاً بلا مالك: واجهة تقبل طلبات لا أحد يفتحها.
+     *    (لا نحذف مستند المحلّ نفسه: فيه تاريخ طلبات ومال — يُوقف
+     *    ويبقى للسجلّ، والحذف النهائي للبيانات قرارك بيدك.)
+     *
+     * ٢) ثم حذف الحساب.
+     *
+     * ٣) ثم `clearStatusCache` — وهذا سدّ الثغرة الأخطر في الفحص:
+     *    توكن المحذوف يبقى صالحاً ٩٠ يوماً، وفحص الحظر كان يقول
+     *    «لا مانع» عن حسابٍ لا وجود له (أُصلح في server.js ليحظر)،
+     *    لكن الكاش كان يحفظ «لا مانع» الأخيرة دقيقةً كاملة — تكفي
+     *    مندوباً محذوفاً ليقبل طلباً ويُحصّل كاش زبونه. */
+    const shopId = await syncShopWithOwner(req, db, id,
+      { status: 'rejected', isActive: false, isOpen: false, statusNote: 'حُذف حساب صاحبه' });
     await db.collection('users').doc(String(id)).delete();
-    res.json({ success: true });
+    const clr = req.app.get('clearStatusCache'); if (clr) clr(String(id));
+    const io = req.app.get('socketio');
+    if (io) io.emit('partner_status_changed', { id: String(id), status: 'rejected', note: 'حُذف الحساب' });
+    res.json({ success: true, closedShop: shopId || null });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
