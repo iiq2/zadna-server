@@ -283,8 +283,21 @@ router.get('/', async (req, res) => {
       // الزبون مفتوحاً بمنيو لا يعرفه، ويطلب منه، والمطبخ مغلق.
       // والأمر نفسه ينطبق على المطعم المجمَّد أو غير المعتمد: يُخفى ثم يعود
       // بنسخة الديمو — أي أن التجميد بلا أثر أيضاً.
-      const knownIds = new Set(restaurants.map(r => String(r.id)));
-      const merged = visible.concat(demoRestaurants.filter(d => !knownIds.has(String(d.id))));
+      /* مطاعم الكود تُعرض **فقط** حين لا قاعدة بيانات إطلاقاً.
+       *
+       * كانت تُدمج دائماً، فصارت أشباحاً لا يملكها أحد ولا يستطيع أحد
+       * حذفها: المدير يمسحها من Firestore فتعود، ويجمّدها فتعود — لأنها
+       * ليست بياناتٍ أصلاً بل أسطرٌ في هذا الملف.
+       *
+       * وأخطر من بقائها أنها تقبل الطلبات: زبون يطلب من «Hashtag Snax»
+       * فلا يصل الطلب أحداً — لا مالك له ولا مطبخ.
+       *
+       * وحتى عند انقطاع قاعدة البيانات، عرضُها مشكوك فيه: طلبٌ يذهب إلى
+       * العدم أسوأ من رسالة «الخدمة مضغوطة». أبقيناها لهذه الحالة وحدها
+       * لأن الواجهة الفارغة تُربك، لكن `isOpen: false` تمنع الطلب منها. */
+      const merged = db
+        ? visible
+        : demoRestaurants.map(d => ({ ...d, isOpen: false }));
 
       // ترتيب جميل للزبون: المفتوح أولاً، ثم الأعلى تقييماً، ثم الأسرع توصيلاً
       const nowOpen = (r) => r.isOpen !== false;
@@ -303,7 +316,10 @@ router.get('/', async (req, res) => {
         name: r.name || 'مطعم',
         description: r.description || 'مطعم شريك على منصة زادنا',
         emoji: r.emoji || '🍽️',
-        rating: Number(r.rating) || 5,
+        // تقييمٌ مفقود = 0 لا 5.
+        // كان كل مطعم جديد يُولد بخمس نجوم لم يمنحها أحد، فيثق الزبون
+        // برقم لا أساس له — ويفقد الثقة بكل التقييمات حين يكتشف ذلك.
+        rating: Number(r.rating) || 0,
         deliveryTime: Number(r.deliveryTime) || 25,
         deliveryFee: r.deliveryFee != null ? Number(r.deliveryFee) : 5,
         categories: Array.isArray(r.categories) && r.categories.length ? r.categories : ['all'],
@@ -323,10 +339,16 @@ router.get('/:id', async (req, res) => {
           const db = getDb(req);
           const doc = await db.collection('restaurants').doc(req.params.id).get();
           if (!doc.exists) {
-                  // Fallback check in demoData
-            const demo = demoRestaurants.find(r => r.id === req.params.id);
-                  if (demo) return res.json({ success: true, restaurant: demo });
-                  return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
+            /* لا نُرجع مطعم الكود ما دامت قاعدة البيانات تعمل.
+             *
+             * القائمة لم تعد تعرضه، لكن رابطاً قديماً أو مفضّلةً محفوظة
+             * تفتحه بمعرّفه — فيُبنى منه سلة ويُرسل طلب إلى مطعم لا وجود
+             * له. البابان يُغلقان معاً أو لا يُغلق أيّهما. */
+            if (!db) {
+              const demo = demoRestaurants.find(r => r.id === req.params.id);
+              if (demo) return res.json({ success: true, restaurant: { ...demo, isOpen: false } });
+            }
+            return res.status(404).json({ success: false, error: 'المطعم غير موجود' });
           }
           res.json({ success: true, restaurant: { id: doc.id, ...doc.data() } });
     } catch (error) {
