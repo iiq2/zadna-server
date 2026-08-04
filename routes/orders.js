@@ -12,6 +12,7 @@ const { cached, invalidate, updateCached } = require('../utils/cache');
 const { quoteDelivery } = require('./zones');
 const { notifyRestaurant, notifyDrivers, notifyCustomer } = require('./push');
 const { priceMartItems } = require('./mart');
+const meter = require('../utils/meter');
 
 /* رسالة الخطأ للزبون: عربية ومفيدة، والتفصيل يُسجَّل عندنا لا يُرسَل إليه.
    نأخذها من السيرفر ليكون لسان المنصّة واحداً في كل مسار. */
@@ -376,6 +377,7 @@ router.get('/', needsIdentity, async (req, res) => {
                 .get();
             const list = [];
             snapshot.forEach(doc => list.push(doc.data()));
+            meter.addReads(snapshot.size, 'الطلبات');
             return list;
         });
 
@@ -413,6 +415,7 @@ router.get('/', needsIdentity, async (req, res) => {
                 const snap = await db.collection('restaurants').get();
                 const list = [];
                 snap.forEach(d => list.push({ id: d.id, ...d.data() }));
+                meter.addReads(snap.size, 'المطاعم');
                 return list;
             });
             rests.forEach(r => { if (r.phone) phoneById[String(r.id)] = String(r.phone); });

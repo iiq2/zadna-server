@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { MART_CATEGORIES, MART_SUGGESTIONS } = require('../data/martCatalog');
 const { cached, invalidate } = require('../utils/cache');
+const meter = require('../utils/meter');
 
 /* ============================================================
    زادنا مارت — كتالوج مملوك لكل سوبرماركت.
@@ -147,6 +148,7 @@ router.get('/', async (req, res) => {
       const snap = await db.collection('restaurants').doc(marketId).collection('products').get();
       const out = [];
       snap.forEach(d => out.push({ id: d.id, ...d.data() }));
+      meter.addReads(snap.size, 'كتالوج المارت');
       return out;
     });
 
