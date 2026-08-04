@@ -469,6 +469,10 @@ app.post('/api/auth/register', async (req, res) => {
         });
       }
 
+      /* نوع الشريك كما جاء من كوده: `restaurant` أو `market`.
+       * يبقى `restaurant` لمن سجّل بمتغيّر بيئة لا بكود. */
+      let partnerKind = userType;
+
       // حرق كود الاعتماد ذرياً (Transaction) — يمنع استخدامه مرتين
       if (isPartner && !envCodeOk) {
         const codeRef = db.collection('partner_codes').doc(String(adminCode).toUpperCase().trim());
@@ -478,7 +482,19 @@ app.post('/api/auth/register', async (req, res) => {
             if (!snap.exists) throw new Error('كود الاعتماد غير صحيح ❌');
             const c = snap.data();
             if (c.isUsed) throw new Error('هذا الكود مستخدم سابقاً ❌ اطلب كوداً جديداً من الإدارة');
-            if (c.type !== userType) throw new Error('هذا الكود مخصص لنوع شريك آخر ❌');
+            /* كود الماركت يُسجَّل حسابُه بنوع `restaurant`.
+             *
+             * السوبرماركت والمطعم شريكان بنفس القدرات: يستقبلان طلباً،
+             * ويفتحان ويُغلقان، ولهما محفظة وشات وكشف حساب. الفرق في
+             * البضاعة لا في الحساب — ولذلك لا نُنشئ نوع مستخدم ثالثاً
+             * يستلزم تكرار كل مسار من مسارات الشريك.
+             *
+             * التمييز يقع على **المحلّ** بحقل `partnerType='market'`،
+             * وهو ما يقرؤه مسار «أقرب ماركت» وشاشة الكتالوج. */
+            const codeFits = c.type === userType
+              || (c.type === 'market' && userType === 'restaurant');
+            if (!codeFits) throw new Error('هذا الكود مخصص لنوع شريك آخر ❌');
+            partnerKind = c.type;   // نحتاجه بعد قليل عند إنشاء المحلّ
             t.update(codeRef, { isUsed: true, usedBy: phone || email, usedAt: new Date() });
           });
         } catch (txErr) {
@@ -525,21 +541,29 @@ app.post('/api/auth/register', async (req, res) => {
       const docRef = await db.collection('users').add(newUser);
       const userId = docRef.id;
 
-      // صاحب المطعم: أنشئ مطعمه تلقائياً واربطه بحسابه
+      // صاحب المطعم أو السوبرماركت: أنشئ محلّه تلقائياً واربطه بحسابه
       let createdRestId = null;
       if (userType === 'restaurant' && ownedRestaurantId && String(ownedRestaurantId).trim()) {
         try {
           const restName = String(ownedRestaurantId).trim();
-          createdRestId = 'rest_' + Date.now();
+          const isMarket = partnerKind === 'market';
+          createdRestId = (isMarket ? 'mkt_' : 'rest_') + Date.now();
           await db.collection('restaurants').doc(createdRestId).set({
             id: createdRestId,
             name: restName,
-            description: 'مطعم شريك على منصة زادنا',
+            /* الحقل الذي يفرّق السوبرماركت عن المطعم — وهو كل الفرق.
+             * يقرؤه مسار «أقرب ماركت»، وشاشة الكتالوج، والتسعير
+             * (المطعم سعرٌ للصنف، والماركت سعرٌ لكل وحدة: الكيلو غير
+             * الحبّة). وما عداه يرثه الاثنان سواءً. */
+            partnerType: isMarket ? 'market' : 'restaurant',
+            description: isMarket ? 'سوبرماركت شريك على منصة زادنا'
+                                  : 'مطعم شريك على منصة زادنا',
             phone: phone,
             ownerId: userId,
             ownerEmail: email,
-            emoji: '🍽️',
-            rating: 5,
+            emoji: isMarket ? '🛒' : '🍽️',
+            // تقييم صفر لا خمسة: لا نمنح نجوماً لم يمنحها زبون
+            rating: 0,
             deliveryTime: 25,
             deliveryFee: 5,
             categories: [],
