@@ -11,6 +11,7 @@ const Joi = require('joi');
 // كاش مشترك — يحمي حصة Firestore المجانية (٥٠ ألف قراءة/يوم)
 const { cached, invalidate } = require('./utils/cache');
 const meter = require('./utils/meter');
+const fbAuth = require('./utils/firebaseAuth');
 
 /* ============================================================
    ردّ الخطأ للمستخدم.
@@ -451,7 +452,16 @@ app.post('/api/auth/register', async (req, res) => {
         }
       }
 
-      const hashedPassword = await bcryptjs.hash(password, 10);
+      /* الحساب يُولد عند Firebase مباشرة — فلا يحتاج نقلاً لاحقاً، وتعمل له
+       * رسالة استعادة كلمة السر من أول يوم.
+       *
+       * وتبقى بصمة bcrypt احتياطاً لمن يُنشأ حسابه ساعةَ يكون Firebase
+       * معطّلاً أو مفتاحه غير مضبوط: يدخل بها، ويُنقل عند أول دخول ناجح. */
+      let fbUid = null;
+      if (fbAuth.isConfigured()) {
+        fbUid = await fbAuth.ensureAuthUser(email, password, name);
+      }
+      const hashedPassword = fbUid ? null : await bcryptjs.hash(password, 10);
 
       const newUser = {
         name,
@@ -459,7 +469,9 @@ app.post('/api/auth/register', async (req, res) => {
         phone,
         userType,
         ownedRestaurantId: ownedRestaurantId || null,
-        password: hashedPassword,
+        ...(fbUid
+          ? { firebaseAuth: true, firebaseUid: fbUid }
+          : { password: hashedPassword }),
         createdAt: new Date(),
         profileImage: '',
         rating: 5,
@@ -753,10 +765,20 @@ app.post('/api/auth/login', async (req, res) => {
       const user = userDoc.data();
       const userId = userDoc.id;
 
+      /* ===== التحقق من كلمة السر =====
+       *
+       * مرجعان لا يجتمعان: الحساب المنقول يُسأل Firebase وحده، وغير المنقول
+       * يُسأل bcrypt ثم يُنقل في تلك اللحظة — فكلمته الصريحة تمرّ بين أيدينا
+       * مرة واحدة، وهي الفرصة الوحيدة للنقل بلا أن يشعر بشيء.
+       *
+       * ولا نُبقي البصمة القديمة بعد النقل: لو أبقيناها لبقيت الكلمة القديمة
+       * صالحة بعد أن يغيّرها صاحبها — وذلك أسوأ من ألّا ننقل أصلاً. */
+      const migrated = user.firebaseAuth === true;
+
       // حساب أُنشئ بجوجل لا يملك كلمة سر أصلاً. تمرير قيمة غير موجودة إلى
       // bcrypt يرمي استثناءً فيصير الرد خطأ 500 بلا معنى، والمستخدم يظن أنه
       // نسي كلمة سره ويذهب لاستعادتها — وهي غير موجودة أصلاً.
-      if (!user.password || user.authProvider === 'google') {
+      if (!migrated && (!user.password || user.authProvider === 'google')) {
         return res.status(409).json({
           success: false,
           error: 'هذا الحساب مسجّل بحساب جوجل — استخدم زر «الدخول بحساب جوجل» بالأسفل',
@@ -764,11 +786,50 @@ app.post('/api/auth/login', async (req, res) => {
         });
       }
 
-      const isPasswordValid = await bcryptjs.compare(password, user.password);
+      const userEmail = String(user.email || '').trim().toLowerCase();
+      let isPasswordValid = false;
+
+      if (migrated) {
+        const v = await fbAuth.verifyPassword(userEmail, password);
+        if (v.reason === 'unavailable') {
+          // عطلٌ عندنا لا عنده. لا نقول له «كلمتك خاطئة» فيذهب يغيّر كلمة سليمة.
+          return res.status(503).json({
+            success: false, busy: true,
+            error: 'خدمة الدخول مضغوطة الآن — أعد المحاولة بعد دقيقة'
+          });
+        }
+        if (v.reason === 'disabled') {
+          return res.status(403).json({ success: false, error: 'حسابك موقوف — تواصل مع إدارة زادنا' });
+        }
+        isPasswordValid = v.ok;
+      } else {
+        isPasswordValid = await bcryptjs.compare(password, user.password);
+
+        // النقل الكسول — لا يمنع دخولاً ناجحاً مهما فشل
+        if (isPasswordValid && fbAuth.isConfigured() && userEmail) {
+          try {
+            const uid = await fbAuth.ensureAuthUser(userEmail, password, user.name);
+            if (uid) {
+              await userDoc.ref.update({
+                firebaseAuth: true,
+                firebaseUid: uid,
+                password: admin.firestore.FieldValue.delete(),
+                migratedAt: new Date()
+              });
+              console.log('🔁 نُقل حساب إلى Firebase Auth:', userEmail);
+            }
+          } catch (e) {
+            console.warn('⚠️ فشل نقل الحساب — الدخول يكمل عادياً:', e.message);
+          }
+        }
+      }
+
       if (!isPasswordValid) {
         return res.status(401).json({
           success: false,
-          error: 'البريد الإلكتروني أو كلمة السر غير صحيحة'
+          error: asLocalPhone
+            ? 'رقم الجوال أو كلمة السر غير صحيحة'
+            : 'البريد الإلكتروني أو كلمة السر غير صحيحة'
         });
       }
 
@@ -843,6 +904,119 @@ app.post('/api/auth/login', async (req, res) => {
 
   } catch (error) {
     return failJson(res, error, 'تسجيل الدخول');
+  }
+});
+
+/* ============================================================
+ * إعادة ضبط كلمة السر — من الإدارة
+ *
+ * حتى اليوم لم يكن في زادنا مسارٌ واحد لإعادة تعيين كلمة سر: لا
+ * للزبون ولا للإدارة. وكان حوار «نسيت كلمة السر» في التطبيق يَعِد
+ * الناس أن يراسلوا الإدارة «وسنعيد ضبط كلمة سرك خلال دقائق» —
+ * ولا سبيل إلى ذلك، لأن الكلمات مخزّنة مُعمّاة بـbcrypt فلا تُكتب
+ * بيد في قاعدة البيانات. فكان كل من ينسى كلمته يفقد حسابه وسجلّ
+ * طلباته ومحفظته إلى الأبد، ونحن نظنّ أننا وعدناه خيراً.
+ *
+ * لا يُعيد هذا المسار ضبط حسابات الإدارة، ولا يقبل كلمة يختارها
+ * الطالب: يولّد السيرفر كلمة مؤقتة ويردّها مرة واحدة فقط.
+ * ============================================================ */
+
+// حروف بلا التباس: لا 0/O ولا 1/l/I — تُملى على الهاتف فلا تُخطئ
+const TEMP_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function makeTempPassword(len = 8) {
+  const bytes = require('crypto').randomBytes(len);
+  let out = '';
+  for (let i = 0; i < len; i++) out += TEMP_ALPHABET[bytes[i] % TEMP_ALPHABET.length];
+  return out;
+}
+
+app.post('/api/admin/reset_password', requireAdmin, async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ success: false, error: 'قاعدة البيانات غير متصلة' });
+
+    const b = req.body || {};
+    const phone = String(b.phone || '').trim();
+    const email = String(b.email || '').trim().toLowerCase();
+    if (!phone && !email) {
+      return res.status(400).json({ success: false, error: 'أرسل رقم الجوال أو البريد' });
+    }
+
+    // البحث بالرقم أوّلاً — هو ما يعرفه الزبون عن نفسه
+    let snap;
+    if (phone) {
+      const norm = phone.replace(/[\s\-()]/g, '').replace(/^(\+?9(70|72)|00 ?9(70|72))/, '0');
+      snap = await db.collection('users').where('phone', '==', norm).limit(2).get();
+      if (snap.empty) snap = await db.collection('users').where('phone', '==', phone).limit(2).get();
+    } else {
+      snap = await db.collection('users').where('email', '==', email).limit(2).get();
+    }
+    meter.addReads(snap.size || 1, 'استعادة كلمة السر');
+
+    if (snap.empty) {
+      return res.status(404).json({ success: false, error: 'لا حساب بهذا الرقم أو البريد' });
+    }
+    // رقمان متطابقان يعنيان بيانات مشوّشة — لا نخمّن أيّهما صاحب الحساب
+    if (snap.size > 1) {
+      return res.status(409).json({
+        success: false,
+        error: 'وُجد أكثر من حساب بهذا الرقم — راجع القائمة يدوياً قبل إعادة الضبط'
+      });
+    }
+
+    const doc = snap.docs[0];
+    const u = doc.data();
+
+    if (String(u.userType || '') === 'manager') {
+      return res.status(403).json({ success: false, error: 'حسابات الإدارة لا تُضبط من هنا' });
+    }
+    // حساب جوجل لا كلمة سر له أصلاً، وإعطاؤه واحدة يفتح باباً ثانياً لحساب
+    // كانت هويته مضمونة من جوجل وحدها.
+    if (String(u.authProvider || '') === 'google' && !u.password) {
+      return res.status(409).json({
+        success: false,
+        error: 'هذا حساب جوجل — يدخل صاحبه بزرّ «الدخول بجوجل» بلا كلمة سر'
+      });
+    }
+
+    const temp = makeTempPassword(8);
+
+    /* الكلمة تُكتب حيث يقرؤها الدخول، لا حيث اعتدنا.
+     * الحساب المنقول يُسأل Firebase وحده، فكتابةُ bcrypt له تُنتج كلمةً
+     * لا تفتح شيئاً — والإدارة تظنّها أعطت الزبون مفتاحاً وهو لا يفتح. */
+    const userEmail = String(u.email || '').trim().toLowerCase();
+    if (u.firebaseAuth === true) {
+      const uid = await fbAuth.ensureAuthUser(userEmail, temp, u.name);
+      if (!uid) {
+        return res.status(503).json({
+          success: false,
+          error: 'تعذّر الوصول إلى خدمة الحسابات — أعد المحاولة بعد دقيقة'
+        });
+      }
+      await doc.ref.update({
+        mustChangePassword: true,
+        passwordResetAt: new Date(),
+        passwordResetBy: 'admin'
+      });
+    } else {
+      await doc.ref.update({
+        password: await bcryptjs.hash(temp, 10),
+        mustChangePassword: true,
+        passwordResetAt: new Date(),
+        passwordResetBy: 'admin'
+      });
+    }
+
+    // لا تُطبع الكلمة في السجل — سجلّات Render تُقرأ ولا تُمحى
+    console.log(`🔑 أُعيد ضبط كلمة سر: ${u.name || ''} · ${u.phone || u.email || doc.id}`);
+
+    return res.json({
+      success: true,
+      tempPassword: temp,          // تُعرض مرة واحدة، لا تُحفظ في أي مكان
+      user: { id: doc.id, name: u.name || '', phone: u.phone || '', email: u.email || '' },
+      note: 'أرسلها لصاحبها، واطلب منه تغييرها بعد الدخول'
+    });
+  } catch (error) {
+    return failJson(res, error, 'إعادة ضبط كلمة السر');
   }
 });
 
@@ -1366,7 +1540,7 @@ io.on('connection', (socket) => {
      كاذبة لكل المناديب بلا أي تحقق. مستمع ميت وباب مفتوح في آن. */
 
   // تحديث موقع المندوب
-  socket.on('driver_location_update', (data) => {
+  socket.on('driver_location_update', async (data) => {
     // تطبيق المندوب يرسل lat/lng، وكان هذا المستمع يقرأ latitude/longitude
     // فقط — وهما غير موجودين في الرسالة، فيُبثّ الموقع فارغاً وترميه لوحة
     // المدير عند فحص الأرقام. النتيجة: لم يصل موقع حقيقي واحد إلى الخريطة
@@ -1417,6 +1591,39 @@ io.on('connection', (socket) => {
       lng: lng,
       timestamp: new Date()
     });
+
+    /* ============================================================
+       وللزبون أيضاً — لكن لصاحب الطلب وحده.
+
+       الزبون ينتظر ولا يعرف: هل تحرّك المندوب؟ هل هو قريب؟ فيتصل
+       بعد عشر دقائق ليسأل، ويتصل غيره، وتصير هذه مكالمات يومك كلّه.
+       والخريطة تُجيب عن السؤال قبل أن يُسأل.
+
+       والقاعدة هنا هي القاعدة نفسها التي حكمت كل شيء الليلة: يرى
+       الزبون **مندوبه هو**، على **طلبه هو**، وفي **وقت التوصيل وحده**.
+       لا يُبثّ موقع مندوب لمن لا طلب له عنده، ولا بعد أن يُسلّم.
+
+       ولا يكلّف قراءة واحدة: نقرأ من كاش الطلبات الذي يعمل أصلاً.
+       ============================================================ */
+    try {
+      const list = await cached('orders:all', 1800000, async () => []);
+      if (Array.isArray(list) && list.length) {
+        const me = String(su.userId);
+        const LIVE = ['DRIVER_ASSIGNED', 'AT_RESTAURANT', 'PICKED_UP', 'ON_THE_WAY'];
+        for (const o of list) {
+          if (!LIVE.includes(String(o.status || ''))) continue;
+          const drv = (o.driver && typeof o.driver === 'object')
+            ? String(o.driver.id || o.driver.phone || '') : String(o.driverId || '');
+          if (drv !== me) continue;
+          io.to(`order_room_${o.id}`).emit('driver_location', {
+            orderId: String(o.id),
+            driverName: data.driverName || '',
+            lat, lng,
+            timestamp: new Date(),
+          });
+        }
+      }
+    } catch (e) { /* الخريطة زينة لا شرط — لا تُسقط تحديث الموقع */ }
   });
 
   socket.on('join_chat', (roomName) => {
