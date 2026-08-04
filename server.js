@@ -1321,6 +1321,73 @@ app.post('/api/driver_chats', requireIdentity, async (req, res) => {
       });
       // الكاتب يرى رسالته فوراً — لا ينتظر انتهاء كاش الثواني الثماني
       invalidate(`chat:${orderId}`);
+
+      /* ============================================================
+         البثّ الفوري — كان غائباً كلّياً عن هذا المسار.
+
+         التطبيقات ترسل رسائلها عبر **HTTP** لا عبر السوكت (انظر
+         `ChatRepository.sendMessage`). وهذا المسار كان يحفظ الرسالة
+         ويُبطل الكاش ثم ينتهي — بلا `emit` واحد. فالطرف الآخر لا يعلم
+         بها إلا حين يستطلع، والاستطلاع كل تسعين ثانية، وهو لا يعمل
+         أصلاً إلا وشاشة الشات مفتوحة أمامه.
+
+         فمن يفتح الشات ويكتب ويُغلق، تنتظره رسالة الطرف الآخر حتى
+         يفتح من جديد. والعطل يبدو **باتجاه واحد** لأن الزبون يُبقي
+         شاشته مفتوحة على التتبّع بينما المندوب يقود: يكتب المندوب
+         فتصل، ويكتب الزبون فلا تصل.
+
+         نبثّ هنا بنفس الشكل الذي يبثّ به مسار السوكت حرفاً بحرف
+         (`receive_message` على `order_room_<id>`)، فالمستمع في التطبيق
+         موجود منذ البداية — كان ينتظر حدثاً لا يأتي.
+         ============================================================ */
+      try {
+        const io = req.app.get('socketio');
+        if (io) {
+          const isGlobal = orderId === 'global_driver_chat'
+            || orderId === 'global_zadna_chat'
+            || orderId === 'manager_monitor'
+            || orderId.startsWith('admin_driver_');
+          const targetRoom = isGlobal ? orderId : `order_room_${orderId}`;
+          const payload = {
+            orderId,
+            text,
+            senderId:   who.senderId,
+            senderName: who.senderName,
+            senderRole: who.senderRole,
+            timestamp:  new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })
+          };
+          io.to(targetRoom).emit('receive_message', payload);
+          // الإدارة تراقب كل المحادثات من غرفة واحدة
+          if (targetRoom !== 'manager_monitor') {
+            io.to('manager_monitor').emit('receive_message', payload);
+          }
+        }
+      } catch (e) { /* فشل البثّ لا يُسقط رسالةً حُفظت */ }
+
+      /* ============================================================
+         الرسالة تصل صاحبها ولو كان التطبيق مغلقاً.
+
+         لم يكن للشات إشعار إطلاقاً: تُكتب الرسالة وتُحفظ ويُبثّ السوكت
+         — والسوكت لا يعمل إلا والتطبيق مفتوح على الشاشة. فمندوبٌ يسأل
+         «وين بالضبط؟» ويقف تحت العمارة ينتظر جواباً لن يصل حتى يفتح
+         الزبون التطبيق صدفة.
+
+         وبقناة خفيفة عمداً لا بإنذار: الرسالة ليست طلباً. صوتٌ قصير
+         بلا تجاوز «عدم الإزعاج» وبلا اهتزاز طويل — من يُرعبه رنينُ
+         رسالةٍ يُطفئ إشعارات زادنا كلها، فيخسر الطلبات معها.
+         ============================================================ */
+      try {
+        const { notifyChatPeer } = require('./routes/push');
+        if (notifyChatPeer) {
+          notifyChatPeer(req.app, {
+            orderId,
+            senderId: who.senderId,
+            senderName: who.senderName,
+            senderRole: who.senderRole,
+            text
+          }).catch(() => {});
+        }
+      } catch (e) { /* الإشعار لا يُسقط رسالةً حُفظت */ }
     }
 
     res.json({ success: true });
