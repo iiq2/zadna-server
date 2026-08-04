@@ -41,6 +41,29 @@ const needsIdentity = (req, res, next) => {
 
 const CATALOG_TTL = 300000;   // خمس دقائق — ويُمحى فوراً بعد أي تعديل
 
+/* ============================================================
+   كتالوج الإدارة (كل المحلّات معاً) — عمرٌ طويل عمداً.
+
+   هذا الاستعلام يقرأ ٨٨٠ مستنداً في المرّة الواحدة. وبعمرٍ من خمس
+   دقائق كانت لوحةٌ مفتوحة على المكتب تُنفق ٨٨٠ × ٢٨٨ = ٢٥٣ ألف قراءة
+   في اليوم — خمسة أضعاف الحصة المجانية كلّها. ولوحةُ مراقبةٍ لا يلمسها
+   أحد لا يجوز أن تُوقف تطبيق الزبون والمندوب والمطعم.
+
+   والصحّة لا تأتي من قِصَر العمر بل من الإبطال: كل كتابة على أي صنف
+   تمسح هذا المفتاح صراحةً (invalidateCatalog أدناه). فالتعديل يظهر في
+   اللوحة فوراً، والثمن يصير «قراءة عند كل تعديل» لا «قراءة كل خمس
+   دقائق أبد الدهر».
+
+   وكان المفتاح — قبل هذا — لا يُبطَل عند الكتابة أصلاً: أي أنّه كان
+   غالياً وقديماً معاً. أسوأ الاثنين.
+   ============================================================ */
+const ADMIN_CATALOG_TTL = 6 * 60 * 60 * 1000;   // ست ساعات
+
+/** كل كتابة على صنف تمسح كتالوج محلّه وكتالوج الإدارة معاً. */
+function invalidateCatalog(marketId) {
+  invalidate(`mart:${marketId}`, 'mart:all');
+}
+
 /* ===== الصلاحية =====
 
    صاحب المحلّ سيّد بضاعته. وكون هذا كلّه adminOnly كان وحده كافياً
@@ -339,7 +362,7 @@ async (req, res) => {
       if (!req.isAdmin) {
         return res.status(400).json({ success: false, error: 'حدّد المحل (marketId)' });
       }
-      const list = await cached('mart:all', CATALOG_TTL, async () => {
+      const list = await cached('mart:all', ADMIN_CATALOG_TTL, async () => {
         const snap = await db.collectionGroup('products').limit(2000).get();
         const out = [];
         snap.forEach(d => {
@@ -390,7 +413,7 @@ router.post('/', needsIdentity, async (req, res) => {
     await db.collection('restaurants').doc(marketId)
       .collection('products').doc(id).set(product, { merge: true });
 
-    invalidate(`mart:${marketId}`);
+    invalidateCatalog(marketId);
     res.status(201).json({ success: true, id, product: { id, ...product } });
   } catch (e) {
     console.error('❌ حفظ صنف:', e.message);
@@ -426,7 +449,7 @@ router.post('/bulk', needsIdentity, async (req, res) => {
     }
     if (n) await batch.commit();
 
-    invalidate(`mart:${marketId}`);
+    invalidateCatalog(marketId);
     res.json({ success: true, saved, rejected });
   } catch (e) {
     console.error('❌ حفظ دفعة:', e.message);
@@ -463,7 +486,7 @@ router.patch('/:id', needsIdentity, async (req, res) => {
     if (!snap.exists) return res.status(404).json({ success: false, error: 'الصنف غير موجود' });
     await ref.update(patch);
 
-    invalidate(`mart:${marketId}`);
+    invalidateCatalog(marketId);
     res.json({ success: true });
   } catch (e) {
     console.error('❌ تعديل صنف:', e.message);
@@ -486,7 +509,7 @@ router.delete('/:id', needsIdentity, async (req, res) => {
     await db.collection('restaurants').doc(marketId)
       .collection('products').doc(String(req.params.id)).delete();
 
-    invalidate(`mart:${marketId}`);
+    invalidateCatalog(marketId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
@@ -556,7 +579,7 @@ router.post('/migrate', needsIdentity, async (req, res) => {
     });
     if (moved) await batch.commit();
 
-    invalidate(`mart:${marketId}`);
+    invalidateCatalog(marketId);
     console.log(`🔀 نُقل ${moved} صنفاً إلى ${marketId} · تُخطّي ${skipped} · تعذّر ${failed.length}`);
     res.json({ success: true, moved, skipped, failed });
   } catch (e) {
