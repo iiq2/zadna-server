@@ -215,7 +215,25 @@ const registerSchema = Joi.object({
   adminCode: Joi.string().optional().allow(''),
   // النسخ القديمة من التطبيق ترسل نصاً فارغاً لغير المطاعم، وJoi يرفضه
   // افتراضياً فيفشل تسجيل كل زبون ومندوب. نقبله ونعامله كـ null.
-  ownedRestaurantId: Joi.string().optional().allow(null, '')
+  ownedRestaurantId: Joi.string().optional().allow(null, ''),
+
+  /* ============================================================
+     موقع المحلّ يُلتقط وقت التسجيل.
+
+     كان يُترك لبطاقة «حدّد موقع محلّك» في اللوحة بعد الاعتماد — أي
+     خطوةٌ يسهل تخطّيها، ومن تخطّاها اختفى محلّه عن كل زبون بلا أن
+     يفهم لماذا. وقع ذلك فعلاً مع أول سوبرماركت سجّلناه.
+
+     والموقع ليس تفصيلاً تجميلياً: عليه تُحسب أجرة التوصيل بالمسافة،
+     وبه يُختار أقرب ماركت للزبون، وإليه يقود المندوب. محلٌّ بلا
+     إحداثيات لا يعمل — فالأولى أن يُطلب حين يكون الشريك أمام الشاشة
+     لا بعد أسبوع من الاعتماد.
+
+     اختياريان في المخطَّط لا في الواجهة: النسخ القديمة من التطبيق
+     لا ترسلهما، ورفضها يعني منع كل شريك من التسجيل حتى يُحدِّث.
+     ============================================================ */
+  lat: Joi.number().min(29).max(34).optional().allow(null),
+  lng: Joi.number().min(33.5).max(36.5).optional().allow(null)
 });
 
 const loginSchema = Joi.object({
@@ -434,7 +452,7 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    const { name, email, phone, password, userType, adminCode, ownedRestaurantId } = value;
+    const { name, email, phone, password, userType, adminCode, ownedRestaurantId, lat, lng } = value;
 
     // Security Guard: Check Secret Codes for Partners
     const CODES = {
@@ -572,8 +590,16 @@ app.post('/api/auth/register', async (req, res) => {
             status: 'pending',
             isActive: false,
             isOpen: false,
+            /* الإحداثيات من شاشة التسجيل مباشرة.
+             * عليها تُحسب أجرة التوصيل، وبها يُختار أقرب ماركت للزبون،
+             * وإليها يقود المندوب. محلٌّ بلا موقع لا يظهر لأحد — ولا شيء
+             * كان يقول ذلك لصاحبه، فيظنّ المنصّة لا تجلب له شغلاً. */
+            ...(Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : {}),
             createdAt: new Date()
           });
+          if (!(Number.isFinite(lat) && Number.isFinite(lng))) {
+            console.warn(`🗺️ محلّ جديد بلا إحداثيات: ${createdRestId} (${restName}) — لن يظهر لأي زبون`);
+          }
           await db.collection('users').doc(userId).update({ ownedRestaurantId: createdRestId });
           console.log('🏠 مطعم جديد بانتظار الاعتماد:', restName, createdRestId);
         } catch (e) {
