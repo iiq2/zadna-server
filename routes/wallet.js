@@ -29,21 +29,17 @@ async function selfOrAdmin(req, res, next, matches) {
 // المندوب يدفع للمطعم كاش وقت الاستلام (ثمن الوجبة ناقص عمولة زادنا)
 // المندوب يحصّل من الزبون (الوجبة + التوصيل)
 // المندوب يسدّد لزادنا يومياً: عمولة المطعم + عمولة التوصيل
-const RESTAURANT_COMMISSION = parseFloat(process.env.RESTAURANT_COMMISSION || '0.10');
-const DRIVER_COMMISSION     = parseFloat(process.env.DRIVER_COMMISSION || '0.10');
-// 10 لا 5: هذا هو BASE_FEE في نظام التسعير (zones.js). كان الرقمان
-// مختلفين، فطلب بلا أجرة مسجَّلة يُحسب بنصف قيمته في كشف الحساب —
-// فتظهر على المندوب ديون أقل مما عليه، وعلى زادنا إيرادات أقل مما لها.
-const DEFAULT_DELIVERY_FEE  = parseFloat(process.env.DEFAULT_DELIVERY_FEE || '10');
-
-const orderTotal = (o) => {
-  const v = o.totalAmount != null ? o.totalAmount : (o.total != null ? o.total : 0);
-  const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/[^\d.]/g, ''));
-  return isNaN(n) ? 0 : n;
-};
-// 0 || 5 في جافاسكربت = 5 — فطلب بتوصيل مجاني كان يُحسب 5 ₪،
-// فتُفرض على المندوب عمولة على مال لم يقبضه وتُسجَّل له أرباح وهمية.
-const feeOf = (o) => (o.deliveryFee == null || o.deliveryFee === '' ? DEFAULT_DELIVERY_FEE : Number(o.deliveryFee) || 0);
+/* النِّسَب والدوال انتقلت إلى utils/money.js — المصدر الوحيد الذي تقرأ
+ * منه الطلباتُ والتطبيقاتُ الثلاثة واللوحة. كانت مكرَّرة هنا حرفياً،
+ * وأيّ تعديل على أحد النسختين كان يمرّ بلا أن يلاحظه أحد. */
+const money = require('../utils/money');
+const {
+  RESTAURANT_COMMISSION,
+  DRIVER_COMMISSION,
+  DEFAULT_DELIVERY_FEE,
+  itemsTotal: orderTotal,
+  deliveryFeeOf: feeOf,
+} = money;
 const orderDate = (o) => (o.createdAt && o.createdAt._seconds) ? new Date(o.createdAt._seconds * 1000) : null;
 const driverKeyOf = (o) => {
   if (o.driver && typeof o.driver === 'object') return String(o.driver.id || o.driver.phone || o.driver.name || '');
@@ -92,19 +88,23 @@ async function fetchDelivered(db) {
   return list;
 }
 
-// حساب مستحقات زادنا على طلب واحد
+/* مستحقات زادنا على طلب واحد — بأسماء كشف الحساب.
+ *
+ * الأرقام تأتي من `breakdown` في utils/money.js حرفياً، وهذه الدالة
+ * تعيد تسميتها فقط. الطلب الذي حُفظ فيه `money` وقت الإنشاء يُقرأ منه
+ * كما هو: طلبٌ سُلّم بنسبة ١٠٪ يبقى محاسَباً بها حتى لو رُفعت النسبة
+ * اليوم — وإلا اختلفت التسوية عن الرقم الذي رآه المندوب يوم التسليم. */
 function orderBreakdown(o) {
-  const total = orderTotal(o), fee = feeOf(o);
-  const restCommission = total * RESTAURANT_COMMISSION;   // من حصة المطعم
-  const drvCommission  = fee * DRIVER_COMMISSION;         // من أجرة التوصيل
+  const m = o.money || money.breakdown(o);
   return {
-    total, fee,
-    paidToRestaurant: r2(total - restCommission),  // ما يدفعه المندوب للمطعم
-    collectedFromCustomer: r2(total + fee),
-    restCommission: r2(restCommission),
-    drvCommission: r2(drvCommission),
-    owedToZadna: r2(restCommission + drvCommission),
-    driverNet: r2(fee - drvCommission)
+    total: m.itemsTotal,
+    fee: m.deliveryFee,
+    paidToRestaurant: m.payToRestaurant,       // ما يدفعه المندوب للمطعم
+    collectedFromCustomer: m.cashToCollect,    // ما يحصّله من الزبون
+    restCommission: m.restaurantCommission,
+    drvCommission: m.driverCommission,
+    owedToZadna: m.zadnaCommission,
+    driverNet: m.driverNet
   };
 }
 
@@ -242,9 +242,18 @@ router.get('/wallet/summary', adminOnly, async (req, res) => {
 
     const drivers = {}, rests = {};
     let revenue=0, revenueToday=0, volume=0;
+    /* عمولتا المطعم والتوصيل مفصولتين.
+     *
+     * اللوحة كانت تشتقّ عمولة المناديب طرحاً: إيراد المنصّة ناقص مجموع
+     * عمولات المطاعم. والطرح خاطئ فعلاً لا نظرياً — قائمة المطاعم تُبنى
+     * من `restaurantId` وتتخطّى ما لا يحمله، بينما `platformRevenue`
+     * يجمع كل الطلبات. فعمولةُ كل طلب بلا معرّف مطعم (مارت، قديم، يدوي)
+     * كانت تُنسب للمناديب. نُرسل الرقمين صريحين فلا يبقى للطرح موضع. */
+    let restCommTotal=0, drvCommTotal=0;
     all.forEach(o => {
       const b = orderBreakdown(o);
       volume += b.total; revenue += b.owedToZadna;
+      restCommTotal += b.restCommission; drvCommTotal += b.drvCommission;
       const d = orderDate(o); if (d && d >= todayStart) revenueToday += b.owedToZadna;
       const did = driverKeyOf(o);
       if (did) {
@@ -284,6 +293,8 @@ router.get('/wallet/summary', adminOnly, async (req, res) => {
         ordersDelivered: all.length,
         grossVolume: r2(volume),
         platformRevenue: r2(revenue),
+        restaurantCommission: r2(restCommTotal),
+        driverCommission: r2(drvCommTotal),
         revenueToday: r2(revenueToday),
         pendingFromDrivers: r2(driversList.reduce((s,d)=>s+d.balanceDue,0)),
         totalSettled: r2(Object.values(settled).reduce((s,v)=>s+v,0))

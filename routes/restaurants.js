@@ -268,8 +268,20 @@ router.get('/', async (req, res) => {
             return list;
           });
 
-      // دمج المطاعم الأساسية مع المسجلة، وإخفاء غير المعتمدة عن الزبائن
-      const showAll = req.query.all === '1' || req.query.all === 'true';
+      /* ============================================================
+         `?all=1` للإدارة وحدها.
+
+         كان يكفي أن يضيف أيّ زائر `?all=1` على الرابط ليرى المطاعم غير
+         المعتمدة والمجمَّدة ومنيوهاتها وأسعارها — أي كل شريك تفاوضتَ معه
+         ولم يُطلق بعد، وكل شريك أوقفتَه ولمَ أوقفتَه.
+
+         الطلب المعتمد يمرّ بترويسة x-admin-key؛ الزائر يرى المعتمد فقط.
+         ============================================================ */
+      const asksAll = req.query.all === '1' || req.query.all === 'true';
+      const showAll = asksAll && !!req.isAdmin;
+      if (asksAll && !req.isAdmin) {
+        console.warn('⚠️ طلب ?all=1 بلا مفتاح إدارة — عُرضت المطاعم المعتمدة فقط');
+      }
       const visible = showAll
         ? restaurants
         : restaurants.filter(r => (!r.status || r.status === 'approved') && r.isOpen !== false);

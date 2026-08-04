@@ -13,6 +13,9 @@ const { quoteDelivery } = require('./zones');
 const { notifyRestaurant, notifyDrivers, notifyCustomer } = require('./push');
 const { priceMartItems } = require('./mart');
 const meter = require('../utils/meter');
+/* المصدر الوحيد لكل رقم مالي. التطبيقات الثلاثة واللوحة تعرض ما يأتي
+ * من هنا ولا يحسب أيٌّ منها شيئاً — انظر utils/money.js. */
+const { breakdown } = require('../utils/money');
 
 /* رسالة الخطأ للزبون: عربية ومفيدة، والتفصيل يُسجَّل عندنا لا يُرسَل إليه.
    نأخذها من السيرفر ليكون لسان المنصّة واحداً في كل مسار. */
@@ -195,8 +198,14 @@ router.post('/', needsIdentity, async (req, res) => {
         }
       } catch (e) { /* تعذّر التسعير: نُبقي المرسل ولا نُسقط الطلب */ }
 
-      // المجموع الذي يدفعه الزبون يُشتقّ ولا يُستقبل
-      orderData.grandTotal = r2((Number(orderData.totalAmount) || 0) + (Number(orderData.deliveryFee) || 0));
+      /* المجموع وكل تفصيل مالي يُشتقّ هنا ولا يُستقبل، ويُخزَّن داخل
+       * الطلب نفسه. سببان لتخزينه لا حسابه عند القراءة:
+       *   ١ · النِّسَب قد تتغيّر على Render، وطلبٌ سُلّم بنسبة قديمة يجب
+       *       أن يبقى محاسَباً بها — وإلا اختلفت التسوية عن يوم التسليم.
+       *   ٢ · اللوحة والتطبيقات تقرأ الرقم نفسه حرفياً، فلا مجال لخلاف. */
+      const m = breakdown(orderData);
+      orderData.grandTotal = m.grandTotal;
+      orderData.money = m;
 
       // Save to Firestore
       //
@@ -286,13 +295,17 @@ router.post('/', needsIdentity, async (req, res) => {
 
       updateCached('orders:all', list => [{ ...orderData, id: savedId }, ...list].slice(0, ORDERS_LIMIT));
 
-      // نُعيد المبالغ التي أقرّها السيرفر ليعرضها التطبيق بدل أرقامه
+      /* نُعيد المبالغ التي أقرّها السيرفر ليعرضها التطبيق بدل أرقامه،
+       * و`id` هو **المعرّف المحفوظ فعلاً** لا الذي أرسله التطبيق: عند
+       * تصادم يولّد السيرفر بديلاً، وتطبيقٌ يتابع معرّفه القديم يفتح
+       * شاشة تتبّع لطلب غير موجود. */
       res.status(201).json({
         success: true,
         id: savedId,
         totalAmount: orderData.totalAmount,
         deliveryFee: orderData.deliveryFee,
-        grandTotal: orderData.grandTotal
+        grandTotal: orderData.grandTotal,
+        money: orderData.money
       });
     } catch (error) {
           return fail(req, res, error, 'إنشاء طلب');
@@ -457,7 +470,11 @@ router.get('/', needsIdentity, async (req, res) => {
         const orders = filtered.map(o => {
             const out = {
                 ...o,
-                restaurantPhone: o.restaurantPhone || phoneById[String(o.restaurantId)] || ''
+                restaurantPhone: o.restaurantPhone || phoneById[String(o.restaurantId)] || '',
+                /* الطلبات التي أُنشئت قبل وحدة المال لا تحمل الحقل، فنحسبه
+                 * لحظة الإرجاع. الجديدة تحمله مخزَّناً فنُبقيه كما هو —
+                 * لأن طلباً سُلّم بنسبة قديمة يجب أن يبقى محاسَباً بها. */
+                money: o.money || breakdown(o)
             };
             if (hideCustomerPhone) delete out.customerPhone;
             return out;

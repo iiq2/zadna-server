@@ -142,7 +142,35 @@ router.get('/', async (req, res) => {
     const db = getDb(req);
     const marketId = String(req.query.marketId || '').trim();
     if (!db) return res.json([]);
-    if (!marketId) return res.status(400).json({ success: false, error: 'حدّد المحل (marketId)' });
+
+    /* ============================================================
+       الإدارة وحدها ترى الكتالوجات كلها.
+
+       الزبون بلا معرّف محلّ كان يحصل على ٤٠٠ — وهذا صحيح: بعشرة محلات
+       يصير الردّ آلاف الأصناف مختلطة لا يعرف من أيّها.
+
+       لكن لوحة المدير تنادي بلا معرّف عمداً، لأن مهمّتها مراقبة الجميع.
+       فكانت تحصل على ٤٠٠ ويخرج تبويب الهايبرماركت فارغاً — لا لأن
+       الكتالوج فارغ، بل لأن السؤال رُفض. نردّ لها الجميع مع اسم المحلّ
+       لكل صنف كي تعرف لمن هو.
+       ============================================================ */
+    if (!marketId) {
+      if (!req.isAdmin) {
+        return res.status(400).json({ success: false, error: 'حدّد المحل (marketId)' });
+      }
+      const list = await cached('mart:all', CATALOG_TTL, async () => {
+        const snap = await db.collectionGroup('products').limit(2000).get();
+        const out = [];
+        snap.forEach(d => {
+          // مسار المستند: restaurants/{marketId}/products/{productId}
+          const owner = d.ref.parent.parent;
+          out.push({ id: d.id, marketId: owner ? owner.id : '', ...d.data() });
+        });
+        meter.addReads(snap.size, 'كتالوجات المارت — الإدارة');
+        return out;
+      });
+      return res.json(list);
+    }
 
     const list = await cached(`mart:${marketId}`, CATALOG_TTL, async () => {
       const snap = await db.collection('restaurants').doc(marketId).collection('products').get();
