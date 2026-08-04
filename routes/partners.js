@@ -159,12 +159,102 @@ router.post('/registered_partners/approve', adminOnly, async (req, res) => {
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ success: false, error: 'id مطلوب' });
     await db.collection('users').doc(String(id)).update({ status: 'approved' });
+
+    /* ============================================================
+       واعتماد المحلّ نفسه — لا حساب صاحبه وحده.
+
+       هذا العطل كان يعمل بصمت تامّ، وهو أسوأ ما وجدتُه اليوم:
+
+       التسجيل يُنشئ مستندين لا واحداً — حساب المستخدم في `users`،
+       ومستند المحلّ في `restaurants` بـ`status:'pending'` و`isOpen:false`
+       (server.js:590). وكان هذا المسار يعتمد الأول ويترك الثاني.
+
+       فماذا يرى كلٌّ من الأطراف الثلاثة؟
+         · **أنت** في اللوحة: «معتمد ✅ ومفعّل» — لأن الجدول يقرأ `users`
+         · **الشريك**: يدخل تطبيقه ويعمل، ويرى لوحته، ولا يأتيه طلب واحد
+         · **الزبون**: لا يرى المحلّ إطلاقاً — `nearest` يفلتر بـ`status`
+           على مستند المحلّ، و`isOpen !== false` كذلك
+
+       ولا شاشة في المنصّة كلّها تقول إنّ شيئاً ناقص. الرسالة التي تظهر
+       لك بعد الضغط تقول حرفياً «يقدر يفتح التطبيق ويشتغل هلق» — وهي
+       غير صحيحة.
+
+       وهذا ما كان يحدث فعلاً: ماركتان مسجّلان، حسابا صاحبيهما معتمدان
+       في لوحتك منذ يومين، و`nearest` يردّ `approved: 0` — أي أنّ زادنا
+       مارت كان مغلقاً أمام كل زبون في نابلس، وشريكان أدخلا بضاعتهما
+       وينتظران عملاً لن يأتي.
+
+       و`isOpen: true` عمداً: أُنشئ `false` عند التسجيل، ومن يُعتمَد اليوم
+       يريد أن يعمل اليوم. ويبقى المفتاح بيده يُغلق متى شاء من تطبيقه.
+       ============================================================ */
+    try {
+      const uDoc = await db.collection('users').doc(String(id)).get();
+      const shopId = String(((uDoc.data() || {}).ownedRestaurantId) || '');
+      if (shopId) {
+        await db.collection('restaurants').doc(shopId)
+          .update({ status: 'approved', isActive: true, isOpen: true });
+        // الكاشات الثلاثة التي تُخفي المحلّ حتى تنتهي مُددها
+        invalidate('restaurants:raw', 'markets:list', 'mart:all');
+        console.log('🏪 فُتح المحلّ مع صاحبه:', shopId);
+      }
+    } catch (e) {
+      /* لا نُسقط اعتماد الحساب لأن المحلّ تعثّر — لكن لا نبتلع الخبر:
+       * حسابٌ معتمد ومحلٌّ مغلق هو بالضبط الحالة التي أخفت العطل شهراً. */
+      console.error('⚠️ اعتُمد الحساب ولم يُفتح محلّه:', id, e.message);
+    }
+
     // بلا هذين السطرين يبقى الاعتماد حبيس اللوحة: الشريك لا يعلم أنه اعتُمد
     // حتى يُغلق تطبيقه ويفتحه، وكاش الحالة يظل يردّه دقيقةً كاملة.
     const clr = req.app.get('clearStatusCache'); if (clr) clr(String(id));
     const io0 = req.app.get('socketio');
     if (io0) io0.emit('partner_status_changed', { id: String(id), status: 'approved', note: '' });
     res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/* ============================================================
+   POST /api/registered_partners/reconcile_shops
+   إصلاح مَن اعتُمد حسابه قبل هذا التصحيح ومحلّه ما زال مغلقاً.
+
+   الإصلاح أعلاه يمنع تكرار العطل، ولا يُداوي مَن وقع فيه: شريكان
+   اعتُمدا بالمسار القديم يبقيان محجوبين إلى الأبد، وزرّ «موافقة» لا
+   يظهر لهما أصلاً لأن اللوحة تراهما معتمدين — فلا سبيل يدوياً لفتحهما.
+
+   ولا يفتح هذا المسار محلّاً لم تعتمده أنت: يمرّ على أصحاب الحسابات
+   المعتمدة وحدهم. أي أنّه يُنفّذ قرارك أنت الذي لم يُنفَّذ كاملاً.
+   ============================================================ */
+router.post('/registered_partners/reconcile_shops', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+
+    const users = await db.collection('users').where('userType', '==', 'restaurant').get();
+    const fixed = [], already = [], orphan = [];
+
+    for (const u of users.docs) {
+      const d = u.data() || {};
+      if (String(d.status || 'approved') !== 'approved') continue;   // لم تعتمده — لا نتجاوزك
+      const shopId = String(d.ownedRestaurantId || '');
+      if (!shopId) { orphan.push({ user: u.id, name: d.name || '' }); continue; }
+
+      const shop = await db.collection('restaurants').doc(shopId).get();
+      if (!shop.exists) { orphan.push({ user: u.id, shopId, سبب: 'مستند المحلّ مفقود' }); continue; }
+      const s = shop.data() || {};
+
+      if (String(s.status || 'approved') === 'approved' && s.isOpen !== false) {
+        already.push({ shopId, name: s.name || '' });
+        continue;
+      }
+      await db.collection('restaurants').doc(shopId)
+        .update({ status: 'approved', isActive: true, isOpen: true });
+      fixed.push({ shopId, name: s.name || '', نوع: s.partnerType || 'restaurant' });
+    }
+
+    invalidate('restaurants:raw', 'markets:list', 'mart:all', 'partners:all');
+    console.log(`🔧 مصالحة المحلّات: فُتح ${fixed.length}، سليم ${already.length}، يتيم ${orphan.length}`);
+    res.json({ success: true, فُتِح: fixed, كان_سليماً: already, بلا_محلّ: orphan });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
