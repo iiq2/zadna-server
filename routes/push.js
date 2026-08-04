@@ -23,11 +23,27 @@ const needsIdentity = (req, res, next) => {
      zadna_success  → الزبون: نجح الطلب / تم التوصيل (أغنية زادنا)
    ============================================================ */
 
+/* أسماء القنوات هنا **يجب** أن تطابق ما ينشئه التطبيق حرفاً بحرف.
+ *
+ * التطبيق رقّى قنواته إلى `_v2` (لأن صوت القناة يتجمّد عند إنشائها
+ * ولا سبيل لتغييره إلا باسم جديد)، وبقي السيرفر يرسل الأسماء القديمة.
+ *
+ * والنتيجة كانت أخبث عطل في الإشعارات:
+ *   · التطبيق مفتوح  → onMessageReceived يصحّح الاسم → يصل ✓
+ *   · التطبيق مغلق   → **النظام** يعرض بالقناة التي سمّاها السيرفر،
+ *                      وهي غير موجودة → أندرويد يُسقطه **صامتاً**
+ *
+ * فتصل الإشعارات «حين تفتح التطبيق» ولا تصل حين يهمّ الأمر — وهو
+ * بالضبط ما لا يحتمله تطبيق توصيل: المطعم لا يسمع بالطلب الجديد.
+ *
+ * وقناة `partner` كانت غائبة هنا أصلاً: المطعم كان يُرسَل له على قناة
+ * الكابتن، فيصله — إن وصله — بصوت الكابتن. */
 const CHANNELS = {
-  alert:   { id: 'zadna_alert',   sound: 'zadna_alert',   priority: 'high' },
-  update:  { id: 'zadna_update',  sound: 'zadna_update',  priority: 'default' },
-  arrived: { id: 'zadna_arrived', sound: 'zadna_arrived', priority: 'high' },
-  success: { id: 'zadna_success', sound: 'zadna_success', priority: 'high' },
+  alert:   { id: 'zadna_alert_v2',   sound: 'zadna_alert',   priority: 'high' },
+  partner: { id: 'zadna_partner_v2', sound: 'zadna_partner', priority: 'high' },
+  update:  { id: 'zadna_update_v2',  sound: 'zadna_update',  priority: 'default' },
+  arrived: { id: 'zadna_arrived_v2', sound: 'zadna_arrived', priority: 'high' },
+  success: { id: 'zadna_success_v2', sound: 'zadna_intro',   priority: 'high' },
 };
 
 /* ===== حفظ رموز الأجهزة =====
@@ -212,7 +228,8 @@ async function notifyRestaurant(app, restaurantId, { title, body, data }) {
     }
     // تطبيق المطعم وحده — لا تطبيق الزبون على نفس الجوّال
     const tokens = await tokensOf(db, ownerIds, 'merchant');
-    return await push(db, tokens, { title, body, channel: 'alert', data });
+    // قناة المطعم لا قناة الكابتن — لكلٍّ صوته الذي تدرّب أن يهبّ عليه
+    return await push(db, tokens, { title, body, channel: 'partner', data });
   } catch (e) { console.warn('⚠️ إشعار المطعم:', e.message); }
 }
 
@@ -300,8 +317,25 @@ async function notifyCustomer(app, customerPhone, { title, body, channel = 'upda
   const db = app.get('db');
   if (!db || !customerPhone) return;
   try {
-    const snap = await db.collection('users').where('phone', '==', String(customerPhone)).limit(1).get();
-    if (snap.empty) return;
+    /* الرقم يُطبَّع قبل البحث — نفس عائلة عطل «الطلبات المختفية».
+     *
+     * كانت المطابقة نصية حرفية: طلبٌ حُفظ رقمه بصيغة +970 أو بشرطات
+     * لا يُطابق مستند المستخدم (المحفوظ بصيغة 05xxxxxxxx)، فيرجع
+     * البحث فارغاً و**لا يُرسل الإشعار أصلاً** — بلا خطأ ولا سجل.
+     * الزبون لا يعرف أن مندوبه على الباب، ونحن لا نعرف أنه لم يُبلَّغ. */
+    const digits = String(customerPhone).replace(/[\s\-()]/g, '');
+    const norm =
+      /^\+?9(70|72)\d{9}$/.test(digits) ? '0' + digits.replace(/^\+?9(70|72)/, '')
+      : /^009(70|72)\d{9}$/.test(digits) ? '0' + digits.replace(/^009(70|72)/, '')
+      : digits;
+    let snap = await db.collection('users').where('phone', '==', norm).limit(1).get();
+    if (snap.empty && norm !== String(customerPhone)) {
+      snap = await db.collection('users').where('phone', '==', String(customerPhone)).limit(1).get();
+    }
+    if (snap.empty) {
+      console.warn('⚠️ إشعار الزبون: لا حساب بهذا الرقم —', norm);
+      return;
+    }
     // أغنية زادنا تذهب لتطبيق الزبون وحده — لا للوحة تحكم مطعمه
     const tokens = await tokensOf(db, [snap.docs[0].id], 'customer');
     return await push(db, tokens, { title, body, channel, data });
