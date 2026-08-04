@@ -1338,15 +1338,26 @@ app.get('/api/driver_chats', requireIdentity, async (req, res) => {
 
        ومعه حدّ ١٠٠ رسالة، فلا تكبر المحادثة الطويلة بلا سقف.
        ============================================================ */
+    /* العدّ **داخل** الجالب لا بعده.
+     *
+     * كان `addReads` تحت السطر، فيُحصي في كل طلب حتى حين يردّ الكاش بلا
+     * أن تُمسّ Firestore إطلاقاً. ولوحة الإدارة تستطلع كل 15 ثانية، فبعد
+     * نصف ساعة من فتحها يعرض العدّاد «166٪ من الحصة» — إنذارٌ أحمر
+     * لاستهلاك لم يحدث.
+     *
+     * وهذا أخطر من مجرّد رقم خاطئ: عدّادٌ يصرخ بلا سبب يُفقد الثقة، فيُهمَل
+     * حين يصرخ بحقّ. والمقياس الذي لا يُصدَّق أسوأ من غياب المقياس. */
     const CHAT_LIMIT = 100;
-    const snapshot = await cached(`chat:${orderId}`, 300000, () =>
-      db.collection('chats')
+    const snapshot = await cached(`chat:${orderId}`, 300000, async () => {
+      const s = await db.collection('chats')
         .doc(orderId)
         .collection('messages')
         .orderBy('createdAt', 'desc')     // الأحدث أولاً كي يقتطع الحدّ الأقدم
         .limit(CHAT_LIMIT)
-        .get()
-    );
+        .get();
+      meter.addReads(s.size, 'المحادثات');
+      return s;
+    });
 
     // نُرفق معرّف المستند مع كل رسالة.
     //
@@ -1355,7 +1366,6 @@ app.get('/api/driver_chats', requireIdentity, async (req, res) => {
     // وأي اختلاف بسيط في صيغة الوقت يُظهر الرسالة مرّتين.
     const messages = [];
     snapshot.forEach(doc => messages.push({ id: doc.id, ...doc.data() }));
-    meter.addReads(snapshot.size, 'المحادثات');
     // قرأناها من الأحدث للأقدم لنقتطع القديم؛ والتطبيق يعرضها بالترتيب
     // الزمني، فنعيدها إلى نصابها قبل الإرسال.
     messages.reverse();
