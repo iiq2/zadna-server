@@ -507,10 +507,40 @@ router.patch('/:id', needsIdentity, async (req, res) => {
     const UNASSIGNED_STATES = ['READY_FOR_PICKUP', 'PENDING_RESTAURANT', 'ACCEPTED', 'PREPARING'];
 
     if (!req.isAdmin) {
-      const isOwner = curDrvKey && meId && curDrvKey === meId;
+      /* المندوب له هويتان: معرّف حسابه ورقم هاتفه — والقبول قد يسجّل
+       * أيّاً منهما في `driver.id` (نسخ التطبيق القديمة ترسل الرقم).
+       *
+       * كانت المقارنة بالمعرّف وحده، فمن قُبل طلبه برقمه يضغط «تم
+       * التوصيل» فيُرفض 403 «مُسند لمندوب آخر» — **لصاحبه نفسه**.
+       * التطبيق يُرجع البطاقة (revert) فيراها المندوب «تروح وترجع»
+       * ولا يفهم لماذا، والطلب لا يُغلق أبداً.
+       *
+       * نقبل الآن أيّ الهويتين، والرقم مُطبَّعاً — فـ+970 والصيغة
+       * المحلية رقمٌ واحد. */
+      const sp = req.app.get('samePhone') || ((a, b) => String(a) === String(b));
+      const me = await (req.app.get('loadUser')?.(meId));
+      const mePhone = String(me?.phone || '');
+      const isOwner = !!curDrvKey && (
+        curDrvKey === meId ||
+        (mePhone && sp(curDrvKey, mePhone))
+      );
       const isFreeToTake = !curDrvKey || UNASSIGNED_STATES.includes(String(cur.status));
 
-      if (!isOwner && !isFreeToTake) {
+      /* صاحب المطعم يتحكّم بمراحل مطبخه دائماً — حتى بعد إسناد مندوب.
+       *
+       * كان يمرّ بالمصادفة وحدها: مراحل المطبخ ضمن UNASSIGNED_STATES،
+       * فما إن يقبل مندوبٌ سريعٌ الطلب حتى يصير كل زرّ في لوحة المطعم
+       * يردّ 403 «مُسند لمندوب آخر». والطعام في مطبخه لا في يد المندوب.
+       *
+       * لا يوسّع هذا صلاحيته: `ownedRestaurantId` يُقرأ من حسابه هو،
+       * ويطابَق مع `restaurantId` المكتوب في الطلب — لا يمسّ طلب غيره. */
+      const RESTAURANT_STAGES = ['ACCEPTED', 'PREPARING', 'READY_FOR_PICKUP', 'CANCELLED'];
+      const myRest = String(me?.ownedRestaurantId || '');
+      const isMyRestaurantOrder =
+        !!myRest && String(cur.restaurantId || '') === myRest &&
+        (!status || RESTAURANT_STAGES.includes(String(status)));
+
+      if (!isOwner && !isFreeToTake && !isMyRestaurantOrder) {
         console.warn('🔒 محاولة تعديل طلب ليس لصاحبها:', id, '| الطلب لـ:', curDrvKey, '| الطالب:', meId);
         return res.status(403).json({
           success: false,
