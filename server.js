@@ -10,6 +10,7 @@ const bcryptjs = require('bcryptjs');
 const Joi = require('joi');
 // كاش مشترك — يحمي حصة Firestore المجانية (٥٠ ألف قراءة/يوم)
 const { cached, invalidate } = require('./utils/cache');
+const meter = require('./utils/meter');
 
 /* ============================================================
    ردّ الخطأ للمستخدم.
@@ -278,6 +279,7 @@ async function accountBlockedReason(userId) {
   let reason = null;
   try {
     const snap = await db.collection('users').doc(String(userId)).get();
+    meter.addReads(1, 'سجلّ المستخدم');
     if (snap.exists) {
       const u = snap.data() || {};
       if (u.isFrozen === true || u.status === 'frozen') {
@@ -313,6 +315,7 @@ async function loadUser(userId) {
   if (hit && (Date.now() - hit.at) < USER_TTL) return hit.user;
   try {
     const snap = await db.collection('users').doc(String(userId)).get();
+    meter.addReads(1, 'سجلّ المستخدم');
     const user = snap.exists ? { id: snap.id, ...snap.data() } : null;
     _userCache.set(userId, { user, at: Date.now() });
     return user;
@@ -1178,6 +1181,7 @@ app.get('/api/driver_chats', requireIdentity, async (req, res) => {
     // وأي اختلاف بسيط في صيغة الوقت يُظهر الرسالة مرّتين.
     const messages = [];
     snapshot.forEach(doc => messages.push({ id: doc.id, ...doc.data() }));
+    meter.addReads(snapshot.size, 'المحادثات');
     // قرأناها من الأحدث للأقدم لنقتطع القديم؛ والتطبيق يعرضها بالترتيب
     // الزمني، فنعيدها إلى نصابها قبل الإرسال.
     messages.reverse();
@@ -1272,11 +1276,26 @@ if (SELF_URL && process.env.KEEP_AWAKE !== '0') {
  * GET /api/health
  */
 app.get('/api/health', (req, res) => {
+  /* الاستهلاك في نفس شاشة الصحة.
+   *
+   * ضاعت ليلة كاملة ونحن نجهل أنّ استعلاماً واحداً يلتهم الحصة.
+   * لم يكن العطل خفيّاً — كان **غير مرئي**: لا شاشة تقول «أنت تقرأ
+   * ألفاً في الدقيقة»، فلا يُكتشف إلا حين يتوقّف كل شيء دفعة واحدة.
+   *
+   * وأنفع رقم هنا ليس ما استُهلك، بل **إلى أين تسير**: الإسقاط
+   * اليومي بناءً على المعدّل الحالي. من يراه ٢٠٪ ينام مطمئناً،
+   * ومن يراه ٣٠٠٪ يعرف قبل أن يقف. */
+  const jwtOk = !!process.env.JWT_SECRET;
   res.json({
     status: '✅ الخادم يعمل بنجاح!',
     timestamp: new Date(),
     environment: process.env.NODE_ENV,
-    firebaseConnected: !!db
+    firebaseConnected: !!db,
+    // الحقول التي تقرؤها لوحة الإدارة
+    uptimeMinutes: Math.max(1, Math.round(process.uptime() / 60)),
+    jwtConfigured: jwtOk,
+    memoryMB: Math.round(process.memoryUsage().rss / 1048576),
+    firestore: meter.stats(),
   });
 });
 
