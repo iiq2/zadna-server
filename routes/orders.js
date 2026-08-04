@@ -162,6 +162,49 @@ router.post('/', needsIdentity, async (req, res) => {
                   orderData.status = "READY_FOR_PICKUP";
           }
 
+      /* ============================================================
+         المطعم المغلق لا يستقبل طلباً.
+
+         كان صاحب المطعم يُطفئ مفتاح «مفتوح» ويقفل مطبخه ويمشي، ثم
+         تصله طلبات. والسبب أن الإغلاق كان يعمل في مكان واحد: إخفاء
+         المطعم من قائمة الزبون. لكن الزبون الذي فتح صفحة المطعم قبل
+         الإغلاق بدقيقة، أو جاء من إشعار أو من سجلّ طلباته، تبقى
+         الصفحة مفتوحة عنده ويكمل طلبه بلا أن يعلم شيئاً.
+
+         والنتيجة أسوأ من رفضٍ صريح: زبونٌ ينتظر طعاماً لن يُطبخ،
+         ومندوبٌ يذهب إلى محلٍّ مغلق، وشريكٌ يُتَّهم بإهمال طلب لم يره.
+
+         الإخفاء واجهة؛ وهذا هو المنع. والفحص هنا لأن السيرفر هو الوحيد
+         الذي يعرف الحالة لحظةَ الطلب لا لحظةَ فتح الشاشة.
+
+         المارت مستثنى: لا مطعم يوافق عليه أصلاً.
+         ============================================================ */
+      if (!isMart && orderData.restaurantId) {
+        try {
+          const rDoc = await db.collection('restaurants').doc(String(orderData.restaurantId)).get();
+          if (!rDoc.exists) {
+            return res.status(404).json({ success: false, error: 'هذا المطعم لم يعد موجوداً' });
+          }
+          const r = rDoc.data() || {};
+          if (r.isOpen === false) {
+            return res.status(409).json({
+              success: false, restaurantClosed: true,
+              error: `${r.name || 'المطعم'} مغلق الآن ولا يستقبل طلبات. جرّب مطعماً آخر أو عُد لاحقاً.`
+            });
+          }
+          if (r.status && r.status !== 'approved') {
+            return res.status(409).json({
+              success: false, restaurantClosed: true,
+              error: 'هذا المطعم غير متاح حالياً'
+            });
+          }
+        } catch (e) {
+          /* عطلٌ في القراءة لا يُسقط طلباً سليماً — الأصل أن المطعم
+           * مفتوح، وهذه الحالة نادرة ومسجَّلة كي تُرى إن تكرّرت. */
+          console.warn('⚠️ تعذّر فحص حالة المطعم قبل الطلب:', e.message);
+        }
+      }
+
       // ===== التسعير من السيرفر =====
       const priced = await priceItems(db, orderData.restaurantId, orderData.items);
       if (priced && priced.error) {

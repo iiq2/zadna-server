@@ -47,6 +47,11 @@ const CHANNELS = {
   update:  { id: 'zadna_update_v2',  sound: 'zadna_update',  priority: 'default' },
   arrived: { id: 'zadna_arrived_v2', sound: 'zadna_arrived', priority: 'high' },
   success: { id: 'zadna_success_v2', sound: 'zadna_intro',   priority: 'high' },
+  /* الشات: خفيفة عمداً.
+   * الرسالة ليست طلباً — لا تتجاوز «عدم الإزعاج» ولا تهتزّ طويلاً ولا
+   * توقظ الشاشة. من يُرعبه رنينُ رسالةٍ يُطفئ إشعارات زادنا كلها،
+   * فيخسر الطلبات معها. `zadna_update` أقصر نغماتنا وأهدؤها. */
+  chat:    { id: 'zadna_chat_v1',    sound: 'zadna_update',  priority: 'default' },
 };
 
 /* ===== حفظ رموز الأجهزة =====
@@ -122,6 +127,39 @@ router.delete('/fcm_token', needsIdentity, async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     res.json({ success: true });   // فشل الإزالة لا يمنع الخروج
+  }
+});
+
+/* ============================================================
+   POST /api/driver_shift  { onShift: true|false }
+
+   المندوب يقول للسيرفر متى يبدأ دوامه ومتى ينهيه.
+
+   كان هذا القرار في الهاتف وحده، وكان الإسكات يقع **بعد** وصول
+   الإشعار. وذاك خطأ من وجهين: عَلَمُ الهاتف يُطفأ من تلقاء نفسه حين
+   يفشل بدء خدمة الموقع والتطبيق في الخلفية (أندرويد ١٢+)، فيصمت
+   مندوبٌ على دوامه ويخسر رزقه؛ ثم إننا نستهلك حصّة إرسال ونوقظ جهازاً
+   لنقول له «لا شيء لك».
+
+   الآن الحقل على السيرفر، و`notifyDrivers` تقرؤه قبل الإرسال.
+   ============================================================ */
+router.post('/driver_shift', needsIdentity, async (req, res) => {
+  try {
+    const db = getDb(req);
+    const uid = String((req.user && req.user.userId) || '');
+    if (!db || !uid) return res.json({ success: true });
+    const onShift = req.body && req.body.onShift === true;
+    await db.collection('users').doc(uid).update({
+      onShift,
+      shiftChangedAt: new Date()
+    });
+    res.json({ success: true, onShift });
+  } catch (e) {
+    /* فشل التسجيل لا يمنع المندوب من العمل — والغياب يعني «نعم»
+     * في notifyDrivers، فالأسوأ أن يصله طلب وهو منصرف، لا أن يفوته
+     * طلبٌ وهو على الطريق. */
+    console.warn('⚠️ تسجيل الوردية:', e.message);
+    res.json({ success: true, saved: false });
   }
 });
 
@@ -287,7 +325,27 @@ async function notifyDrivers(app, { title, body, data, restaurantLat, restaurant
       const u = d.data();
       const st = String(u.status || 'approved');
       // المجمّد والمرفوض لا يُنبَّهان — لا نُغريه بطلب لا يستطيع أخذه
-      if (st === 'approved') ids.push(d.id);
+      if (st !== 'approved') return;
+
+      /* ============================================================
+         من أنهى ورديته لا يُوقَظ.
+
+         كان الإسكات في التطبيق: يصل الإشعار ثم يقرّر الهاتف أيرنّ أم
+         لا. وكان خطأً من وجهين — الأول أن العَلَم المحلي يُطفأ من تلقاء
+         نفسه حين يفشل بدء خدمة الموقع والتطبيق في الخلفية، فيصمت مندوبٌ
+         على دوامه ويخسر رزقه؛ والثاني أننا نستهلك حصّة إرسال ونوقظ
+         جهازاً لنقول له «لا شيء لك».
+
+         القرار هنا أصحّ: السيرفر يعرف المجمَّد والمشغول والأبعد، ويعرف
+         الآن من أنهى ورديته. فلا يُرسل أصلاً.
+
+         و`undefined` تعني «نعم» عمداً: كل مندوب مسجَّل قبل اليوم لا
+         يحمل الحقل، وافتراض «خارج الدوام» كان سيُسكت الجميع دفعة واحدة.
+         الإسكات لا يقع إلا بـ `false` صريحة كتبها المندوب بيده.
+         ============================================================ */
+      if (u.onShift === false) return;
+
+      ids.push(d.id);
     });
     if (!ids.length) return;
 
@@ -345,7 +403,79 @@ async function notifyCustomer(app, customerPhone, { title, body, channel = 'upda
   } catch (e) { console.warn('⚠️ إشعار الزبون:', e.message); }
 }
 
+/* ============================================================
+   إشعار رسالة الشات — للطرف الآخر وحده.
+
+   لم يكن للشات إشعار إطلاقاً: تُحفظ الرسالة ويُبثّ السوكت، والسوكت
+   لا يعمل إلا والتطبيق مفتوح على الشاشة. فمندوبٌ يسأل «وين بالضبط؟»
+   يقف تحت العمارة ينتظر جواباً لن يصل حتى يفتح الزبون التطبيق صدفة.
+
+   ومن يُرسل إليه: طرفا الطلب — الزبون والمندوب — عدا الكاتب نفسه.
+   ولكلٍّ تطبيقه: الزبون على `customer` والمندوب على `captain`، وإلا
+   وصل إشعار المندوب إلى تطبيق الزبون على نفس الجهاز (حالتك أنت،
+   إذ تحمل التطبيقات الثلاثة).
+
+   والمطعم لا يدخل هنا: شاته أُزيل، والتواصل معه عبر الإدارة.
+   ============================================================ */
+async function notifyChatPeer(app, { orderId, senderId, senderName, senderRole, text }) {
+  const db = app.get('db');
+  if (!db || !orderId || orderId === 'global_zadna_chat') return;
+  try {
+    const oDoc = await db.collection('orders').doc(String(orderId)).get();
+    if (!oDoc.exists) return;
+    const o = oDoc.data() || {};
+
+    const sp = app.get('samePhone') || ((a, b) => String(a) === String(b));
+    const me = String(senderId || '');
+
+    /* نصّ مختصر: الإشعار ليس مكان قراءة الرسالة كاملة، وقد تكون
+     * طويلة أو فيها ما لا يُعرض على شاشة مقفلة أمام الناس. */
+    const preview = String(text || '').slice(0, 80);
+    const title = `💬 ${senderName || 'رسالة جديدة'}`;
+    const data  = { orderId: String(orderId), type: 'chat' };
+
+    // ===== المندوب =====
+    const drv = (o.driver && typeof o.driver === 'object') ? o.driver : null;
+    const drvId = String((drv && drv.id) || o.driverId || '');
+    if (drvId && drvId !== me && senderRole !== 'driver') {
+      const tk = await tokensOf(db, [drvId], 'captain');
+      if (tk.length) await push(db, tk, { title, body: preview, channel: 'chat', data });
+    }
+
+    // ===== الزبون =====
+    if (senderRole !== 'customer') {
+      const cid = String(o.customerId || '');
+      let ids = [];
+      if (cid && cid !== me) {
+        ids = [cid];
+      } else if (!cid && o.customerPhone) {
+        /* الطلبات القديمة بلا `customerId` — نبحث بالرقم مطبَّعاً.
+         * المطابقة الحرفية هنا كانت عائلة عطلٍ كاملة: رقمٌ محفوظ
+         * بصيغة +970 لا يطابق مستنداً محفوظاً بـ05، فلا يُرسل شيء
+         * ولا يُسجَّل خطأ — لا الزبون يعلم ولا نحن. */
+        const digits = String(o.customerPhone).replace(/[\s\-()]/g, '');
+        const norm =
+          /^\+?9(70|72)\d{9}$/.test(digits)  ? '0' + digits.replace(/^\+?9(70|72)/, '')
+          : /^009(70|72)\d{9}$/.test(digits) ? '0' + digits.replace(/^009(70|72)/, '')
+          : digits;
+        let snap = await db.collection('users').where('phone', '==', norm).limit(1).get();
+        if (snap.empty && norm !== String(o.customerPhone)) {
+          snap = await db.collection('users').where('phone', '==', String(o.customerPhone)).limit(1).get();
+        }
+        if (!snap.empty && snap.docs[0].id !== me) ids = [snap.docs[0].id];
+      }
+      if (ids.length) {
+        const tk = await tokensOf(db, ids, 'customer');
+        if (tk.length) await push(db, tk, { title, body: preview, channel: 'chat', data });
+      }
+    }
+  } catch (e) {
+    console.warn('⚠️ إشعار الشات:', e.message);
+  }
+}
+
 module.exports = router;
 module.exports.notifyRestaurant = notifyRestaurant;
 module.exports.notifyDrivers = notifyDrivers;
 module.exports.notifyCustomer = notifyCustomer;
+module.exports.notifyChatPeer = notifyChatPeer;
