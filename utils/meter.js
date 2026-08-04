@@ -39,12 +39,25 @@ function addWrites(n, what = 'other') {
 const FREE_READS = 50000;
 const FREE_WRITES = 20000;
 
+/* كم دقيقة نحتاج قبل أن نصدّق الإسقاط؟
+ *
+ * الإسقاط يضرب معدّل الدقيقة في 1440. وفي أول دقائق التشغيل يكون
+ * المعدّل مشوّهاً: الإقلاع نفسه يقرأ المطاعم والطلبات دفعةً واحدة، فتُنسب
+ * تلك الدفعة إلى دقيقة واحدة وتُضرب في يوم كامل.
+ *
+ * فكان يُعرض «83٪ من الحصة» بعد 86 قراءة فقط — إنذارٌ كاذب يُفزع صاحب
+ * المنصّة كل مرة يُعيد فيها النشر. والإنذار الكاذب أسوأ من غيابه: من
+ * يعتاد تجاهله يتجاهل الإنذار الصادق حين يأتي.
+ *
+ * خمس عشرة دقيقة تكفي لتذوب دفعة الإقلاع في المعدّل. */
+const WARMUP_MIN = 15;
+
 function stats() {
   const upMs = Date.now() - startedAt;
   const upMin = Math.max(1, Math.round(upMs / 60000));
   const perMin = reads / upMin;
-  // الإسقاط اليومي: أنفع رقم في الشاشة كلّها — يقول إلى أين تسير
   const projectedDaily = Math.round(perMin * 60 * 24);
+  const warming = upMin < WARMUP_MIN;
 
   const top = Object.entries(byWhat)
     .sort((a, b) => b[1] - a[1]).slice(0, 5)
@@ -55,12 +68,19 @@ function stats() {
     قراءات: reads,
     كتابات: writes,
     قراءات_بالدقيقة: Math.round(perMin * 10) / 10,
-    الإسقاط_اليومي: projectedDaily,
-    نسبة_الحصة: Math.round((projectedDaily / FREE_READS) * 100),
+
+    /* أثناء الإحماء نُرجع null لا رقماً.
+     * الصفر يُقرأ «ممتاز» والرقم المنفوخ يُقرأ «خطر» — وكلاهما كذب.
+     * وnull يُجبر الواجهة على قول «يُقاس…» بدل أن تخترع لوناً. */
+    الإسقاط_اليومي: warming ? null : projectedDaily,
+    نسبة_الحصة: warming ? null : Math.round((projectedDaily / FREE_READS) * 100),
+    قيد_القياس: warming,
+    يكتمل_القياس_بعد_دقيقة: warming ? WARMUP_MIN - upMin : 0,
+
     الحصة_اليومية: FREE_READS,
     الأعلى_استهلاكاً: top,
     // تقدير التكلفة لو استمرّ هذا المعدّل شهراً كاملاً
-    تقدير_الشهر_بالدولار:
+    تقدير_الشهر_بالدولار: warming ? null :
       Math.round(Math.max(0, projectedDaily - FREE_READS) * 30 / 100000 * 0.06 * 100) / 100,
   };
 }
