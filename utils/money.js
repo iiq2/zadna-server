@@ -54,22 +54,54 @@ function breakdown(o) {
   const items = r2(itemsTotal(o));
   const fee   = r2(deliveryFeeOf(o));
 
-  const restaurantCommission = r2(items * RESTAURANT_COMMISSION);
-  const driverCommission     = r2(fee   * DRIVER_COMMISSION);
+  /* ============================================================
+     الخصم — ومن يتحمّله.
+
+     أُضيف اليوم فارغاً (صفراً) استعداداً للكوبونات. وسببُ إضافته
+     مبكّراً أن تأجيله يخلق سؤالاً لا جواب له بعد ألف طلب: العمولة
+     على السعر قبل الخصم أم بعده؟ ومن دفع الخصم — أنت أم المطعم؟
+
+     `discountBy` يحسم الاثنين:
+       · `zadna`      → أنت تموّل الخصم. المطعم يقبض ثمنه كاملاً،
+                        وعمولتك تُحسب على السعر الكامل ثم تنقص منها
+                        قيمة الخصم. أي أن الخصم يخرج من جيبك أنت.
+       · `restaurant` → المطعم يموّل الخصم (عرضٌ من عنده). عمولتك
+                        على المبلغ بعد الخصم، لأنه ما قبضه فعلاً.
+
+     والزبون يدفع الأقلّ في الحالتين — الفرق في من يتحمّل.
+     ============================================================ */
+  /* الافتراضي `restaurant` بقرارٍ منك: العروض من المطاعم لا من زادنا.
+   * وهو الأسلم أيضاً — خصمٌ من عندك على طلبٍ عمولتك منه ٦٫٧ شواكل
+   * يعني أنك تدفع من جيبك، وهذا يمرّ بلا أن يراه أحد. */
+  const discount   = Math.max(0, Math.min(items, r2(Number(o && o.discount) || 0)));
+  const discountBy = String((o && o.discountBy) || 'restaurant');
+  const restBase   = discountBy === 'restaurant' ? r2(items - discount) : items;
+
+  const restaurantCommission = r2(restBase * RESTAURANT_COMMISSION);
+  const driverCommission     = r2(fee * DRIVER_COMMISSION);
+  // خصمُ زادنا ينقص من عمولتها لا من حصّة أحد آخر — وقد يبلغ صفراً
+  const zadnaGross = r2(restaurantCommission + driverCommission);
+  const zadnaNet   = discountBy === 'zadna' ? r2(Math.max(0, zadnaGross - discount)) : zadnaGross;
+
+  const customerPays  = r2(items - discount + fee);
+  const payToRestaurant = r2(restBase - restaurantCommission);
+  const driverNet       = r2(fee - driverCommission);
 
   return {
-    itemsTotal:   items,                                  // ثمن الوجبات
+    itemsTotal:   items,                                  // ثمن الوجبات قبل الخصم
+    discount,                                             // قيمة الخصم (صفر اليوم)
+    discountBy,                                           // من يتحمّله
     deliveryFee:  fee,                                    // أجرة التوصيل
-    grandTotal:   r2(items + fee),                        // ما يدفعه الزبون
-    cashToCollect: r2(items + fee),                       // ما يحصّله المندوب
+    grandTotal:   customerPays,                           // ما يدفعه الزبون
+    cashToCollect: customerPays,                          // ما يحصّله المندوب — انظر أدناه
 
     restaurantCommission,                                 // عمولة زادنا من المطعم
     driverCommission,                                     // عمولة زادنا من التوصيل
-    zadnaCommission: r2(restaurantCommission + driverCommission),
+    zadnaCommission: zadnaNet,                            // ما يبقى لزادنا بعد تمويل خصمها
 
-    payToRestaurant: r2(items - restaurantCommission),    // ما يدفعه المندوب للمطعم
-    restaurantNet:   r2(items - restaurantCommission),    // ما يقبضه المطعم (الاسم نفسه من زاويته)
-    driverNet:       r2(fee - driverCommission),          // ما يبقى للمندوب
+    payToRestaurant,                                      // ما يدفعه المندوب للمطعم
+    restaurantNet:   payToRestaurant,                     // ما يقبضه المطعم (الاسم نفسه من زاويته)
+    driverNet,                                            // ما يبقى للمندوب
 
     // النِّسَب مرفقة كي تعرض الواجهة «١٠٪» من هنا لا من نصّ محفور
     restaurantRate: RESTAURANT_COMMISSION,
@@ -77,10 +109,43 @@ function breakdown(o) {
   };
 }
 
+/* ============================================================
+   الدفع الإلكتروني يقلب اتجاه المال — والحقول تنتظره من اليوم.
+
+   بالكاش: المندوب يحصّل من الزبون، ويدفع للمطعم، ويسدّد لك عمولتك.
+   المال لا يمرّ بك إطلاقاً.
+
+   بالبطاقة أو المحفظة: **المال يصل إليك أنت**. فتصير مديناً للمطعم
+   بحصّته وللمندوب بأجرته، وعليك أن تدفع لهما. عكسٌ كامل.
+
+   وأخطر ما فيه عملياً: مندوبٌ لا يعرف أن الطلب مدفوع سيحصّل من زبونٍ
+   دفع أصلاً. لذلك `cashToCollect` تصير صفراً هنا، و`owedToDriver`
+   تظهر صراحةً — فتعرف كم تدين له في نهاية اليوم.
+
+   ولا شيء من هذا مفعَّل الآن: كل الطلبات `cash`. الحقول موجودة كي
+   لا نُهاجر بيانات ألف طلب يوم نربط البوابة.
+   ============================================================ */
+function applyPayment(b, order) {
+  const paidOnline = !!(order && (order.paidOnline === true || order.paymentStatus === 'paid'));
+  if (!paidOnline) {
+    return Object.assign({}, b, {
+      paidOnline: false,
+      owedToRestaurant: 0,   // المندوب يدفع نقداً — لا دين عليك
+      owedToDriver: 0,
+    });
+  }
+  return Object.assign({}, b, {
+    paidOnline: true,
+    cashToCollect: 0,                    // لا يُحصّل المندوب شيئاً
+    owedToRestaurant: b.payToRestaurant, // تدفعها أنت للمطعم
+    owedToDriver: b.driverNet,           // تدفعها أنت للمندوب
+  });
+}
+
 /** يُلصق التفصيل بالطلب قبل إرساله للتطبيقات. لا يعدّل الأصل. */
 function withMoney(o) {
   if (!o || typeof o !== 'object') return o;
-  return Object.assign({}, o, { money: breakdown(o) });
+  return Object.assign({}, o, { money: applyPayment(breakdown(o), o) });
 }
 
 module.exports = {
@@ -91,5 +156,6 @@ module.exports = {
   itemsTotal,
   deliveryFeeOf,
   breakdown,
+  applyPayment,
   withMoney,
 };
