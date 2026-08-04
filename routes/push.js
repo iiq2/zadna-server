@@ -203,7 +203,11 @@ async function tokensOf(db, userIds, wantApp) {
  * محاولة إرسال فاشلة في كل مرة إلى آخر الدهر، وبطء متراكم.
  */
 async function push(db, tokens, { title, body, channel = 'update', data = {} }) {
-  if (!tokens || !tokens.length) return { sent: 0, failed: 0 };
+  if (!tokens || !tokens.length) {
+    // صمتٌ مُعلَّل خيرٌ من صمتٍ غامض: لا جهاز مسجّلاً لهذا المستقبِل أصلاً
+    console.log(`📭 ${channel} → لا أجهزة مسجّلة · «${title}»`);
+    return { sent: 0, failed: 0 };
+  }
   const ch = CHANNELS[channel] || CHANNELS.update;
 
   /* ============================================================
@@ -258,14 +262,27 @@ async function push(db, tokens, { title, body, channel = 'update', data = {} }) 
   try {
     const r = await admin.messaging().sendEachForMulticast({ tokens, ...message });
     const dead = [];
+    const codes = new Set();
     r.responses.forEach((resp, i) => {
       if (!resp.success) {
         const code = resp.error && resp.error.code;
+        if (code) codes.add(code);
         if (code === 'messaging/registration-token-not-registered'
          || code === 'messaging/invalid-registration-token') dead.push(tokens[i]);
       }
     });
     if (dead.length) cleanupDeadTokens(db, dead).catch(() => {});
+
+    /* سطر الحقيقة — «ما وصل الإشعار» كانت بلا جواب.
+     *
+     * كل نداءات الإرسال تُبتلع بـ catch(()=>{}) عند مستدعيها، والعدّان
+     * sent/failed يعودان ولا يقرؤهما أحد. فحين قال صاحب المنصّة «ما
+     * وصل الديليفري» لم يكن في السجلّ كله سطرٌ يقول أأُرسل شيء أصلاً،
+     * أم أُرسل وفشل، أم فشل لأي سبب. سطرٌ واحد لكل إرسال يجيب الثلاثة:
+     *   📨 alert → أُرسل 1 · فشل 1 (messaging/registration-token-not-registered)
+     * ومعناه فوراً: جهاز المندوب سجّل رمزاً ثم حُذف التطبيق أو مُسح. */
+    const codesTxt = codes.size ? ` (${[...codes].join(', ')})` : '';
+    console.log(`📨 ${channel} → أُرسل ${r.successCount} · فشل ${r.failureCount}${codesTxt} · «${title}»`);
     return { sent: r.successCount, failed: r.failureCount };
   } catch (e) {
     console.warn('⚠️ تعذّر إرسال إشعار:', e.message);

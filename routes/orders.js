@@ -319,13 +319,21 @@ router.post('/', needsIdentity, async (req, res) => {
       // احتمال أن طلباً دهس طلباً 39% — زبون دفع ومندوب سلّم ولا أثر.
       // create يرفض التكرار، فنولّد بديلاً بدل أن نمحو طلباً حقيقياً.
       let finalId = orderId;
+      /* createdAt يُكتب على orderData نفسه لا داخل نداء الحفظ وحده.
+       *
+       * كان `createdAt: new Date()` يُضاف في سطر الحفظ فيصل مستندَ
+       * Firestore ولا يصل نسخةَ الكاش (تُدفع orderData كما هي). فطلبٌ
+       * جديد يعيش في الكاش **بلا تاريخ**، وقارئ التاريخ القديم كان
+       * يحوّل الفراغ إلى سنة ٢٠٠٠ — فرأت المكنسة طلباً عمره ٢٦ سنة
+       * وألغته بعد خمس ثوانٍ من إنشائه. هذا ما أخفى طلب المارت 642443. */
+      orderData.createdAt = new Date();
       try {
-        await db.collection('orders').doc(finalId).create({ ...orderData, id: finalId, createdAt: new Date() });
+        await db.collection('orders').doc(finalId).create({ ...orderData, id: finalId });
       } catch (e) {
         if (e && (e.code === 6 || /ALREADY_EXISTS/i.test(String(e.message)))) {
           finalId = `${orderId}-${Math.random().toString(36).slice(2, 7)}`;
           console.warn(`⚠️ تصادم معرّف طلب — أُنقذ الطلب القديم ووُلّد بديل: ${finalId}`);
-          await db.collection('orders').doc(finalId).create({ ...orderData, id: finalId, createdAt: new Date() });
+          await db.collection('orders').doc(finalId).create({ ...orderData, id: finalId });
         } else throw e;
       }
       const savedId = finalId;
@@ -811,9 +819,7 @@ router.post('/:id/cancel', needsIdentity, async (req, res) => {
       return res.status(400).json({ success: false, error: 'الطلب سُلّم — لا يمكن إلغاؤه' });
     }
 
-    const createdMs = o.createdAt && o.createdAt.toDate
-      ? o.createdAt.toDate().getTime()
-      : Date.parse(o.createdAt || 0) || 0;
+    const createdMs = orderCreatedMs(o);
     const inGrace = createdMs && (Date.now() - createdMs) < GRACE_MS;
 
     /* «قبل أن يلتزم أحد» — لكلٍّ من النوعين معناه.
@@ -892,6 +898,32 @@ const EXPIRE_MS = Number(process.env.REST_EXPIRE_MIN || 20) * 60000;
 const _staleSeen = new Map();   // معرّف الطلب → آخر مرحلة أُبلغ عنها
 
 /* ============================================================
+   قراءة تاريخ الإنشاء — درسُ الطلب 642443.
+
+   كانت القراءة: `Date.parse(o.createdAt || 0)`. وحين يكون التاريخ
+   غائباً يصير النداء `Date.parse(0)` — والصفر يُقرأ **سنة ٢٠٠٠**،
+   لا «لا تاريخ». فطلبُ مارت حقيقي، أول طلب بعد إصلاح الـ400، بدا
+   للمكنسة عمرُه ٢٦ سنة فألغته بعد خمس ثوانٍ من ولادته.
+
+   القاعدة: تاريخٌ لا نفهمه = صفر = «لا تحكم عليه»، لا تخمينٌ قديم
+   يستوجب الإعدام. والدالة تقرأ كل الصيغ التي تمرّ فعلاً في النظام:
+   Timestamp من Firestore، و{_seconds} من التسلسل، وDate من الكاش،
+   ونصّ ISO، ورقم ميلي ثانية.
+   ============================================================ */
+function orderCreatedMs(o) {
+  const c = o && o.createdAt;
+  if (!c) return 0;
+  try {
+    if (typeof c.toDate === 'function') return c.toDate().getTime();     // Firestore Timestamp
+    if (typeof c._seconds === 'number') return c._seconds * 1000;        // صيغة متسلسلة
+    if (c instanceof Date) return c.getTime();                           // من الكاش
+    if (typeof c === 'number') return c > 1e12 ? c : c * 1000;           // ميلي أو ثوانٍ
+    if (typeof c === 'string') { const t = Date.parse(c); return Number.isFinite(t) ? t : 0; }
+  } catch (e) {}
+  return 0;
+}
+
+/* ============================================================
    الوجه الثاني للمهلة: طلبٌ جاهز لا يلتقطه مندوب.
 
    المهلة الأولى عالجت «مطعماً لا يردّ». وبقي توأمها مكشوفاً: طلبٌ
@@ -903,63 +935,58 @@ const _staleSeen = new Map();   // معرّف الطلب → آخر مرحلة �
      · ٥ دقائق:  يُعاد نداء المناديب. الرنّة الأولى تفوت من كان
                  على الدراجة — الثانية بابُها.
      · ١٢ دقيقة: يُصارَح الزبون («نبحث لك عن مندوب») وتُصرخ اللوحة.
-     · ٣٥ دقيقة: طلب **المارت وحده** يُلغى بصدق — بضاعته على الرفّ
-                 لم يخسر أحدٌ شيئاً. أمّا طلب المطعم فطعامه مطبوخ
-                 وإلغاؤه آلياً يعني خسارة الشريك مالاً بقرار روبوت —
-                 يبقى مفتوحاً وتصرخ اللوحة، والقرار لصاحب المنصّة.
-   ============================================================ */
-const READY_NUDGE_MS  = Number(process.env.READY_NUDGE_MIN  || 5)  * 60000;
-const READY_ALERT_MS  = Number(process.env.READY_ALERT_MIN  || 12) * 60000;
-const MART_EXPIRE_MS  = Number(process.env.MART_EXPIRE_MIN  || 35) * 60000;
+     · ثم نداء مناديب متجدّد كل ١٠ دقائق — بلا توقف.
 
-const _readySeen = new Map();   // معرّف الطلب → آخر مرحلة أُبلغ عنها
+   **لا إلغاء تلقائياً — قرار صاحب المنصّة، حرفياً:**
+   «بدل ما يختفي أعطِ الديليفري والمطعم خيار الرفض». كان هنا إلغاءٌ
+   آلي بعد ٣٥ دقيقة، وأول ما فعله في الدنيا أنه أعدم طلبَ اختبارٍ
+   حقيقياً بعد خمس ثوانٍ (عطل تاريخ الكاش أعلاه). والعبرة أعمق من
+   العطل: روبوتٌ يلغي طلباً قرارٌ تجاري، وصاحب القرار قال لا.
+   الطلب يبقى معروضاً حتى يلتقطه مندوب، أو يرفضه المحلّ صراحةً
+   (مسار reject أدناه)، أو يلغيه الزبون أو الإدارة.
+   ============================================================ */
+const READY_NUDGE_MS   = Number(process.env.READY_NUDGE_MIN   || 5)  * 60000;
+const READY_ALERT_MS   = Number(process.env.READY_ALERT_MIN   || 12) * 60000;
+const READY_RENUDGE_MS = Number(process.env.READY_RENUDGE_MIN || 10) * 60000;
+
+const _readySeen = new Map();   // معرّف الطلب → { stage, lastNudge }
 
 async function sweepReadyUnclaimed(app, db, o) {
   const id = String(o.id);
-  const created = o.createdAt && o.createdAt.toDate
-    ? o.createdAt.toDate().getTime()
-    : Date.parse(o.createdAt || 0) || 0;
-  if (!created) return;
+  const created = orderCreatedMs(o);
+  if (!created) return;                    // تاريخ لا نفهمه = لا حكم عليه
   const age = Date.now() - created;
-  const stage = _readySeen.get(id) || 0;
-  const isMart = o.isMarketOrder === true;
+  const st = _readySeen.get(id) || { stage: 0, lastNudge: 0 };
 
-  if (isMart && age >= MART_EXPIRE_MS && stage < 3) {
-    _readySeen.set(id, 3);
-    await db.collection('orders').doc(id).update({
-      status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
-      cancelledBy: 'system', cancelReason: 'لا مندوب متاح', cancelledAt: new Date(),
-    });
-    updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED' } : x)));
-    const io = app.get('socketio');
-    if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
-    notifyCustomer(app, o.customerPhone, {
-      title: 'اعتذارنا — أُلغي طلبك',
-      body: 'لا مندوب متاحاً الآن. لم يُخصم منك شيء — جرّب بعد قليل',
-      channel: 'update', data: { orderId: id, type: 'status', status: 'CANCELLED' },
-    }).catch(() => {});
-    console.warn(`⏰ أُلغي طلب المارت ${id} — لا مندوب التقطه خلال ${MART_EXPIRE_MS / 60000} دقيقة`);
+  const nudgeDrivers = () => notifyDrivers(app, {
+    title: 'طلب ما زال بانتظار مندوب 📦',
+    body: `${o.restaurant || 'محلّ'} — ${o.grandTotal || o.totalAmount || 0} ₪`,
+    data: { orderId: id, type: 'new_ready_order' },
+  }).catch(() => {});
 
-  } else if (age >= READY_ALERT_MS && stage < 2) {
-    _readySeen.set(id, 2);
+  if (age >= READY_ALERT_MS && st.stage < 2) {
+    _readySeen.set(id, { stage: 2, lastNudge: Date.now() });
     notifyCustomer(app, o.customerPhone, {
       title: 'طلبك جاهز — نبحث لك عن مندوب',
       body: 'كل المناديب مشغولون الآن. سنُبلغك فور انطلاق أحدهم إليك',
       channel: 'update', data: { orderId: id, type: 'status', status: 'READY_FOR_PICKUP' },
     }).catch(() => {});
+    nudgeDrivers();
     const io = app.get('socketio');
     if (io) io.to('manager_monitor').emit('order_stuck', {
       orderId: id, restaurant: o.restaurant || '', minutes: Math.round(age / 60000),
     });
     console.warn(`🆘 الطلب ${id} جاهز بلا مندوب منذ ${Math.round(age / 60000)} دقيقة · ${o.restaurant || o.restaurantId}`);
 
-  } else if (age >= READY_NUDGE_MS && stage < 1) {
-    _readySeen.set(id, 1);
-    notifyDrivers(app, {
-      title: 'طلب ما زال بانتظار مندوب 📦',
-      body: `${o.restaurant || 'محلّ'} — ${o.grandTotal || o.totalAmount || 0} ₪`,
-      data: { orderId: id, type: 'new_ready_order' },
-    }).catch(() => {});
+  } else if (st.stage >= 2 && Date.now() - st.lastNudge >= READY_RENUDGE_MS) {
+    // ما دام معلّقاً تتجدّد الرنّة — الطلب لا يُنسى ولا يُعدم
+    _readySeen.set(id, { stage: st.stage, lastNudge: Date.now() });
+    nudgeDrivers();
+    console.warn(`🔁 نداء مناديب متجدّد للطلب ${id} — معلّق منذ ${Math.round(age / 60000)} دقيقة`);
+
+  } else if (age >= READY_NUDGE_MS && st.stage < 1) {
+    _readySeen.set(id, { stage: 1, lastNudge: Date.now() });
+    nudgeDrivers();
   }
 }
 
@@ -983,9 +1010,7 @@ function startRestaurantTimeout(app) {
           continue;
         }
         if (st !== 'PENDING_RESTAURANT') { _staleSeen.delete(String(o.id)); _readySeen.delete(String(o.id)); continue; }
-        const created = o.createdAt && o.createdAt.toDate
-          ? o.createdAt.toDate().getTime()
-          : Date.parse(o.createdAt || 0) || 0;
+        const created = orderCreatedMs(o);
         if (!created) continue;
         const age = now - created;
         const id = String(o.id);
@@ -1035,6 +1060,77 @@ function startRestaurantTimeout(app) {
   if (t.unref) t.unref();
   console.log(`⏰ مهلة ردّ المطعم مفعّلة — تذكير ${NUDGE_MS / 60000}د · إبلاغ ${ALERT_MS / 60000}د · إلغاء ${EXPIRE_MS / 60000}د`);
 }
+
+/* ============================================================
+   POST /api/orders/:id/reject_by_shop — المحلّ يرفض طلبه صراحةً.
+
+   نصف قرار صاحب المنصّة حين ألغى الإلغاء الآلي: «أعطِ الديليفري
+   والمطعم خيار الرفض». الروبوت لا يُعدم طلباً؛ **صاحب البضاعة** هو
+   من يقول «ما عندي» — بسبب معدود لا نصّ حرّ، فيصير تقرير «لماذا
+   نخسر طلبات» ممكناً من أول أسبوع (وهي العادة التي أخذناها من
+   CoopCycle: أسبابهم SOLD_OUT/RUSH_HOUR محفورة في الكيان نفسه).
+
+   الحارس: صاحب هذا المحلّ تحديداً أو الإدارة. والرفض ممنوع بعد أن
+   يستلم المندوب البضاعة — عندها البضاعة في الشارع والقرار لم يعد
+   قرار الرفّ.
+
+   (زرّ التطبيق يأتي في دفعة البناء القادمة — المسار جاهز قبله عمداً:
+   حين يُبنى الزرّ يجد باباً مفتوحاً لا جداراً.)
+   ============================================================ */
+const SHOP_REJECT_REASONS = {
+  SOLD_OUT: 'الصنف غير متوفر حالياً',
+  CLOSING:  'المحلّ على وشك الإغلاق',
+  BUSY:     'ضغط شديد — لا نستطيع التجهيز الآن',
+  OTHER:    'ظرف خارج عن الإرادة',
+};
+
+router.post('/:id/reject_by_shop', needsIdentity, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+    const id = String(req.params.id);
+    const ref = db.collection('orders').doc(id);
+    const snap = await ref.get();
+    meter.addReads(1, 'رفض المحلّ');
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+    const o = snap.data() || {};
+
+    // الحارس: صاحب المحلّ نفسه أو الإدارة
+    if (!req.isAdmin) {
+      const me = await (req.app.get('loadUser')?.(String(req.user?.userId || '')));
+      if (!me || String(me.ownedRestaurantId || '') !== String(o.restaurantId || '')) {
+        return res.status(403).json({ success: false, error: 'هذا ليس طلب محلّك' });
+      }
+    }
+
+    const st = String(o.status || '');
+    if (st === 'CANCELLED') return res.json({ success: true, already: true });
+    if (['PICKED_UP', 'ON_THE_WAY', 'DELIVERED'].includes(st)) {
+      return res.status(409).json({ success: false, error: 'المندوب استلم البضاعة — لم يعد الرفض ممكناً. راسل الإدارة.' });
+    }
+
+    const code = String((req.body && req.body.reason) || 'OTHER').toUpperCase();
+    const reasonAr = SHOP_REJECT_REASONS[code] || SHOP_REJECT_REASONS.OTHER;
+
+    await ref.update({
+      status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
+      cancelledBy: 'shop', cancelReason: code, cancelReasonAr: reasonAr, cancelledAt: new Date(),
+    });
+    updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED' } : x)));
+    const io = req.app.get('socketio');
+    if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
+
+    // الصدق مع الزبون: السبب الحقيقي بلسان مهذّب، لا «أُلغي» غامضة
+    notifyCustomer(req.app, o.customerPhone, {
+      title: 'اعتذارنا — المحلّ لم يستطع تلبية طلبك',
+      body: `${reasonAr}. لم يُخصم منك شيء — جرّب محلاً آخر أو أعد المحاولة لاحقاً`,
+      channel: 'update', data: { orderId: id, type: 'status', status: 'CANCELLED' },
+    }).catch(() => {});
+
+    console.log(`🚫 رفض المحلّ ${o.restaurantId} الطلب ${id} — السبب: ${code}`);
+    res.json({ success: true, reason: code });
+  } catch (e) { fail(req, res, e, 'رفض المحلّ'); }
+});
 
 module.exports = router;
 // مُصدَّرة للاختبار: مسار المال يستحق اختباراً مباشراً لا فحصاً بالنظر
