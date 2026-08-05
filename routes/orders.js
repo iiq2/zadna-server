@@ -968,8 +968,15 @@ router.post('/:id/cancel', needsIdentity, async (req, res) => {
       cancelReason: reason,
       cancelledAt: new Date(),
     });
+    /* statusAr مع status — لا أحدهما.
+     *
+     * التطبيق يقرأ `statusAr` **قبل** `status` (سطر ١١١ في
+     * OrdersViewModel). فكتابةُ الإنجليزي وحده في الكاش تترك العربيَّ
+     * على حاله القديم، والتطبيق يصدّق القديم: طلبٌ أُلغي يبقى ظاهراً
+     * حيّاً حتى ينتهي عمر الكاش. الحقيقة في مكانين، فلتُكتب في كليهما. */
     updateCached('orders:all', list =>
-      list.map(x => (String(x.id) === String(id) ? { ...x, status: 'CANCELLED' } : x)));
+      list.map(x => (String(x.id) === String(id)
+        ? { ...x, status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED } : x)));
 
     const io = req.app.get('socketio');
     if (io) io.emit('order_updated', { orderId: String(id), status: 'CANCELLED', timestamp: new Date() });
@@ -1114,7 +1121,7 @@ async function sweepReadyUnclaimed(app, db, o) {
         cancelledBy: 'system', cancelReason: 'مهجور — لم يلتقطه مندوب خلال ١٢ ساعة',
         cancelledAt: new Date(),
       });
-      updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED' } : x)));
+      updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED } : x)));
       const io = app.get('socketio');
       if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
       notifyCustomer(app, o.customerPhone, {
@@ -1200,7 +1207,7 @@ function startRestaurantTimeout(app) {
             status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
             cancelledBy: 'system', cancelReason: 'لم يردّ المطعم', cancelledAt: new Date(),
           });
-          updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED' } : x)));
+          updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED } : x)));
           const io = app.get('socketio');
           if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
           notifyCustomer(app, o.customerPhone, {
@@ -1294,7 +1301,7 @@ router.post('/:id/reject_by_shop', needsIdentity, async (req, res) => {
       status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
       cancelledBy: 'shop', cancelReason: code, cancelReasonAr: reasonAr, cancelledAt: new Date(),
     });
-    updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED' } : x)));
+    updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED } : x)));
     const io = req.app.get('socketio');
     if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
 
@@ -1422,7 +1429,7 @@ router.post('/:id/assign', async (req, res) => {
         unassignedAt: new Date(), unassignedBy: 'admin',
       });
       updateCached('orders:all', l => l.map(x => (String(x.id) === id
-        ? { ...x, driver: null, driverId: null, status: 'READY_FOR_PICKUP' } : x)));
+        ? { ...x, driver: null, driverId: null, status: 'READY_FOR_PICKUP', statusAr: STATUS_AR.READY_FOR_PICKUP } : x)));
       const io = req.app.get('socketio');
       if (io) io.emit('order_updated', { orderId: id, status: 'READY_FOR_PICKUP', timestamp: new Date() });
 
@@ -1464,7 +1471,7 @@ router.post('/:id/assign', async (req, res) => {
       assignedBy: 'admin', assignedAt: new Date(),
     });
     updateCached('orders:all', l => l.map(x => (String(x.id) === id
-      ? { ...x, driver, driverId, status: 'DRIVER_ASSIGNED' } : x)));
+      ? { ...x, driver, driverId, status: 'DRIVER_ASSIGNED', statusAr: STATUS_AR.DRIVER_ASSIGNED } : x)));
     const io2 = req.app.get('socketio');
     if (io2) io2.emit('order_updated', { orderId: id, status: 'DRIVER_ASSIGNED', timestamp: new Date() });
 
