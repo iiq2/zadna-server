@@ -577,7 +577,28 @@ router.get('/', needsIdentity, async (req, res) => {
                 asManager = true;
                 restaurantId = q.restaurantId; driverId = q.driverId; customerPhone = q.customerPhone;
             } else {
-                if (q.driverId && (String(q.driverId) === myId || (myPhone && String(q.driverId) === myPhone))) {
+                /* ===== نطاق المندوب لمن هو مندوب — لا لمن يدّعيه =====
+                 *
+                 * كان الشرط: «هل `driverId` هو معرّفك؟» ولا شيء غيره.
+                 * وهذا يعني أن **أي حساب مسجَّل** — زبونٌ عاديّ نزّل
+                 * التطبيق قبل دقيقة — ينادي:
+                 *
+                 *     GET /api/orders?driverId=<معرّفه هو>
+                 *
+                 * فيُمنح نطاق المندوب، ويرى **كل طلب غير مُسنَد**: اسم
+                 * الزبون وعنوان بيته ورقمه ومبلغه. ثم يقبله، لأن حارس
+                 * التعديل يسمح بأخذ ما لا مندوب له.
+                 *
+                 * أي أن باب القراءة كان مفتوحاً بلا حارس، وباب الإشعار
+                 * مغلقاً بأربعة. ومن ثمّ كان صاحب المنصّة يرى الطلبات
+                 * ويوصّلها ولا يُنادى عليه — وهو ما حيّرنا يوماً كاملاً.
+                 *
+                 * القاعدة الآن هي قاعدة `notifyDrivers` نفسها: مندوبٌ
+                 * بنوع حسابه، أو من سجّل جهاز كابتن فعلاً. حقيقة واحدة
+                 * في المكانين — لا حارسان مختلفان لبابين على غرفة واحدة. */
+                const isDriverAccount = type === 'driver' || me.worksAsDriver === true;
+                if (q.driverId && isDriverAccount &&
+                    (String(q.driverId) === myId || (myPhone && String(q.driverId) === myPhone))) {
                     driverId = String(q.driverId);
                 }
                 if (q.restaurantId && myRest && String(q.restaurantId) === myRest) {
@@ -591,7 +612,8 @@ router.get('/', needsIdentity, async (req, res) => {
                 }
                 // لم يطلب نطاقاً صالحاً؟ نُعطيه نطاقه الافتراضي حسب نوعه
                 if (!driverId && !restaurantId && !customerPhone) {
-                    if (type === 'driver') driverId = myId;
+                    // نفس القاعدة في النطاق الافتراضي — وإلا دخل من الباب الخلفي
+                    if (isDriverAccount) driverId = myId;
                     else if (type === 'restaurant' && myRest) restaurantId = myRest;
                     else if (myPhone) customerPhone = myPhone;
                     else return res.json([]);
@@ -1222,7 +1244,16 @@ function startRestaurantTimeout(app) {
         const id = String(o.id);
         const stage = _staleSeen.get(id) || 0;
 
-        if (age >= EXPIRE_MS && stage < 3) {
+        /* `EXPIRE_MS > 0` شرطٌ ناقص كان فخّاً.
+         *
+         * `ZADNA_ABANDON_HOURS=0` تُعطّل مكنسة المهجور (شرطها صريح).
+         * فمن يقيس عليها ويضع `REST_EXPIRE_MIN=0` ظانّاً أنه يُعطّل
+         * مهلة المطعم — يفعل العكس تماماً: `age >= 0` صادقة دائماً،
+         * فيُلغى **كل طلب في اللحظة التي يُنشأ فيها**، ويصل كل زبون
+         * «اعتذارنا، المطعم لم يردّ» قبل أن يرفع المطعم رأسه.
+         *
+         * متغيّرٌ اسمه «عطّلني» لا يجوز أن يعني «ألغِ كل شيء». */
+        if (EXPIRE_MS > 0 && age >= EXPIRE_MS && stage < 3) {
           _staleSeen.set(id, 3);
           await db.collection('orders').doc(id).update({
             status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
