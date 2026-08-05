@@ -585,6 +585,41 @@ async function notifyChatPeer(app, { orderId, senderId, senderName, senderRole, 
   const db = app.get('db');
   if (!db || !orderId || orderId === 'global_zadna_chat') return;
   try {
+    /* ============================================================
+       غرفة الإدارة الخاصة — لا طلب لها، فكان الإشعار يخرج صامتاً.
+
+       الدالة تبدأ بجلب مستند الطلب ثم `if (!oDoc.exists) return;`.
+       واسم غرفة الإدارة `admin_driver_<المندوب>` ليس رقم طلب، فتخرج
+       من أول سطرين. أي أنّ **كل رسالة خاصة أرسلتها لمندوب لم تُنتج
+       إشعاراً واحداً** — يراها فقط إن صادف أن شاشة الشات مفتوحة أمامه.
+
+       والمندوب على دراجته لا يفتح شاشة الشات. فرسالة الإدارة — وهي
+       أعجل ما يكون عادةً: «روح على العنوان الثاني» — كانت تنام في
+       الخادم حتى يفتح التطبيق صدفةً.
+
+       ونقبل الاسمين: المجرّد، والمُلصَق ببادئة `order_room_` التي
+       يضيفها التطبيق بالخطأ.
+       ============================================================ */
+    const rawRoom = String(orderId);
+    const adminRoom = rawRoom.startsWith('admin_driver_') ? rawRoom
+      : rawRoom.startsWith('order_room_admin_driver_')
+        ? rawRoom.slice('order_room_'.length) : null;
+
+    if (adminRoom) {
+      const drvKey = adminRoom.slice('admin_driver_'.length);
+      if (!drvKey || drvKey === String(senderId || '')) return;   // لا يُنبَّه كاتبها
+      const tk = await tokensOf(db, [drvKey], 'captain');
+      if (tk.length) {
+        await push(db, tk, {
+          title: `💬 ${senderName || 'الإدارة'}`,
+          body: String(text || '').slice(0, 80),
+          channel: 'chat',
+          data: { room: adminRoom, type: 'chat' },
+        });
+      }
+      return;
+    }
+
     const oDoc = await db.collection('orders').doc(String(orderId)).get();
     if (!oDoc.exists) return;
     const o = oDoc.data() || {};

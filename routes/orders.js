@@ -62,6 +62,11 @@ const CUSTOMER_NOTE = {
    STRICT_ORDER_PRICING=1 على Render يرفض أي طلب بلا أصناف. اتركه
    مطفأً حتى يُحدِّث الجميع تطبيقاتهم، ثم شغّله ليُغلق الباب نهائياً.
    ============================================================ */
+/* بصمات الطلبات الأخيرة — حارس التكرار عند انقطاع الشبكة.
+ * في الذاكرة عمداً: لا قراءة ولا كتابة من الحصة، وتُمسح بإعادة التشغيل. */
+const _recentOrders = new Map();
+const DUP_WINDOW_MS = Number(process.env.ORDER_DUP_WINDOW_SEC || 90) * 1000;
+
 const STRICT_PRICING = process.env.STRICT_ORDER_PRICING === '1';
 const r2 = (n) => Math.round(n * 100) / 100;
 
@@ -157,6 +162,51 @@ router.post('/', needsIdentity, async (req, res) => {
 
       // Ensure ID is set
       const orderId = orderData.id || 'ORD_' + Date.now();
+
+      /* ============================================================
+         حارس الطلب المكرَّر — أخطر ما تُنتجه شبكة نابلس.
+
+         السيناريو الواقعي: الزبون يضغط «تأكيد»، فيصل الطلب السيرفر
+         ويُحفظ، ثم ينقطع النت قبل أن يعود الردّ. التطبيق ينتظر ستين
+         ثانية ثم يقول «تعذّر الاتصال» ويحذف الطلب من شاشته. فيضغط
+         الزبون ثانيةً — والتطبيق يولّد **معرّفاً جديداً** من الساعة،
+         فيصير طلبان حقيقيان بمعرّفين مختلفين.
+
+         والنتيجة: مطعمٌ يطبخ مرّتين، ومندوبان يتحرّكان، وأجرتا توصيل.
+         الزبون يرفض الثاني، والمندوب خسر رحلته، وأنت تدفع الفرق.
+         وليس نادراً — هذا هو الحال الغالب في الطابق الأرضي بنابلس.
+
+         والحلّ الصحيح مفتاح تكرار من التطبيق، وهو يحتاج بناءً. وهذا
+         بديلٌ يعمل **الآن على الأجهزة المثبَّتة**: بصمة من (الزبون +
+         المحلّ + المبلغ + ملخّص الأصناف). فطلبٌ بنفس البصمة خلال ٩٠
+         ثانية هو إعادةُ محاولةٍ لا طلبٌ ثانٍ — نردّ الطلب الأول نفسه
+         بنجاح، فيرى الزبون طلبه ولا يُنشأ شيء.
+
+         ولماذا ٩٠ ثانية؟ أطول من مهلة التطبيق (٦٠) بهامش، وأقصر من
+         أن تمنع زبوناً أراد فعلاً طلباً ثانياً مطابقاً — وهو نادر،
+         ومن أراده ينتظر دقيقة ونصفاً أو يغيّر صنفاً.
+
+         والكاش في الذاكرة لا في Firestore: لا قراءة ولا كتابة إضافية،
+         وإعادة تشغيل السيرفر تمسحه — وهي لحظة لا يكون فيها تكرار أصلاً.
+         ============================================================ */
+      const dupKey = [
+        orderData.customerId || orderData.customerPhone || '',
+        orderData.restaurantId || '',
+        Number(orderData.totalAmount || 0),
+        String(orderData.itemsSummary || '').slice(0, 60),
+      ].join('|');
+      const now0 = Date.now();
+      for (const [k, v] of _recentOrders) {
+        if (now0 - v.at > DUP_WINDOW_MS) _recentOrders.delete(k);
+      }
+      const seen = _recentOrders.get(dupKey);
+      if (seen && now0 - seen.at < DUP_WINDOW_MS) {
+        console.warn(`♻️ طلب مكرَّر مُنع: ${dupKey.slice(0, 40)} → أُعيد ${seen.id}`);
+        return res.status(200).json({
+          success: true, duplicate: true, id: seen.id, orderId: seen.id,
+          message: 'طلبك وصلنا بالفعل ✅',
+        });
+      }
 
       // Check if Mart Order
       // طلبات المارت تذهب للمناديب مباشرة — لا مطعم يوافق عليها.
@@ -329,6 +379,7 @@ router.post('/', needsIdentity, async (req, res) => {
       orderData.createdAt = new Date();
       try {
         await db.collection('orders').doc(finalId).create({ ...orderData, id: finalId });
+        _recentOrders.set(dupKey, { id: finalId, at: Date.now() });
       } catch (e) {
         if (e && (e.code === 6 || /ALREADY_EXISTS/i.test(String(e.message)))) {
           finalId = `${orderId}-${Math.random().toString(36).slice(2, 7)}`;
