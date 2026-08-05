@@ -100,10 +100,17 @@ router.post('/fcm_token', needsIdentity, async (req, res) => {
       const rest = devs.filter(x => x && x.token !== token);
       const entry = { token, app: APPS.has(app) ? app : null, at: Date.now() };
       // نُبقي آخر 5 أجهزة فقط — أكثر من ذلك يعني أجهزة قديمة لم تُحذف
-      await ref.update({
+      const patch = {
         fcmDevices: [entry, ...rest].slice(0, 5),
         fcmTokens: [token, ...cur.filter(t => t !== token)].slice(0, 5),
-      });
+      };
+      /* تسجيل جهاز «كابتن» إعلانٌ صريح: أنا أعمل مندوباً.
+       *
+       * ولا يُستعلَم عن عنصرٍ داخل مصفوفة كائنات في Firestore، فنرفع
+       * علماً مسطّحاً يُستعلَم عنه. هذا ما يجعل `notifyDrivers` تجد
+       * صاحبَ المنصّة حين يوصّل بنفسه، وصاحبَ مطعمٍ يعمل مندوباً مساءً. */
+      if (app === 'captain') patch.worksAsDriver = true;
+      await ref.update(patch);
     }
     res.json({ success: true });
   } catch (e) {
@@ -420,7 +427,29 @@ async function notifyDrivers(app, { title, body, data, restaurantLat, restaurant
   const db = app.get('db');
   if (!db) return;
   try {
-    const snap = await db.collection('users').where('userType', '==', 'driver').get();
+    /* ============================================================
+       المندوب يُعرَف بعمله لا بحقلٍ في سجلّه — والدرس مكرَّر.
+
+       كان السؤال `userType === 'driver'` وحده. وهو يكسر كل حالة يعمل
+       فيها شخص بأكثر من دور، وهي الحالة الطبيعية عندنا: صاحب المنصّة
+       يوصّل بنفسه، وصاحب مطعم قد يوصّل مساءً.
+
+       وقد كُتبت هذه القاعدة بعينها في `GET /api/orders` — «يحقّ لك أي
+       نطاق تُثبت أنه لك» — ولم تُطبَّق هنا. فكان يزن يفتح تطبيق
+       الكابتن ويقف على دوامه، والسيرفر لا يراه مندوباً أصلاً فلا
+       يرسل إليه. المطعمُ يصله والزبونُ يصله، وهو صامت.
+
+       `worksAsDriver` يُرفع لحظة تسجيل جهاز `captain` — أي بالفعل لا
+       بالإقرار. ومن سجّل الجهاز ثم تركه تحرسه بقية الفلاتر
+       (الاعتماد · الوردية · سقف الكاش) كما تحرس غيره تماماً.
+       ============================================================ */
+    const [byType, byDevice] = await Promise.all([
+      db.collection('users').where('userType', '==', 'driver').get(),
+      db.collection('users').where('worksAsDriver', '==', true).get(),
+    ]);
+    const seenDocs = new Map();
+    [byType, byDevice].forEach(sn => sn.forEach(d => seenDocs.set(d.id, d)));
+    const snap = { forEach: (fn) => seenDocs.forEach(d => fn(d)) };
     const ids = [];
     const overCap = [];
     snap.forEach(d => {
