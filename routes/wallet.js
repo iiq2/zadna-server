@@ -1,5 +1,8 @@
 const express = require('express');
 const router = express.Router();
+/* عدّاد القراءات — قراءةٌ لا تُحصى تجعل مقياس الحصة يكذب، والمقياس
+ * الذي يكذب أسوأ من غيابه. */
+const meter = require('../utils/meter');
 
 const getDb = (req) => req.app.get('db');
 /** تسجيل تسوية يخفض دين مندوب — للإدارة وحدها. كان مفتوحاً للإنترنت. */
@@ -276,9 +279,37 @@ router.get('/wallet/summary', adminOnly, async (req, res) => {
     const settled = {};
     setSnap.forEach(d => { const s = d.data(); settled[s.driverId] = (settled[s.driverId]||0) + (Number(s.amount)||0); });
 
+    /* ============================================================
+       `cashOnHand` — ما يحمله المندوب نقداً في جيبه الآن.
+
+       يختلف عن `balanceDue`: الأخير رقمٌ محاسبي (كم عليه إجمالاً)،
+       وهذا رقمٌ **تشغيلي** — وهو الذي يحرسه سقف الكاش في push.js
+       فيمنع الطلبات عمّن تجاوزه.
+
+       وبلا إرساله للّوحة تكتشف أن مندوباً توقّفت طلباته ولا تعرف
+       لماذا، فتظنّ عطلاً في التوزيع وتبحث في المكان الخطأ.
+
+       نقرؤه من مستندات المستخدمين دفعةً واحدة لا مستنداً لكل مندوب:
+       قراءةٌ لكل مندوب في كل تحديث للوحة تُنفق الحصة بلا داعٍ. */
+    const cashOf = {};
+    try {
+      const ids = Object.keys(drivers).slice(0, 60);
+      if (ids.length) {
+        const snaps = await Promise.all(
+          ids.map(id => db.collection('users').doc(String(id)).get())
+        );
+        snaps.forEach(s => { if (s.exists) cashOf[s.id] = Number((s.data() || {}).cashOnHand || 0); });
+        meter.addReads(snaps.length, 'كاش المناديب');
+      }
+    } catch (e) {
+      // الشارة زينة — غيابها لا يُسقط الكشف المالي
+      console.warn('⚠️ تعذّرت قراءة كاش المناديب:', e.message);
+    }
+
     const driversList = Object.values(drivers).map(d => ({
       ...d, collected:r2(d.collected), owed:r2(d.owed), owedToday:r2(d.owedToday),
       earnings:r2(d.earnings), settled:r2(settled[d.id]||0),
+      cashOnHand: r2(cashOf[d.id] || 0),
       balanceDue:r2(Math.max(0, d.owed - (settled[d.id]||0))),
       overpaid:r2(Math.max(0, (settled[d.id]||0) - d.owed))
     })).sort((a,b) => b.balanceDue - a.balanceDue);
