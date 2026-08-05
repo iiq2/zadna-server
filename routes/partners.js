@@ -440,9 +440,28 @@ router.get('/partner_status', async (req, res) => {
       const d = await db.collection('users').doc(String(id)).get();
       if (d.exists) data = d.data();
     } else if (phone || email) {
-      const field = phone ? 'phone' : 'email';
-      const snap = await db.collection('users').where(field, '==', String(phone || email)).limit(1).get();
-      if (!snap.empty) data = snap.docs[0].data();
+      /* الرقم يُطبَّع قبل البحث — وهذا آخر موضع بقي بمطابقة حرفية.
+       *
+       * طبّعنا الرقم في فلتر الطلبات وفي `notifyCustomer`، ونسيناه هنا.
+       * فصاحب مطعمٍ حُفظ رقمه `0599…` ويرسل تطبيقه `+970599…` لا يُطابَق،
+       * فيردّ السيرفر ٤٠٤ «المستخدم غير موجود»، وتظهر له لافتة صفراء
+       * تقول «تعذّر التحقق من حالة حسابك مع الإدارة» — وحسابه سليم
+       * معتمَد يعمل. تحذيرٌ كاذب يُقلق شريكاً لا ذنب له.
+       *
+       * نجرّب المُطبَّع أولاً ثم الخام — كما في `notifyCustomer` تماماً. */
+      if (phone) {
+        const { normPhone } = require('../utils/phone');
+        const raw = String(phone);
+        const norm = normPhone(raw) || raw;
+        let snap = await db.collection('users').where('phone', '==', norm).limit(1).get();
+        if (snap.empty && norm !== raw) {
+          snap = await db.collection('users').where('phone', '==', raw).limit(1).get();
+        }
+        if (!snap.empty) data = snap.docs[0].data();
+      } else {
+        const snap = await db.collection('users').where('email', '==', String(email)).limit(1).get();
+        if (!snap.empty) data = snap.docs[0].data();
+      }
     }
     if (!data) return res.status(404).json({ status: 'unknown', error: 'المستخدم غير موجود' });
     const status = data.status || 'approved';
