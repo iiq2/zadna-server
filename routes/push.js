@@ -87,7 +87,7 @@ router.post('/fcm_token', needsIdentity, async (req, res) => {
     /* سطر يقول «وصل» — كان تسجيل الجهاز يحدث بلا أثر في السجلّ.
      * فحين شكا صاحب المنصّة أن الإشعارات لا تصل لم يكن فيه ما يجيب:
      * أسُجّل جهازٌ أصلاً؟ ومتى؟ ولأي تطبيق؟ */
-    console.log(`📱 سُجّل جهاز: ${d.name || uid} · تطبيق ${app || '—'} · ...${token.slice(-8)}`);
+    console.log(`📱 سُجّل جهاز: ${d.name || '—'} [${uid}] · تطبيق ${app || '—'} · …${token.slice(-8)}`);
 
     const cur = Array.isArray(d.fcmTokens) ? d.fcmTokens : [];
     // fcmDevices هو المرجع الجديد؛ fcmTokens يبقى لتوافق النسخ القديمة
@@ -326,7 +326,9 @@ async function push(db, tokens, { title, body, channel = 'update', data = {} }) 
      *   📨 alert → أُرسل 1 · فشل 1 (messaging/registration-token-not-registered)
      * ومعناه فوراً: جهاز المندوب سجّل رمزاً ثم حُذف التطبيق أو مُسح. */
     const codesTxt = codes.size ? ` (${[...codes].join(', ')})` : '';
-    console.log(`📨 ${channel} → أُرسل ${r.successCount} · فشل ${r.failureCount}${codesTxt} · «${title}»`);
+    const tails = tokens.map((t, i) =>
+      `${r.responses[i] && r.responses[i].success ? '✓' : '✗'}…${String(t).slice(-8)}`).join(' ');
+    console.log(`📨 ${channel} → أُرسل ${r.successCount} · فشل ${r.failureCount}${codesTxt} · [${tails}] · «${title}»`);
     return { sent: r.successCount, failed: r.failureCount };
   } catch (e) {
     console.warn('⚠️ تعذّر إرسال إشعار:', e.message);
@@ -558,16 +560,31 @@ async function notifyCustomer(app, customerPhone, { title, body, channel = 'upda
       /^\+?9(70|72)\d{9}$/.test(digits) ? '0' + digits.replace(/^\+?9(70|72)/, '')
       : /^009(70|72)\d{9}$/.test(digits) ? '0' + digits.replace(/^009(70|72)/, '')
       : digits;
-    let snap = await db.collection('users').where('phone', '==', norm).limit(1).get();
+    /* `limit(1)` حُذفت — وهي كانت تُسقط الإشعار على حساب وتترك الجهاز
+     * على الآخر.
+     *
+     * حين يوجد حسابان بنفس الرقم (والتسجيل يمنع تكرار البريد ولا يمنع
+     * تكرار الرقم) تختار `limit(1)` **أحدهما بلا ترتيب مضمون**. فإن وقع
+     * الاختيار على الحساب الذي لا جهاز عليه، خرج الإشعار إلى العدم —
+     * والسيرفر يقول «أُرسل» بضمير مرتاح.
+     *
+     * نأخذ كل الحسابات بذلك الرقم ونجمع أجهزتها. المستقبِل إنسان واحد
+     * مهما تعدّدت حساباته، فلا ازدواج في الإشعار عملياً — وإن تعدّد
+     * فالسطر أدناه يقوله لنا صراحةً. */
+    let snap = await db.collection('users').where('phone', '==', norm).get();
     if (snap.empty && norm !== String(customerPhone)) {
-      snap = await db.collection('users').where('phone', '==', String(customerPhone)).limit(1).get();
+      snap = await db.collection('users').where('phone', '==', String(customerPhone)).get();
     }
     if (snap.empty) {
       console.warn('⚠️ إشعار الزبون: لا حساب بهذا الرقم —', norm);
       return;
     }
+    const ids = snap.docs.map(x => x.id);
+    if (ids.length > 1) {
+      console.warn(`⚠️ ${ids.length} حسابات بنفس الرقم ${norm} — [${ids.join(' · ')}] · نُرسل لجميعها`);
+    }
     // أغنية زادنا تذهب لتطبيق الزبون وحده — لا للوحة تحكم مطعمه
-    const tokens = await tokensOf(db, [snap.docs[0].id], 'customer');
+    const tokens = await tokensOf(db, ids, 'customer');
     return await push(db, tokens, { title, body, channel, data });
   } catch (e) { console.warn('⚠️ إشعار الزبون:', e.message); }
 }
