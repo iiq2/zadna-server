@@ -387,7 +387,10 @@ router.get('/nearest', async (req, res) => {
     if (!open) {
       return res.json({
         success: false, allClosed: true, nearestName: ranked[0].name,
-        error: `${ranked[0].name} مغلق الآن — جرّب بعد قليل`
+        /* بلا اسم المحلّ في نصّ الخطأ: التطبيق لم يعد يعرض هوية الماركت
+         * للزبون أصلاً، فاسمٌ يظهر في رسالة إغلاقٍ وحدها يُحيّر من لم يره
+         * قطّ. والاسم يبقى في `nearestName` للّوحة والسجلّ. */
+        error: `السوبرماركت الأقرب لك مغلق الآن — جرّب بعد قليل`
       });
     }
 
