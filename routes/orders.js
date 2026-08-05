@@ -201,11 +201,43 @@ router.post('/', needsIdentity, async (req, res) => {
       }
       const seen = _recentOrders.get(dupKey);
       if (seen && now0 - seen.at < DUP_WINDOW_MS) {
-        console.warn(`♻️ طلب مكرَّر مُنع: ${dupKey.slice(0, 40)} → أُعيد ${seen.id}`);
-        return res.status(200).json({
-          success: true, duplicate: true, id: seen.id, orderId: seen.id,
-          message: 'طلبك وصلنا بالفعل ✅',
-        });
+        /* ============================================================
+           والطلب المنتهي لا يُعدّ تكراراً — تصحيحٌ لخطأ في تصميمي.
+
+           بنيتُ الحارس على افتراضٍ واحد: «طلبان متطابقان في دقيقة ونصف
+           = إعادة محاولة». وهو صحيح للطلب **المعلّق**، وخاطئ تماماً
+           للطلب الذي **انتهى**.
+
+           فمن سلّم طلبه ثم طلب مثله فوراً — أو ألغاه ثم أعاده — يريد
+           طلباً جديداً بيقين، لا نسخةً من طلبٍ فرغ منه. وحارسي كان
+           يردّ عليه معرّف القديم، فيتبنّاه التطبيق ويظنّ صاحبه أن
+           طلبه «علق» — وهو لم يُنشأ أصلاً.
+
+           وقد ظهر هذا في أول ساعة من عمر الحارس: سجلّ الأخطاء يقول
+           «أُرسل 034921 وحُفظ 962060».
+
+           فالشرط الصحيح: يُمنع التكرار ما دام الطلب الأول **حيّاً**.
+           والفحص من الكاش لا من Firestore — بلا قراءة إضافية. */
+        let prevAlive = true;
+        try {
+          const cachedList = await cached('orders:all', ORDERS_TTL, async () => []);
+          const prev = Array.isArray(cachedList)
+            ? cachedList.find(x => String(x.id) === String(seen.id)) : null;
+          if (prev && ['DELIVERED', 'CANCELLED'].includes(String(prev.status || ''))) {
+            prevAlive = false;
+          }
+        } catch (e) { /* تعذّر الفحص: نبقى على الحماية */ }
+
+        if (prevAlive) {
+          console.warn(`♻️ طلب مكرَّر مُنع: ${dupKey.slice(0, 40)} → أُعيد ${seen.id}`);
+          return res.status(200).json({
+            success: true, duplicate: true, id: seen.id, orderId: seen.id,
+            message: 'طلبك وصلنا بالفعل ✅',
+          });
+        }
+        // الأول انتهى — نمسح بصمته ونمضي في إنشاء طلبٍ جديد حقيقي
+        _recentOrders.delete(dupKey);
+        console.log(`✅ طلب جديد بنفس بصمة طلبٍ منتهٍ (${seen.id}) — يمرّ`);
       }
 
       // Check if Mart Order
