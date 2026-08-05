@@ -710,6 +710,38 @@ router.patch('/:id', needsIdentity, async (req, res) => {
 
     await docRef.update(updateData);
 
+      /* ============================================================
+         عدّاد الكاش في جيب المندوب — يُحدَّث لحظة التسليم.
+
+         السقف في push.js يحرس هذا الرقم، وبلا تحديثه هنا يبقى صفراً
+         أبداً فيصير الحارس حرفاً ميتاً.
+
+         وما يُضاف هو **ما يبقى في جيبه فعلاً**: يحصّل من الزبون
+         `cashToCollect`، ويدفع للمحلّ `payToRestaurant` نقداً، فيبقى
+         معه الفرق — وهو حصّة زادنا وأجرته معاً. حصّتك أنت من ذلك
+         الفرق هي ما ينتظر التسوية.
+
+         والطلب المدفوع إلكترونياً `cashToCollect = 0` بحكم money.js،
+         فلا يزيد جيبه شيئاً — والحساب يبقى صحيحاً بلا شرط إضافي.
+
+         `increment` لا قراءة-ثم-كتابة: طلبان يُسلَّمان في نفس الثانية
+         لا يدهس أحدهما الآخر. وفشلُه لا يُسقط التسليم — تسليمٌ تمّ
+         فعلاً أهمّ من عدّاد. */
+      if (status === 'DELIVERED') {
+        try {
+          const m = cur.money || {};
+          const kept = Math.max(0, Number(m.cashToCollect || 0) - Number(m.payToRestaurant || 0));
+          const drvId = curDrvKey || meId;
+          if (kept > 0 && drvId) {
+            const FV = require('firebase-admin').firestore.FieldValue;
+            await db.collection('users').doc(String(drvId))
+              .update({ cashOnHand: FV.increment(kept) });
+          }
+        } catch (e) {
+          console.warn('⚠️ تعذّر تحديث كاش المندوب:', e.message);
+        }
+      }
+
       // Notify via sockets
       const io = req.app.get('socketio');
       if (io) {

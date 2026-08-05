@@ -337,9 +337,54 @@ router.post('/wallet/settlement', adminOnly, async (req, res) => {
       }
     }
 
-    const doc = { driverId:String(driverId), driverName:driverName||'', amount:amt, note:note||'', createdAt:new Date() };
+    /* ============================================================
+       رقم إيصال متسلسل — لأن التسوية بلا رقم ليست إيصالاً.
+
+       كانت التسوية تُحفظ بمعرّف Firestore عشوائي (`aX9k...`) لا
+       يُقرأ ولا يُنطق ولا يُكتب على ورقة. وحين يختلف مندوب معك بعد
+       شهر — «دفعتُك ٤٠٠» — لا مرجع بينكما إلا ذاكرتان متعارضتان.
+
+       `SET-0001` رقمٌ يُقال في الهاتف ويُكتب على قصاصة ويُبحث عنه في
+       اللوحة. هذا هو الفرق بين سجلٍّ ووثيقة.
+
+       والترقيم يُشتقّ من العدد الحالي لا من عدّاد منفصل: لا مستند
+       زائد يُقرأ، ولا عدّاد يفسد إن حُذفت تسوية. وعند التصادم النادر
+       (تسويتان في نفس اللحظة) يُلحق حرفٌ بدل أن تفشل العملية —
+       فالمال أهمّ من جمال الرقم. */
+    let receiptNo = '';
+    try {
+      const cnt = await db.collection('settlements').count().get();
+      receiptNo = 'SET-' + String((cnt.data().count || 0) + 1).padStart(4, '0');
+      const clash = await db.collection('settlements').where('receiptNo', '==', receiptNo).limit(1).get();
+      if (!clash.empty) receiptNo += '-' + Math.random().toString(36).slice(2, 4).toUpperCase();
+    } catch (e) {
+      receiptNo = 'SET-' + Date.now().toString().slice(-6);   // بديل لا يُفشل التسوية
+    }
+
+    const doc = {
+      driverId: String(driverId), driverName: driverName || '',
+      amount: amt, note: note || '',
+      receiptNo,
+      // من سجّلها ومتى — التسوية فعلٌ مالي يستحق توقيعاً
+      recordedBy: String((req.user && req.user.userId) || 'admin'),
+      createdAt: new Date(),
+    };
     const ref = await db.collection('settlements').add(doc);
+
+    /* التسوية تُنقص كاش جيبه — وإلا بقي فوق السقف بعد أن دفع.
+     * لا ينزل تحت الصفر: من سدّد أكثر ممّا عليه لا يصير دائناً بجيبه. */
+    try {
+      const FV = require('firebase-admin').firestore.FieldValue;
+      const uref = db.collection('users').doc(String(driverId));
+      const u = await uref.get();
+      const cur = Number((u.exists ? u.data() : {}).cashOnHand || 0);
+      await uref.update({ cashOnHand: Math.max(0, cur - amt) });
+    } catch (e) {
+      console.warn('⚠️ تعذّر إنقاص كاش المندوب بعد التسوية:', e.message);
+    }
+
     _cache = { at: 0, data: null }; // إبطال الكاش
+    console.log(`🧾 تسوية ${receiptNo}: ${driverName || driverId} — ${amt} ₪`);
     res.status(201).json({ success:true, id:ref.id, ...doc });
   } catch (e) { res.status(500).json({ success:false, error:e.message }); }
 });

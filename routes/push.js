@@ -406,12 +406,16 @@ async function activeLoadByDriver(db) {
  * كل المناديب المعتمدين وغير المجمّدين — طلب جاهز للاستلام.
  * إن مرّرتَ موقع المطعم، رُتِّبوا بالقرب منه.
  */
+/** آخر مرّة نُبّه فيها مندوبٌ بأنه فوق سقف الكاش — لئلا يُقصف بكل طلب. */
+const _capNoticed = new Map();
+
 async function notifyDrivers(app, { title, body, data, restaurantLat, restaurantLng }) {
   const db = app.get('db');
   if (!db) return;
   try {
     const snap = await db.collection('users').where('userType', '==', 'driver').get();
     const ids = [];
+    const overCap = [];
     snap.forEach(d => {
       const u = d.data();
       const st = String(u.status || 'approved');
@@ -436,8 +440,56 @@ async function notifyDrivers(app, { title, body, data, restaurantLat, restaurant
          ============================================================ */
       if (u.onShift === false) return;
 
+      /* ============================================================
+         سقف الكاش — الحماية المالية الوحيدة الممكنة بلا بناء تطبيق.
+
+         المندوب يحمل نقد الزبائن في جيبه: يجمع من كل طلب ثمن البضاعة
+         كاملاً، ويدفع للمحلّ ناقص العمولة، ويبقى معه الفرق حتى يسوّي.
+         وبعشرة طلبات في مساء واحد قد يحمل ألفاً ونصفاً من مالك أنت.
+
+         ولم يكن في المنصّة شيء يوقف ذلك: يواصل أخذ الطلبات بلا حدّ،
+         ولا تعرف أنت إلا حين تفتح الكشف بنفسك. والخسارة هنا لا تُسترد
+         بشكوى — النقد الذي غادر لا يعود.
+
+         والسقف ليس اتهاماً بل حدّ معقول: من بلغ ٨٠٠ ₪ غير مسوّاة
+         **لا تصله طلبات جديدة** حتى يسوّي، ويُخطَر بالسبب صريحاً فلا
+         يظنّ المنصّة عطلت أو أنك تُقصيه.
+
+         ولماذا هنا لا في مسار القبول؟ لأن المنع عند القبول يعني أن
+         يرى الطلب ويسعى إليه ثم يُصدم برفض — إهانة بلا فائدة. أمّا
+         هنا فلا يُعرض عليه أصلاً، ويصله بدلاً منه تذكيرٌ بالتسوية.
+
+         ZADNA_CASH_CAP=0 على Render يُعطّله كلياً إن أردت.
+         ============================================================ */
+      const cap = Number(process.env.ZADNA_CASH_CAP || 800);
+      if (cap > 0 && Number(u.cashOnHand || 0) >= cap) {
+        overCap.push({ id: d.id, name: u.name || d.id, cash: Number(u.cashOnHand || 0) });
+        return;
+      }
+
       ids.push(d.id);
     });
+
+    /* من تجاوز السقف يُخطَر مرّة كل ساعتين — لا مع كل طلب.
+     * التذكير المتكرّر مع كل طلب يمرّ عقوبةٌ لا تنبيه. */
+    if (overCap.length) {
+      const now = Date.now();
+      for (const o of overCap) {
+        if (now - (_capNoticed.get(o.id) || 0) < 2 * 3600 * 1000) continue;
+        _capNoticed.set(o.id, now);
+        const tk = await tokensOf(db, [o.id], 'captain');
+        if (tk.length) {
+          await push(db, tk, {
+            title: '💰 سوِّ حسابك لتستقبل طلبات',
+            body: `معك ${Math.round(o.cash)} ₪ غير مسوّاة. سلّمها للإدارة وتعود الطلبات فوراً.`,
+            channel: 'update', data: { type: 'cash_cap' },
+          });
+        }
+      }
+      console.log(`💰 فوق سقف الكاش (${overCap.length}): ` +
+        overCap.map(o => `${o.name}:${Math.round(o.cash)}₪`).join(' · '));
+    }
+
     if (!ids.length) return;
 
     /* ============================================================

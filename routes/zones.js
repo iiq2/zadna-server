@@ -285,13 +285,36 @@ async function quoteDelivery(db, { lat, lng, restaurantId, zone, restaurantZone 
   }
   const cz = zoneByIdOrName(String(zone || ''), overrides);
   if (!cz) return { success: false, error: 'منطقة الزبون غير معروفة' };
+  /* ============================================================
+     منطقة المحلّ تُشتقّ من إحداثياته — لا من حقل لا يكتبه أحد.
+
+     كان السطر: `if (doc.data().zoneId) rz = zoneById(...)`.
+     و`zoneId` **لا يُكتب في أي مسار في المشروع كلّه** — لا عند
+     التسجيل، ولا عند تعديل المحلّ، ولا من اللوحة. فكان الشرط يفشل
+     دائماً، و`rz` تبقى `null`، و`PICKUP_SURCHARGE` (‎+٥ و+١٠ ₪ للمحلّ
+     خارج وسط البلد) **لم تُحصَّل ولا مرّة منذ كُتبت**.
+
+     ولم يكن الحلّ أن نكتب `zoneId` — بل أن نسأل سؤالاً أصحّ: المحلّ
+     يحمل `lat/lng` حقيقيّين (فرضناهما إلزاميين عند التسجيل)، والمنطقة
+     تُشتقّ منهما بدقّة أعلى من حقلٍ يُملأ باليد. وميزتها أنها تصحّ
+     دائماً — ولو نقل الشريك محلّه غداً.
+
+     ونُبقي `zoneId` مقبولاً إن وُجد: من ضبطه يدوياً يُحترم اختياره.
+     ============================================================ */
   let rz = null;
   if (restaurantZone) rz = zoneByIdOrName(String(restaurantZone), overrides);
   else if (restaurantId && db) {
     try {
       const doc = await db.collection('restaurants').doc(String(restaurantId)).get();
-      if (doc.exists && doc.data().zoneId) rz = zoneById(String(doc.data().zoneId), overrides);
-    } catch (e) { /* تجاهل */ }
+      const r = doc.exists ? (doc.data() || {}) : {};
+      if (r.zoneId) {
+        rz = zoneByIdOrName(String(r.zoneId), overrides);   // ضُبط يدوياً — يُحترم
+      } else if (Number.isFinite(Number(r.lat)) && Number.isFinite(Number(r.lng))) {
+        const merged = DEFAULT_ZONES.map(z => (overrides[z.id] ? { ...z, ...overrides[z.id], id: z.id } : z));
+        const near = nearestZone(merged, Number(r.lat), Number(r.lng));
+        if (near) rz = near.zone;
+      }
+    } catch (e) { /* تجاهل — التسعير لا يسقط لأجل الإضافة */ }
   }
   const q = computeFee(cz, rz);
   return {
