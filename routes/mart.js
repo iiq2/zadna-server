@@ -118,6 +118,28 @@ function cleanUnits(raw) {
   return out;
 }
 
+/* ============================================================
+   رمز الصنف — يُمنَح تلقائياً حين لا يختاره صاحب المحلّ.
+
+   الغالبية العظمى من الأصناف بلا صور: مكتبة الـ٤٥٦ صنفاً بلا صورة
+   واحدة، وصاحب سوبرماركت لن يصوّر ألف منتج بيده. فالحالة الافتراضية
+   هي «لا صورة» لا العكس — وما يملأ مكانها هو الرمز.
+
+   وحين يكون الرمز فارغاً أيضاً يبقى مكان الصورة على ما رسمه آخر ما
+   وُضع فيه — وهو شعار زادنا في ترويسة الصفحة. فيرى الزبون صفّاً من
+   الشعارات المتطابقة لا يميّز فيه الحليب من المنظّف.
+
+   ورمز القسم يفرزها بلمحة: 🥛 للألبان و🍅 للخضار و🍗 للحوم. ونمنحه
+   هنا — على السيرفر — لا في التطبيق: فيسري على الأجهزة المثبَّتة الآن
+   بلا انتظار بناء، ويسري على كل صنف يُدخله أي شريك بعد اليوم.
+   ============================================================ */
+function emojiFor(categoryId, given) {
+  const g = String(given || '').trim().slice(0, 8);
+  if (g) return g;                                  // اختيار صاحب المحلّ أولاً
+  const c = MART_CATEGORIES.find(x => x.id === String(categoryId || '').trim());
+  return (c && c.emoji) || '🛒';
+}
+
 function cleanProduct(body) {
   const b = body || {};
   const nameAr = String(b.nameAr || '').trim().slice(0, 120);
@@ -129,7 +151,7 @@ function cleanProduct(body) {
       nameAr,
       brand:      String(b.brand || '').trim().slice(0, 60),
       categoryId: String(b.categoryId || 'pantry').trim().slice(0, 40),
-      emoji:      String(b.emoji || '').trim().slice(0, 8),
+      emoji:      emojiFor(b.categoryId, b.emoji),
       imageUrl:   String(b.imageUrl || '').trim().slice(0, 500),
       units,
       available:  b.available !== false,
@@ -300,8 +322,11 @@ router.get('/nearest', async (req, res) => {
       success: true,
       market: { id: open.id, name: open.name, emoji: open.emoji, imageUrl: open.imageUrl,
                 address: open.address, lat: open.lat, lng: open.lng, km: open.km },
-      // الزبون لا يرى ما نفد؛ صاحب المحل يراه في تطبيقه ليُعيده
-      products: products.filter(p => p.available !== false),
+      /* الزبون لا يرى ما نفد؛ صاحب المحل يراه في تطبيقه ليُعيده.
+       * والرمز يُمنَح لمن لا رمز له — هذا هو المسار الذي يراه الزبون
+       * فعلاً، فبلا هذا السطر تبقى شاشته صفّاً من الشعارات المتطابقة. */
+      products: products.filter(p => p.available !== false)
+                        .map(p => (p && !p.emoji ? { ...p, emoji: emojiFor(p.categoryId) } : p)),
       alternatives: ranked.length - 1,   // كم ماركت آخر ضمن المدى — لعلمك لا لعرضه
     });
   } catch (e) {
@@ -384,9 +409,12 @@ async (req, res) => {
       return out;
     });
 
+    /* الأصناف المحفوظة قبل اليوم بلا رمز تُمنَح رمزها عند القراءة —
+     * فلا ينتظر الزبون أن يُعدّل الشريك كل صنف أدخله سابقاً. */
+    const withEmoji = list.map(p => (p && !p.emoji ? { ...p, emoji: emojiFor(p.categoryId) } : p));
     // الزبون لا يرى ما نفد. وصاحب المحلّ يراه ليُعيده حين يتوفّر.
     const forOwner = String(req.query.all || '') === '1' && await ownsMarket(req, marketId);
-    res.json(forOwner ? list : list.filter(p => p.available !== false));
+    res.json(forOwner ? withEmoji : withEmoji.filter(p => p.available !== false));
   } catch (e) {
     console.error('❌ كتالوج المارت:', e.message);
     res.status(500).json({ success: false, error: e.message });
