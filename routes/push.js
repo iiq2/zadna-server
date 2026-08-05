@@ -84,6 +84,11 @@ router.post('/fcm_token', needsIdentity, async (req, res) => {
     if (!snap.exists) return res.status(404).json({ success: false, error: 'الحساب غير موجود' });
 
     const d = snap.data();
+    /* سطر يقول «وصل» — كان تسجيل الجهاز يحدث بلا أثر في السجلّ.
+     * فحين شكا صاحب المنصّة أن الإشعارات لا تصل لم يكن فيه ما يجيب:
+     * أسُجّل جهازٌ أصلاً؟ ومتى؟ ولأي تطبيق؟ */
+    console.log(`📱 سُجّل جهاز: ${d.name || uid} · تطبيق ${app || '—'} · ...${token.slice(-8)}`);
+
     const cur = Array.isArray(d.fcmTokens) ? d.fcmTokens : [];
     // fcmDevices هو المرجع الجديد؛ fcmTokens يبقى لتوافق النسخ القديمة
     const devs = Array.isArray(d.fcmDevices) ? d.fcmDevices : [];
