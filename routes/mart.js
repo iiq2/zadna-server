@@ -112,10 +112,91 @@ function cleanUnits(raw) {
      * وإلا صار «عرضاً» يرفع الثمن، وهي حيلة يعرفها الناس ويكرهونها،
      * ومن يقع عليها مرّة لا يثق بالتطبيق بعدها. */
     const offer = Number(u && u.offerPrice);
-    if (Number.isFinite(offer) && offer > 0 && offer < price) unit.offerPrice = r2(offer);
+    if (Number.isFinite(offer) && offer > 0 && offer < price) {
+      unit.offerPrice = r2(offer);
+
+      /* ونهايةُ العرض اختيارية أيضاً — لكنها لا تُحفظ إلا مع عرضٍ قائم.
+       * تاريخُ نهايةٍ بلا عرضٍ حقلٌ يكذب: يقول إن شيئاً سينتهي ولا شيء
+       * بدأ. ولا نقبل تاريخاً مضى: عرضٌ يولد منتهياً خطأُ إدخالٍ لا
+       * نيّة، ورفضُه الآن أرحم من شرحه غداً. */
+      const ends = toDate(u && u.offerEnds);
+      if (ends && ends.getTime() > Date.now()) unit.offerEnds = ends;
+    }
     out.push(unit);
   }
   return out;
+}
+
+/* ============================================================
+   العرض المنتهي — يُطوى في مكانٍ واحد
+
+   العرض له نهاية يحدّدها صاحب المحلّ. والسؤال: من يقرّر أنه انتهى؟
+
+   لو تركنا القرار للتطبيق، لصار **ساعةُ الجهاز** هي التي تُسعّر. وهاتفٌ
+   ساعتُه متأخّرة يوماً يعرض عرضاً انقضى، فيضيفه الزبون إلى سلّته بسعرٍ
+   ثم يحاسبه السيرفر بسعرٍ آخر — فيرى مبلغاً لم يوافق عليه. وهذا أسوأ
+   من غياب العروض أصلاً: لا شيء يهدم الثقة كسعرٍ يتغيّر بعد الموافقة.
+
+   فالسيرفر وحده يقرّر، **ويُسقط العرض المنتهي من الردّ نفسه**: التطبيق
+   لا يرى `offerPrice` لعرضٍ انقضى، فلا يحتاج أن يقارن تاريخاً ليُسعّر.
+   يبقى التاريخ عنده لغرضٍ واحد: أن يقول «ينتهي بعد ساعتين».
+
+   وهذا هو الدرس الذي كلّفنا يوماً كاملاً: **حقيقةٌ واحدة في مكان
+   واحد**. كل عطلٍ طاردناه كان حقيقةً مكتوبةً في موضعين فاختلفا.
+   ============================================================ */
+
+/** يحوّل ما يصل من التطبيق أو من Firestore إلى Date — أو null. */
+function toDate(v) {
+  if (!v) return null;
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+  // Firestore Timestamp
+  if (typeof v.toDate === 'function') { try { return v.toDate(); } catch (e) { return null; } }
+  if (typeof v._seconds === 'number') return new Date(v._seconds * 1000);
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/** هل العرض على هذه الوحدة ساري المفعول الآن؟ */
+function offerLive(unit, nowMs) {
+  const off = Number(unit && unit.offerPrice);
+  if (!Number.isFinite(off) || off <= 0) return false;
+  const ends = toDate(unit && unit.offerEnds);
+  if (!ends) return true;                       // عرضٌ بلا نهاية — دائم
+  return ends.getTime() > (nowMs || Date.now());
+}
+
+/** السعر الذي يُحاسَب به فعلاً — نقطةُ الحقيقة الوحيدة للتسعير. */
+function unitPrice(unit, nowMs) {
+  return offerLive(unit, nowMs) ? Number(unit.offerPrice) : Number(unit && unit.price);
+}
+
+/* يُنظّف منتجاً للعرض: يُخرج التاريخ بصيغةٍ يفهمها التطبيق (ISO) بدل
+ * Timestamp لا يعرف كيف يقرؤه، ويطوي العرض المنتهي.
+ *
+ * `keepExpired` لصاحب المحلّ وحده: يرى عرضه المنقضي ليُجدّده أو
+ * يُزيله — فمن لا يرى ما انتهى لا يستطيع إدارته. أمّا الزبون فلا
+ * يرى إلا القائم. */
+function withLiveOffers(p, nowMs, keepExpired) {
+  if (!p || !Array.isArray(p.units)) return p;
+  const now = nowMs || Date.now();
+  let touched = false;
+  const units = p.units.map(u => {
+    if (!u || u.offerPrice == null) return u;
+    const live = offerLive(u, now);
+    if (!live && !keepExpired) {
+      touched = true;
+      const { offerPrice, offerEnds, ...rest } = u;
+      return rest;                              // انقضى — كأنه لم يكن
+    }
+    const ends = toDate(u.offerEnds);
+    if (!ends) return u;
+    touched = true;
+    // `offerLive` علامةٌ صريحة لصاحب المحلّ: لا يستنتج من تاريخٍ بساعة جهازه
+    return keepExpired
+      ? { ...u, offerEnds: ends.toISOString(), offerLive: live }
+      : { ...u, offerEnds: ends.toISOString() };
+  });
+  return touched ? { ...p, units } : p;
 }
 
 /* ============================================================
@@ -318,15 +399,24 @@ router.get('/nearest', async (req, res) => {
       return out;
     });
 
+    /* الوقت يُقرأ **بعد** الكاش لا داخله. لو طوينا العروض داخل المُحمِّل
+     * لبقيت النتيجة مخزَّنةً بوقت أوّل قارئ، فيرى من بعده عرضاً انقضى
+     * — أو يُحرَم من عرضٍ ما زال قائماً. الطيّ عند كل ردّ لا عند كل قراءة. */
+    const nowMs = Date.now();
+
     res.json({
       success: true,
+      serverTime: new Date(nowMs).toISOString(),   // ليحسب التطبيق «ينتهي بعد…» بساعتنا لا بساعته
       market: { id: open.id, name: open.name, emoji: open.emoji, imageUrl: open.imageUrl,
                 address: open.address, lat: open.lat, lng: open.lng, km: open.km },
       /* الزبون لا يرى ما نفد؛ صاحب المحل يراه في تطبيقه ليُعيده.
        * والرمز يُمنَح لمن لا رمز له — هذا هو المسار الذي يراه الزبون
        * فعلاً، فبلا هذا السطر تبقى شاشته صفّاً من الشعارات المتطابقة. */
       products: products.filter(p => p.available !== false)
-                        .map(p => (p && !p.emoji ? { ...p, emoji: emojiFor(p.categoryId) } : p)),
+                        .map(p => (p && !p.emoji ? { ...p, emoji: emojiFor(p.categoryId) } : p))
+                        // العرض المنتهي يُطوى هنا — فلا يصل التطبيق سعرٌ
+                        // لن يحاسب به السيرفر
+                        .map(p => withLiveOffers(p, nowMs)),
       alternatives: ranked.length - 1,   // كم ماركت آخر ضمن المدى — لعلمك لا لعرضه
     });
   } catch (e) {
@@ -414,7 +504,13 @@ async (req, res) => {
     const withEmoji = list.map(p => (p && !p.emoji ? { ...p, emoji: emojiFor(p.categoryId) } : p));
     // الزبون لا يرى ما نفد. وصاحب المحلّ يراه ليُعيده حين يتوفّر.
     const forOwner = String(req.query.all || '') === '1' && await ownsMarket(req, marketId);
-    res.json(forOwner ? withEmoji : withEmoji.filter(p => p.available !== false));
+
+    /* صاحبُ المحلّ يرى عروضه المنتهية موسومةً بـ`offerLive:false` — كيف
+     * يُدير ما لا يراه؟ أمّا الزبون فلا يرى إلا القائم، وبنفس ساعة
+     * السيرفر التي يُحاسِب بها. */
+    const nowMs = Date.now();
+    if (forOwner) return res.json(withEmoji.map(p => withLiveOffers(p, nowMs, true)));
+    res.json(withEmoji.filter(p => p.available !== false).map(p => withLiveOffers(p, nowMs)));
   } catch (e) {
     console.error('❌ كتالوج المارت:', e.message);
     res.status(500).json({ success: false, error: e.message });
@@ -518,6 +614,122 @@ router.patch('/:id', needsIdentity, async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     console.error('❌ تعديل صنف:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/* ============================================================
+   POST /api/mart_products/:id/offer — إطلاق عرضٍ أو إنهاؤه بنداءٍ واحد
+
+   لماذا مسارٌ خاصّ والـPATCH موجود؟
+
+   لأن PATCH يستبدل `units` **كاملةً**. فمن أراد أن يُنهي عرضاً على وحدة
+   واحدة لزمه أن يُرسل الوحدات كلّها بأسعارها — وأي حقلٍ ينساه يضيع.
+   وصاحب سوبرماركت يُطلق عرضاً صباحاً ويُنهيه مساءً، فلا يجوز أن يكون
+   الفعل اليومي هو الأخطر.
+
+   وهنا السيرفر يقرأ الوحدات القائمة ويُعدّل واحدةً منها ويُعيدها —
+   فالباقي محفوظٌ بالبناء لا بانتباه من يُرسل.
+
+     { unitLabel, offerPrice, offerEnds? }   → أطلق أو عدّل
+     { unitLabel, clearOffer: true }         → أنهِ الآن
+     { clearOffer: true }  بلا unitLabel     → أنهِ عروض الصنف كلّها
+
+   والإنهاء بعلمٍ صريح `clearOffer` لا بغياب `offerPrice`.
+
+   لماذا؟ لأن Gson (وهو ما يستعمله التطبيق) **يحذف مفاتيح `null` من
+   الجسم افتراضاً**. فـ`{unitLabel, offerPrice: null}` يصل السيرفر
+   `{unitLabel}` — بلا المفتاح أصلاً. ولو قرأنا الغياب إنهاءً لعمل
+   الزرّ بالصدفة لا بالتصميم، ولانقلب المعنى على من يُرسل
+   `{unitLabel, offerEnds}` قاصداً تمديد المدّة وحدها: يُنهي عرضه
+   وهو يظنّ أنه مدّده.
+
+   فالنيّة تُكتب ولا تُستنتَج من نقصان.
+   ============================================================ */
+router.post('/:id/offer', needsIdentity, async (req, res) => {
+  try {
+    const db = getDb(req);
+    const b = req.body || {};
+    const marketId = String(req.query.marketId || b.marketId || '').trim();
+    if (!db || !marketId) return res.status(400).json({ success: false, error: 'حدّد المحل' });
+    if (!(await ownsMarket(req, marketId))) return denied(res);
+
+    const ref = db.collection('restaurants').doc(marketId)
+      .collection('products').doc(String(req.params.id));
+    const snap = await ref.get();
+    meter.addReads(1, 'قراءة صنف قبل العرض');
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'الصنف غير موجود' });
+
+    const cur = snap.data() || {};
+    const units = Array.isArray(cur.units) ? cur.units : [];
+    if (!units.length) return res.status(400).json({ success: false, error: 'الصنف بلا وحدات بيع' });
+
+    const label = String(b.unitLabel || '').trim();
+    /* الإنهاء بعلمٍ صريح. و`offerPrice: null` تُقبل أيضاً لمن يُرسلها
+     * صراحةً (اللوحة أو curl)، لكنّ **غياب** المفتاح ليس إنهاءً — انظر
+     * التعليق أعلاه. */
+    const ending = b.clearOffer === true || b.offerPrice === null;
+    if (!ending && (b.offerPrice === undefined || b.offerPrice === '')) {
+      return res.status(400).json({
+        success: false,
+        error: 'حدّد سعر العرض، أو أرسل clearOffer لإنهائه'
+      });
+    }
+
+    if (label && !units.some(u => u && u.label === label)) {
+      return res.status(400).json({ success: false, error: `لا وحدة اسمها «${label}» في هذا الصنف` });
+    }
+
+    let changed = 0;
+    const next = units.map(u => {
+      if (!u) return u;
+      if (label && u.label !== label) return u;      // بلا label نُعدّل الكلّ
+
+      if (ending) {
+        if (u.offerPrice == null) return u;
+        changed++;
+        const { offerPrice, offerEnds, ...rest } = u;
+        return rest;
+      }
+
+      const price = Number(u.price);
+      const offer = Number(b.offerPrice);
+      if (!Number.isFinite(offer) || offer <= 0 || offer >= price) return u;   // يُبلَّغ عنه أدناه
+
+      changed++;
+      const out = { ...u, offerPrice: r2(offer) };
+      const ends = toDate(b.offerEnds);
+      /* `offerEnds: null` صراحةً تعني «عرضٌ دائم» — نحذف النهاية القديمة.
+       * وغيابُ الحقل أصلاً يعني «لا تمسّ ما هو قائم». الفرق بينهما
+       * مقصود: من يُجدّد سعراً لا يُلغي مدّةً لم يذكرها. */
+      if (b.offerEnds === null) delete out.offerEnds;
+      else if (ends && ends.getTime() > Date.now()) out.offerEnds = ends;
+      else if (b.offerEnds !== undefined) delete out.offerEnds;
+      return out;
+    });
+
+    if (!changed) {
+      return res.status(400).json({
+        success: false,
+        error: ending
+          ? 'لا عرض قائم على هذا الصنف'
+          : 'سعر العرض لازم يكون أقلّ من السعر الأصلي وأكبر من صفر'
+      });
+    }
+
+    await ref.update({ units: next, updatedAt: new Date() });
+    invalidateCatalog(marketId);
+    console.log(`🏷️ ${ending ? 'أُنهي' : 'أُطلق'} عرض: ${cur.nameAr || req.params.id} · ${changed} وحدة · ${marketId}`);
+
+    const nowMs = Date.now();
+    res.json({
+      success: true,
+      ended: ending,
+      changed,
+      product: withLiveOffers({ id: snap.id, ...cur, units: next }, nowMs, true),
+    });
+  } catch (e) {
+    console.error('❌ عرض صنف:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -687,6 +899,8 @@ async function priceMartItems(db, marketId, items) {
   snaps.forEach(s => { if (s.exists) byId.set(s.id, s.data()); });
 
   let total = 0;
+  // وقتٌ واحد لكل السلّة: لا يُعقل أن ينتهي عرضٌ بين صنفين في طلبٍ واحد
+  const nowMs = Date.now();
   const unknown = [], gone = [], badUnit = [];
   for (const it of items) {
     const parsed = splitCartId(it && it.id);
@@ -703,8 +917,9 @@ async function priceMartItems(db, marketId, items) {
     if (!u) { badUnit.push(`${p.nameAr || id} (${wanted || '—'})`); continue; }
 
     const qty = Math.max(1, Math.min(99, parseInt(it.qty, 10) || 1));
-    const price = Number(u.offerPrice) > 0 ? Number(u.offerPrice) : Number(u.price);
-    total += price * qty;
+    /* نفس الدالة التي طوت العرض عند القراءة تُسعّر هنا. لو كتبنا الشرط
+     * مرّتين لاختلفا يوماً — وحينها يرى الزبون سعراً ويُحاسَب بآخر. */
+    total += unitPrice(u, nowMs) * qty;
   }
 
   if (unknown.length) return { error: 'أصناف غير موجودة في المحل: ' + unknown.join('، ') };
