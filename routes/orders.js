@@ -8,7 +8,7 @@ const needsIdentity = (req, res, next) => {
   const fn = req.app.get('requireIdentity');
   return fn ? fn(req, res, next) : next();
 };
-const { cached, invalidate, updateCached } = require('../utils/cache');
+const { cached, peekCached, invalidate, updateCached } = require('../utils/cache');
 const { quoteDelivery } = require('./zones');
 const { notifyRestaurant, notifyDrivers, notifyCustomer, notifyDriverById } = require('./push');
 const { priceMartItems } = require('./mart');
@@ -220,7 +220,7 @@ router.post('/', needsIdentity, async (req, res) => {
            والفحص من الكاش لا من Firestore — بلا قراءة إضافية. */
         let prevAlive = true;
         try {
-          const cachedList = await cached('orders:all', ORDERS_TTL, async () => []);
+          const cachedList = peekCached('orders:all');
           const prev = Array.isArray(cachedList)
             ? cachedList.find(x => String(x.id) === String(seen.id)) : null;
           if (prev && ['DELIVERED', 'CANCELLED'].includes(String(prev.status || ''))) {
@@ -1180,7 +1180,7 @@ function startRestaurantTimeout(app) {
       const db = app.get('db');
       if (!db) return;
       // نقرأ الكاش نفسه الذي يستعمله GET — بلا استعلام جديد
-      const list = await cached('orders:all', ORDERS_TTL, async () => []);
+      const list = peekCached('orders:all');
       if (!Array.isArray(list) || !list.length) return;
       const now = Date.now();
       _nudgedThisTick = false;   // دورة جديدة → يُسمح بنداء واحد
@@ -1355,7 +1355,7 @@ router.get('/:id/candidates', async (req, res) => {
     // موقع المحلّ لحساب المسافة — من الكاش المشترك لا بقراءة جديدة
     let sLat = null, sLng = null;
     try {
-      const rests = await cached('restaurants:raw', 600000, async () => []);
+      const rests = peekCached('restaurants:raw');
       const r = Array.isArray(rests) ? rests.find(x => String(x.id) === String(o.restaurantId)) : null;
       if (r && Number.isFinite(Number(r.lat))) { sLat = Number(r.lat); sLng = Number(r.lng); }
     } catch (e) {}
