@@ -9,7 +9,7 @@ const jwt = require('jsonwebtoken');
 const bcryptjs = require('bcryptjs');
 const Joi = require('joi');
 // كاش مشترك — يحمي حصة Firestore المجانية (٥٠ ألف قراءة/يوم)
-const { cached, invalidate } = require('./utils/cache');
+const { cached, peekCached, invalidate } = require('./utils/cache');
 const meter = require('./utils/meter');
 const fbAuth = require('./utils/firebaseAuth');
 
@@ -1862,7 +1862,7 @@ io.on('connection', (socket) => {
        ولا يكلّف قراءة واحدة: نقرأ من كاش الطلبات الذي يعمل أصلاً.
        ============================================================ */
     try {
-      const list = await cached('orders:all', 1800000, async () => []);
+      const list = peekCached('orders:all');
       if (Array.isArray(list) && list.length) {
         const me = String(su.userId);
         const LIVE = ['DRIVER_ASSIGNED', 'AT_RESTAURANT', 'PICKED_UP', 'ON_THE_WAY'];
