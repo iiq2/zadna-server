@@ -1066,18 +1066,80 @@ const READY_RENUDGE_MS = Number(process.env.READY_RENUDGE_MIN || 10) * 60000;
 
 const _readySeen = new Map();   // معرّف الطلب → { stage, lastNudge }
 
+/* ============================================================
+   نداء واحد لكل دورة مهما كثرت الطلبات العالقة — تصحيحُ خطأٍ لي.
+
+   بنيتُ النداء المتجدّد لكل طلب على حدة، ولم أُقيّده على مستوى
+   الدورة. فبطلبين عالقين يُنادى المناديب **مرّتين في نفس الثانية**،
+   وبثلاثة ثلاثاً — كلها بنفس النصّ تقريباً.
+
+   وظهر أثره فوراً: السجلّ يُظهر `alert → أُرسل 2` ثلاث مرات متتالية،
+   أي أن كل مندوب تلقّى ثلاثة إنذارات متطابقة. ومن يُقصف هكذا يُطفئ
+   إشعارات زادنا — فنخسر إنذار الطلب الحقيقي حين يأتي.
+
+   والصواب: نداء واحد في كل دورة مكنسة مهما كان عدد المعلّقين — يكفي
+   أن يفتح المندوب تطبيقه ليرى الجميع. */
+let _nudgedThisTick = false;
+
+/* ============================================================
+   الطلب المهجور — بعد اثنتي عشرة ساعة لم يعد طلباً.
+
+   قرارك «لا إلغاء آلياً» صحيح ومحفوظ: طلبٌ عمره ساعة قد يلتقطه
+   مندوب، وروبوتٌ يلغيه يُخسر شريكاً مالاً.
+
+   لكن طلباً عمره **ثلاث عشرة ساعة** ليس معلّقاً — هو مهجور. وجوده
+   ضررٌ خالص: المكنسة تنادي المناديب من أجله كل دورة، فيُقصفون
+   بإنذارات لطلبٍ من الأمس، ويظنّ صاحب المنصّة أن التوزيع معطّل.
+   وهذا ما حدث حرفياً بالطلبين 862307 و647921.
+
+   والزبون؟ نام وصحا ولم يأته شيء. أن نقول له «اعتذارنا» بعد نصف
+   يوم أصدق من أن نتركه ينتظر أبداً.
+
+   اثنتا عشرة ساعة حدٌّ لا يمسّ قرارك: لا طلب حقيقي ينتظرها.
+   ZADNA_ABANDON_HOURS=0 يُعطّله كلياً.
+   ============================================================ */
+const ABANDON_MS = Number(process.env.ZADNA_ABANDON_HOURS || 12) * 3600 * 1000;
+
 async function sweepReadyUnclaimed(app, db, o) {
   const id = String(o.id);
   const created = orderCreatedMs(o);
   if (!created) return;                    // تاريخ لا نفهمه = لا حكم عليه
   const age = Date.now() - created;
+
+  if (ABANDON_MS > 0 && age >= ABANDON_MS) {
+    _readySeen.delete(id);
+    try {
+      await db.collection('orders').doc(id).update({
+        status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
+        cancelledBy: 'system', cancelReason: 'مهجور — لم يلتقطه مندوب خلال ١٢ ساعة',
+        cancelledAt: new Date(),
+      });
+      updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED' } : x)));
+      const io = app.get('socketio');
+      if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
+      notifyCustomer(app, o.customerPhone, {
+        title: 'اعتذارنا — أُلغي طلبك',
+        body: 'لم نستطع توصيله. لم يُخصم منك شيء — نأسف على الانتظار',
+        channel: 'update', data: { orderId: id, type: 'status', status: 'CANCELLED' },
+      }).catch(() => {});
+      console.warn(`🧹 أُلغي طلب مهجور ${id} — عمره ${Math.round(age / 3600000)} ساعة`);
+    } catch (e) {
+      console.warn('⚠️ تعذّر إلغاء طلب مهجور:', id, e.message);
+    }
+    return;
+  }
   const st = _readySeen.get(id) || { stage: 0, lastNudge: 0 };
 
-  const nudgeDrivers = () => notifyDrivers(app, {
-    title: 'طلب ما زال بانتظار مندوب 📦',
-    body: `${o.restaurant || 'محلّ'} — ${o.grandTotal || o.totalAmount || 0} ₪`,
-    data: { orderId: id, type: 'new_ready_order' },
-  }).catch(() => {});
+  /* حارس الدورة: أول طلب معلّق ينادي، والبقية تكتفي بتسجيل مرحلتها. */
+  const nudgeDrivers = () => {
+    if (_nudgedThisTick) return;
+    _nudgedThisTick = true;
+    return notifyDrivers(app, {
+      title: 'طلب ما زال بانتظار مندوب 📦',
+      body: `${o.restaurant || 'محلّ'} — ${o.grandTotal || o.totalAmount || 0} ₪`,
+      data: { orderId: id, type: 'new_ready_order' },
+    }).catch(() => {});
+  };
 
   if (age >= READY_ALERT_MS && st.stage < 2) {
     _readySeen.set(id, { stage: 2, lastNudge: Date.now() });
@@ -1114,6 +1176,7 @@ function startRestaurantTimeout(app) {
       const list = await cached('orders:all', ORDERS_TTL, async () => []);
       if (!Array.isArray(list) || !list.length) return;
       const now = Date.now();
+      _nudgedThisTick = false;   // دورة جديدة → يُسمح بنداء واحد
 
       for (const o of list) {
         const st = String(o.status || '');
