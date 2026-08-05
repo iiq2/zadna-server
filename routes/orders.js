@@ -640,10 +640,27 @@ router.get('/', needsIdentity, async (req, res) => {
              * بالرقم مُطبَّعاً. `samePhone` هي نفسها التي يستعملها الدخول. */
             const samePhone = req.app.get('samePhone') || ((a, b) => String(a).trim() === String(b).trim());
             const want = String(customerPhone).trim();
-            filtered = filtered.filter(o =>
-                (myUserId && o.customerId && String(o.customerId) === myUserId)
-                || samePhone(o.customerPhone, want)
-            );
+            /* ===== المعرّف يحكم، والرقم احتياطٌ لا شريك =====
+             *
+             * كانت `||`: يُقبل الطلب إن طابق المعرّف **أو** الرقم. وهذا
+             * يعني أنّ حسابين يحملان رقماً واحداً يريان طلبات بعضهما.
+             *
+             * ورآها يزن بعينه: طلبَ بحساب، ثم خرج ودخل بحساب آخر —
+             * فانتقل الطلب إليه. والسيرفر لم يُخطئ في التنفيذ، أخطأ في
+             * القاعدة: جعل الرقم دليلَ ملكية، والرقم يتكرّر.
+             *
+             * وهذا تسريب لا مجرّد إرباك: اسم الزبون وعنوان بيته ورقمه
+             * يظهر لصاحب أي حساب يشاركه الرقم.
+             *
+             * القاعدة الصحيحة: الطلب الذي **يحمل معرّف صاحبه** يُحكم به
+             * وحده، ولا يُسأل الرقم أصلاً. والرقم لا يُستعمل إلا للطلبات
+             * القديمة التي أُنشئت قبل أن نكتب `customerId` — وهي وحدها
+             * التي لا سبيل آخر لنسبتها. */
+            filtered = filtered.filter(o => {
+                const oid = o.customerId ? String(o.customerId) : '';
+                if (oid) return !!myUserId && oid === myUserId;
+                return samePhone(o.customerPhone, want);
+            });
         }
         if (driverId) {
             // كان أي مندوب يرى طلبات كل المناديب ويستطيع تعليمها "تم التوصيل"
@@ -921,8 +938,12 @@ router.post('/:id/cancel', needsIdentity, async (req, res) => {
       const myId = String((me && me.id) || (req.user && req.user.userId) || '');
       const myType = String((me && me.userType) || '');
       const isManager = myType === 'manager' || myType === 'admin';
-      const mine = (o.customerId && String(o.customerId) === myId)
-        || samePhone(o.customerPhone, me && me.phone);
+      /* نفس قاعدة الفلتر: المعرّف يحكم وحده إن وُجد.
+       * وهنا أخطر — من يشاركك الرقم كان يستطيع **إلغاء طلبك**. */
+      const oid = o.customerId ? String(o.customerId) : '';
+      const mine = oid
+        ? (!!myId && oid === myId)
+        : samePhone(o.customerPhone, me && me.phone);
       if (!mine && !isManager) {
         return res.status(403).json({ success: false, error: 'هذا ليس طلبك' });
       }
