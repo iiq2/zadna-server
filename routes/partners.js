@@ -620,4 +620,260 @@ router.get('/registered_partners/duplicates', adminOnly, async (req, res) => {
   }
 });
 
+/* ============================================================
+   حذف حسابٍ مكرَّر — مسارانِ لا مسار واحد
+
+   الحذف لا رجعة فيه، فلا يجوز أن تكون نقرةٌ واحدة كافية. ففصلناه
+   خطوتين:
+
+     ١ · GET  …/deletable  → «ماذا سيضيع لو حذفتُه؟» — يقرأ ولا يكتب
+     ٢ · POST …/delete     → التنفيذ، ولا يقبل إلا بتأكيدٍ مكتوب
+
+   والحراسات ليست تجميلاً. كلٌّ منها وُضع لأنّ غيابه يُتلف شيئاً:
+
+   • **الرقم يجب أن يكون مكرَّراً فعلاً.** هذا أهمّ حارس على الإطلاق:
+     يجعل حذف حسابٍ وحيدٍ بالخطأ مستحيلاً لا مستبعَداً. اخترتَ نطاق
+     «المكرَّرة فقط» — فأجعله شرطاً في السيرفر، لا مجرّد إخفاءِ زرٍّ في
+     اللوحة. من يُخفي زرّاً يحمي نفسه من نقرة؛ ومن يشترط في السيرفر
+     يحمي نفسه من كل نداءٍ مهما جاء.
+
+   • **لا يُحذف آخرُ حسابٍ في المجموعة.** لو حُذفت الأربعةُ واحداً بعد
+     واحد، لصار الأخيرُ حين يُحذف غيرَ مكرَّرٍ فيرفضه الحارس الأول —
+     لكن نُصرّح بالقاعدة كي لا تعتمد على أثرٍ جانبي.
+
+   • **الطلبات النشطة تمنع الحذف منعاً باتّاً.** حسابٌ عليه طلبٌ في
+     الطريق: زبونٌ ينتظر، أو مندوبٌ يحمل كيساً. حذفُه يترك طلباً بلا
+     صاحبٍ في قاعدة البيانات ولا سبيل لإصلاحه.
+
+   • **المحلّ والكاش يُحذّران ولا يمنعان** — كما طلبتَ. لكن التحذير
+     يُعرض قبل الضغط لا بعده، ويُطلب معه تأكيدٌ مكتوب.
+
+   ولا نحذف وثيقة المستخدم فحسب: نُطفئ رموز الإشعارات أولاً، وإلا بقي
+   رمزُ FCM حيّاً في مجموعةٍ أخرى فوصل إشعارٌ لحسابٍ لم يعد موجوداً —
+   وهي بعينها العلّة التي طاردناها اليوم كلّه.
+   ============================================================ */
+
+/** يجمع كل ما يلزم لقرار الحذف. يُنادى من المسارين — القراءة والتنفيذ
+ *  ترى الحقائق نفسها، فلا يُعرض عليك تحذيرٌ ثم يُحذف على أساسٍ آخر. */
+async function inspectAccount(db, id) {
+  const { normPhone } = require('../utils/phone');
+
+  const doc = await db.collection('users').doc(String(id)).get();
+  meter.addReads(1, 'فحص حساب قبل الحذف');
+  if (!doc.exists) return { ok: false, error: 'هذا الحساب غير موجود — لعلّه حُذف سابقاً' };
+
+  const u = doc.data() || {};
+  const raw = String(u.phone || '').trim();
+  if (!raw) {
+    return { ok: false, error: 'حسابٌ بلا رقم — لا يمكن إثبات أنه مكرَّر، فلا يُحذف من هنا' };
+  }
+  const key = normPhone(raw) || raw;
+
+  /* نقرأ كل المستخدمين لا نُصفّي بالرقم: الأرقام مخزَّنة بصيغٍ مختلفة
+   * (+970 و05 و00970)، واستعلامُ المساواة يفوّت التكرار الذي جئنا
+   * لأجله. والمجموعة عشراتٌ لا آلاف. */
+  const snap = await db.collection('users').get();
+  meter.addReads(snap.size, 'إثبات التكرار قبل الحذف');
+
+  const siblings = [];
+  snap.forEach(d => {
+    const x = d.data() || {};
+    const p = String(x.phone || '').trim();
+    if (!p) return;
+    if ((normPhone(p) || p) !== key) return;
+    siblings.push({
+      id: d.id,
+      name: String(x.name || '—'),
+      devices: Array.isArray(x.fcmDevices) ? x.fcmDevices.length : 0,
+      ownsShop: String(x.ownedRestaurantId || ''),
+      cashOnHand: Number(x.cashOnHand || 0),
+    });
+  });
+
+  return {
+    ok: true,
+    id: doc.id,
+    phone: key,
+    name: String(u.name || '—'),
+    email: String(u.email || ''),
+    userType: String(u.userType || 'customer'),
+    ownsShop: String(u.ownedRestaurantId || ''),
+    cashOnHand: Number(u.cashOnHand || 0),
+    devices: Array.isArray(u.fcmDevices) ? u.fcmDevices.length : 0,
+    siblings,
+    duplicateCount: siblings.length,
+  };
+}
+
+/** الطلبات الحيّة التي تخصّ هذا الحساب — زبوناً كان أو مندوباً. */
+const LIVE_STATUSES = [
+  'PENDING_RESTAURANT', 'ACCEPTED', 'PREPARING', 'READY_FOR_PICKUP',
+  'DRIVER_ASSIGNED', 'AT_RESTAURANT', 'PICKED_UP', 'ON_THE_WAY'
+];
+
+async function liveOrdersOf(db, id) {
+  const uid = String(id);
+
+  /* استعلامٌ واحد على `status` ثم فلترةٌ في الذاكرة — لا استعلامانِ
+   * مركّبان. سببان، كلاهما يُفشل النسخة المركّبة في الإنتاج:
+   *
+   * ١ · `where(customerId).where(status,'in',…)` يطلب فهرساً مركّباً في
+   *     Firestore. غيابه لا يُرجع صفراً — يرمي خطأً. فيصير الحذف
+   *     مستحيلاً، أو أسوأ: نبتلع الخطأ فنظنّ الحساب نظيفاً.
+   *
+   * ٢ · المندوب مخزَّن بصيغتين: `driverId` أحياناً و`driver.id` أحياناً.
+   *     استعلامُ `driverId` وحده يفوّت الطلبات التي تحمل الأخرى —
+   *     فنحذف مندوباً يحمل كيساً في الطريق. والطلبات النشطة عشراتٌ
+   *     لا آلاف، ففلترتها في الذاكرة أرخص من الخطأ. */
+  const snap = await db.collection('orders').where('status', 'in', LIVE_STATUSES).get();
+  meter.addReads(snap.size || 1, 'طلبات نشطة قبل الحذف');
+
+  const out = [];
+  snap.forEach(d => {
+    const o = d.data() || {};
+    const drv = String((o.driver && o.driver.id) || o.driverId || '');
+    const cus = String(o.customerId || '');
+    const role = cus === uid ? 'زبون' : (drv === uid ? 'مندوب' : null);
+    if (!role) return;
+    out.push({
+      id: d.id, role,
+      status: String(o.status || ''),
+      statusAr: String(o.statusAr || ''),
+    });
+  });
+  return out;
+}
+
+// GET /api/registered_partners/:id/deletable — ماذا سيضيع؟ (يقرأ ولا يكتب)
+router.get('/registered_partners/:id/deletable', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'قاعدة البيانات غير متصلة' });
+
+    const info = await inspectAccount(db, req.params.id);
+    if (!info.ok) return res.status(404).json({ success: false, error: info.error });
+
+    const blockers = [];
+    const warnings = [];
+
+    if (info.duplicateCount < 2) {
+      blockers.push('هذا الحساب ليس مكرَّراً — لا حساب آخر يحمل رقمه. الحذف من اللوحة للمكرَّر وحده.');
+    }
+
+    const live = await liveOrdersOf(db, info.id);
+    if (live.length) {
+      blockers.push(
+        `عليه ${live.length} ${live.length === 1 ? 'طلب نشط' : 'طلبات نشطة'}: ` +
+        live.slice(0, 5).map(o => `#${o.id} (${o.role})`).join('، ') +
+        ' — أنهِها أو ألغِها أولاً'
+      );
+    }
+
+    if (info.ownsShop) {
+      warnings.push(`يملك المحلّ ${info.ownsShop} — بحذفه يفقد المحلّ مالكه، ولن يستطيع أحد دخول لوحته`);
+    }
+    if (info.cashOnHand > 0) {
+      warnings.push(`معه ${Math.round(info.cashOnHand)} ₪ كاش غير مسوّى — يضيع أثر الدين بحذفه`);
+    }
+    if (info.devices > 0) {
+      warnings.push(`عليه ${info.devices} ${info.devices === 1 ? 'جهاز مسجَّل' : 'أجهزة مسجَّلة'} — قد يكون هذا حسابه المستعمَل فعلاً`);
+    }
+
+    res.json({
+      success: true,
+      account: {
+        id: info.id, name: info.name, email: info.email, phone: info.phone,
+        userType: info.userType, devices: info.devices,
+        ownsShop: info.ownsShop, cashOnHand: info.cashOnHand,
+      },
+      duplicateCount: info.duplicateCount,
+      siblings: info.siblings.filter(s => s.id !== info.id),
+      liveOrders: live,
+      blockers,
+      warnings,
+      canDelete: blockers.length === 0,
+      // آخر أربعة من المعرّف — ما يُطلب كتابته للتأكيد
+      confirmHint: info.id.slice(-4),
+    });
+  } catch (e) {
+    console.error('❌ فحص القابلية للحذف:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/registered_partners/:id/delete — التنفيذ
+router.post('/registered_partners/:id/delete', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'قاعدة البيانات غير متصلة' });
+
+    const id = String(req.params.id);
+    const confirm = String((req.body || {}).confirm || '').trim();
+
+    const info = await inspectAccount(db, id);
+    if (!info.ok) return res.status(404).json({ success: false, error: info.error });
+
+    /* التأكيد يُفحص أولاً: أرخص الفحوص، وأكثرها دلالةً على أن النداء
+     * جاء من إنسانٍ قرأ ما أمامه لا من نصٍّ يدور في حلقة. */
+    if (confirm !== id.slice(-4)) {
+      return res.status(400).json({
+        success: false,
+        error: `للتأكيد اكتب آخر أربعة أحرف من معرّف الحساب (${id.slice(-4)})`
+      });
+    }
+
+    if (info.duplicateCount < 2) {
+      return res.status(409).json({
+        success: false,
+        error: 'هذا الحساب ليس مكرَّراً — لا حساب آخر يحمل رقمه. الحذف من اللوحة للمكرَّر وحده.'
+      });
+    }
+
+    const live = await liveOrdersOf(db, id);
+    if (live.length) {
+      return res.status(409).json({
+        success: false,
+        error: `عليه ${live.length} طلباً نشطاً (${live.slice(0, 3).map(o => '#' + o.id).join('، ')}) — أنهِها أو ألغِها قبل الحذف`
+      });
+    }
+
+    /* أوّلاً نُطفئ أجهزته. لو حذفنا الوثيقة ثم فشل تنظيف الرموز، لبقي
+     * رمزُ FCM حيّاً يستقبل إشعاراتٍ لحسابٍ لا وجود له — وهي العلّة
+     * التي كلّفتنا يوماً. الترتيب هنا ليس ذوقاً. */
+    const ref = db.collection('users').doc(id);
+    try {
+      await ref.update({ fcmDevices: [], fcmToken: null, worksAsDriver: false, onShift: false });
+    } catch (e) {
+      return res.status(500).json({ success: false, error: 'تعذّر إطفاء أجهزة الحساب — لم يُحذف شيء. أعد المحاولة' });
+    }
+
+    /* أرشيفٌ قبل المحو. الحذف لا رجعة فيه — لكن الأثر يبقى، فإن
+     * تبيّن غداً أن الحساب كان هو الصحيح عرفنا ماذا كان فيه. */
+    const snapshot = (await ref.get()).data() || {};
+    await db.collection('deleted_users').doc(id).set({
+      ...snapshot,
+      deletedAt: new Date(),
+      deletedReason: 'حساب مكرَّر — حُذف من لوحة الإدارة',
+      keptSiblings: info.siblings.filter(s => s.id !== id).map(s => s.id),
+    });
+
+    await ref.delete();
+
+    invalidate('partners:all');
+    console.log(`🗑️ حُذف حساب مكرَّر: ${info.name} [${id}] · رقم ${info.phone} · بقي ${info.duplicateCount - 1}`);
+
+    res.json({
+      success: true,
+      deleted: id,
+      name: info.name,
+      remaining: info.duplicateCount - 1,
+      archived: true,
+      message: `حُذف حساب ${info.name}. نسخته محفوظة في deleted_users إن احتجتها.`
+    });
+  } catch (e) {
+    console.error('❌ حذف حساب مكرَّر:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 module.exports = router;
