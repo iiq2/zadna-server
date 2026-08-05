@@ -523,4 +523,101 @@ router.get('/top_driver', async (req, res) => {
   }
 });
 
+/* ============================================================
+   GET /api/registered_partners/duplicates — الحسابات المكرَّرة برقمٍ واحد
+
+   لماذا هذا المسار موجود:
+
+   حارسُ التسجيل يمنع التكرار **القادم** ولا يمسّ القائم. وما هو قائمٌ
+   الآن كلّفنا يوماً كاملاً من التشخيص: إشعارٌ يذهب لحسابٍ بلا جهاز،
+   ومندوبٌ يُبحث عنه فيُوجَد غيره، وطلبٌ «ينتقل» بين حسابين لصاحبٍ واحد.
+
+   والحذف قرارٌ لا يُتّخذ بالتخمين: حسابٌ يبدو مكرَّراً قد يملك محلّاً
+   (`ownedRestaurantId`) — وحذفه يقطع المحلّ عن مالكه. وقد كِدنا نقع
+   فيها: فتحنا حساباً ظننّاه فارغاً فإذا هو صاحب ماركت.
+
+   فهذا المسار **يكشف ولا يحذف**. يُرجع لكل رقمٍ مكرَّر حساباتِه وما
+   يميّز كلاً منها: أيّها عليه جهاز، أيّها يملك محلّاً، أيّها على
+   دوامه، وأيّها أقدم. فتُقرّر بعلمٍ لا بحدس — والضغطة تبقى بيدك.
+
+   الكلفة: قراءةُ مجموعة المستخدمين مرّة، وهي عشراتٌ لا آلاف، ويُنادى
+   عند الطلب لا دورياً.
+   ============================================================ */
+router.get('/registered_partners/duplicates', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.json({ groups: [], total: 0 });
+
+    const { normPhone } = require('../utils/phone');
+
+    const snap = await db.collection('users').get();
+    meter.addReads(snap.size, 'كشف الحسابات المكرَّرة');
+
+    const byPhone = new Map();
+    snap.forEach(d => {
+      const u = d.data() || {};
+      const raw = String(u.phone || '').trim();
+      if (!raw) return;                       // بلا رقم لا يُقارَن
+      const key = normPhone(raw) || raw;
+
+      const devs = Array.isArray(u.fcmDevices) ? u.fcmDevices : [];
+      const apps = [...new Set(devs.map(x => x && x.app).filter(Boolean))];
+
+      const row = {
+        id: d.id,
+        name: String(u.name || '—'),
+        email: String(u.email || ''),
+        userType: String(u.userType || 'customer'),
+        status: String(u.status || 'approved'),
+        worksAsDriver: u.worksAsDriver === true,
+        onShift: u.onShift !== false,
+        devices: devs.length,
+        deviceApps: apps,                     // ['captain','customer'] …
+        ownsShop: String(u.ownedRestaurantId || ''),
+        cashOnHand: Number(u.cashOnHand || 0),
+        createdAt: u.createdAt && u.createdAt.toDate
+          ? u.createdAt.toDate().toISOString()
+          : (u.createdAt || null),
+      };
+      if (!byPhone.has(key)) byPhone.set(key, []);
+      byPhone.get(key).push(row);
+    });
+
+    const groups = [];
+    byPhone.forEach((rows, phone) => {
+      if (rows.length < 2) return;            // لا تكرار
+      /* ترتيبٌ يقود القرار: صاحبُ الجهاز أولاً، ثم مالكُ محلّ، ثم الأقدم.
+       * فأوّلُ الصفّ هو المرشَّح للإبقاء غالباً — ونقولها صراحةً لا تلميحاً. */
+      rows.sort((a, b) =>
+        (b.devices - a.devices) ||
+        ((b.ownsShop ? 1 : 0) - (a.ownsShop ? 1 : 0)) ||
+        String(a.createdAt || '').localeCompare(String(b.createdAt || ''))
+      );
+      const keep = rows[0];
+      groups.push({
+        phone,
+        count: rows.length,
+        suggestKeep: keep.id,
+        /* تحذيرٌ صريح: لا يُحذف حسابٌ يملك محلّاً أو يحمل كاشاً غير مسوّى. */
+        warnings: rows.filter(r => r.id !== keep.id && (r.ownsShop || r.cashOnHand > 0))
+          .map(r => ({
+            id: r.id,
+            why: [
+              r.ownsShop ? `يملك المحلّ ${r.ownsShop}` : null,
+              r.cashOnHand > 0 ? `معه ${Math.round(r.cashOnHand)} ₪ غير مسوّاة` : null,
+            ].filter(Boolean).join(' · ')
+          })),
+        accounts: rows,
+      });
+    });
+
+    groups.sort((a, b) => b.count - a.count);
+    console.log(`🔎 كشف المكرَّر: ${groups.length} رقماً مكرَّراً من ${snap.size} حساباً`);
+    res.json({ groups, total: groups.length, scanned: snap.size });
+  } catch (e) {
+    console.error('❌ كشف الحسابات المكرَّرة:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 module.exports = router;
