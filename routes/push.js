@@ -709,7 +709,32 @@ async function notifyManagers(app, { title, body, data = {} }) {
   }
 }
 
+/* ============================================================
+   إشعار مندوبٍ بعينه — لا كل المناديب.
+
+   `notifyDrivers` تبثّ للجميع، وهي الصواب للطلب المتاح. لكن الإسناد
+   والسحب شأنٌ بين الإدارة ومندوبٍ واحد: من أُسند إليه طلب يجب أن
+   يعلم، ومن سُحب منه أوجب — وإلا بحث عن طلبٍ اختفى من شاشته وظنّ
+   التطبيق معطوباً.
+
+   والقناة قابلة للاختيار: الإسناد يستحق نغمة الكابتن (`alert`) لأنه
+   عملٌ عليه أن يبدأه الآن، والسحب يكفيه `update` — خبرٌ لا أمر.
+   ============================================================ */
+async function notifyDriverById(app, driverKey, { title, body, channel = 'update', data = {} }) {
+  const db = app.get('db');
+  if (!db || !driverKey) return;
+  try {
+    const tokens = await tokensOf(db, [String(driverKey)], 'captain');
+    if (!tokens.length) {
+      console.log(`📭 ${channel} → لا جهاز للمندوب ${driverKey} · «${title}»`);
+      return;
+    }
+    return await push(db, tokens, { title, body, channel, data });
+  } catch (e) { console.warn('⚠️ إشعار مندوب بعينه:', e.message); }
+}
+
 module.exports = router;
+module.exports.notifyDriverById = notifyDriverById;
 module.exports.notifyManagers = notifyManagers;
 module.exports.notifyRestaurant = notifyRestaurant;
 module.exports.notifyDrivers = notifyDrivers;

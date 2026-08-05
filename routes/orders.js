@@ -10,7 +10,7 @@ const needsIdentity = (req, res, next) => {
 };
 const { cached, invalidate, updateCached } = require('../utils/cache');
 const { quoteDelivery } = require('./zones');
-const { notifyRestaurant, notifyDrivers, notifyCustomer } = require('./push');
+const { notifyRestaurant, notifyDrivers, notifyCustomer, notifyDriverById } = require('./push');
 const { priceMartItems } = require('./mart');
 const meter = require('../utils/meter');
 /* المصدر الوحيد لكل رقم مالي. التطبيقات الثلاثة واللوحة تعرض ما يأتي
@@ -1308,6 +1308,178 @@ router.post('/:id/reject_by_shop', needsIdentity, async (req, res) => {
     console.log(`🚫 رفض المحلّ ${o.restaurantId} الطلب ${id} — السبب: ${code}`);
     res.json({ success: true, reason: code });
   } catch (e) { fail(req, res, e, 'رفض المحلّ'); }
+});
+
+/* ============================================================
+   إسناد الطلب وسحبه — يد الإدارة على التوزيع.
+
+   لماذا وُجد: التوزيع آليّ (بثّ للجميع، الأقرب يُنبَّه أولاً) وهو
+   يعمل في الحالة العادية. لكن الواقع فيه ما لا تحسبه خوارزمية:
+   مندوبٌ تعطّلت درّاجته وطلبُه في يده، وزبونٌ يتّصل مستعجلاً، وطلبٌ
+   لا يلتقطه أحد وأنت تعرف من يستطيع.
+
+   وقبل هذا لم يكن أمامك إلا الإلغاء — وهو أسوأ ما يمكن: خسارة طلبٍ
+   لأن أداةً بسيطة غير موجودة.
+
+   ثلاثة أفعال:
+     · assign  — أسند لمندوب بعينه (المعلّق أو المُسنَد لغيره)
+     · unassign — اسحب من المندوب وأعده متاحاً للجميع
+     · candidates — من المتاح الآن ومسافته من المحلّ، لتقرّر برقم
+
+   والإسناد لا يقفز فوق الحقائق: المندوب المجمَّد أو خارج الدوام أو
+   فوق سقف الكاش يُرفض بسبب مكتوب — لا نُسند طلباً لمن لا يستطيع.
+   ============================================================ */
+
+const ADMIN_ASSIGNABLE = ['PENDING_RESTAURANT', 'ACCEPTED', 'PREPARING', 'READY_FOR_PICKUP',
+                          'DRIVER_ASSIGNED', 'AT_RESTAURANT', 'PICKED_UP', 'ON_THE_WAY'];
+
+/** GET /api/orders/:id/candidates — المناديب المتاحون ومسافاتهم من المحلّ. */
+router.get('/:id/candidates', async (req, res) => {
+  try {
+    if (!req.isAdmin) return res.status(403).json({ success: false, error: 'للإدارة فقط' });
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+
+    const oSnap = await db.collection('orders').doc(String(req.params.id)).get();
+    meter.addReads(1, 'مرشّحو الإسناد');
+    if (!oSnap.exists) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+    const o = oSnap.data() || {};
+
+    // موقع المحلّ لحساب المسافة — من الكاش المشترك لا بقراءة جديدة
+    let sLat = null, sLng = null;
+    try {
+      const rests = await cached('restaurants:raw', 600000, async () => []);
+      const r = Array.isArray(rests) ? rests.find(x => String(x.id) === String(o.restaurantId)) : null;
+      if (r && Number.isFinite(Number(r.lat))) { sLat = Number(r.lat); sLng = Number(r.lng); }
+    } catch (e) {}
+
+    const snap = await db.collection('users').where('userType', '==', 'driver').get();
+    meter.addReads(snap.size, 'مرشّحو الإسناد');
+    const locs = req.app.get('lastDriverLocation') || new Map();
+    const cap = Number(process.env.ZADNA_CASH_CAP || 800);
+
+    const out = [];
+    snap.forEach(d => {
+      const u = d.data() || {};
+      const st = String(u.status || 'approved');
+      const l = locs.get(String(d.id));
+      let km = null;
+      if (l && sLat != null) {
+        const R = 6371, rad = x => x * Math.PI / 180;
+        const dLat = rad(l.lat - sLat), dLng = rad(l.lng - sLng);
+        const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(sLat)) * Math.cos(rad(l.lat)) * Math.sin(dLng / 2) ** 2;
+        km = Math.round(2 * R * Math.asin(Math.sqrt(h)) * 1.35 * 10) / 10;
+      }
+      /* نُرجع الجميع مع سبب المنع — لا نُخفي مندوباً ونترك السؤال
+       * «وين فلان؟» بلا جواب. */
+      const blocked = st !== 'approved' ? `الحساب ${st}`
+        : u.onShift === false ? 'خارج الدوام'
+        : (cap > 0 && Number(u.cashOnHand || 0) >= cap) ? `كاشه ${Math.round(u.cashOnHand)} ₪ (فوق السقف)`
+        : null;
+      out.push({
+        id: d.id, name: u.name || d.id, phone: u.phone || '',
+        km, online: !!l, cashOnHand: Number(u.cashOnHand || 0), blocked,
+      });
+    });
+
+    // المتاح أولاً، ثم الأقرب
+    out.sort((a, b) => (!!a.blocked - !!b.blocked) || ((a.km ?? 999) - (b.km ?? 999)));
+    res.json({ success: true, orderId: String(req.params.id), shopHasLocation: sLat != null, drivers: out });
+  } catch (e) { fail(req, res, e, 'مرشّحو الإسناد'); }
+});
+
+/** POST /api/orders/:id/assign  { driverId }  — أو {} للسحب. */
+router.post('/:id/assign', async (req, res) => {
+  try {
+    if (!req.isAdmin) return res.status(403).json({ success: false, error: 'للإدارة فقط' });
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'Database not connected' });
+
+    const id = String(req.params.id);
+    const ref = db.collection('orders').doc(id);
+    const snap = await ref.get();
+    meter.addReads(1, 'إسناد طلب');
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+    const o = snap.data() || {};
+
+    const st = String(o.status || '');
+    if (!ADMIN_ASSIGNABLE.includes(st)) {
+      return res.status(409).json({
+        success: false,
+        error: st === 'DELIVERED' ? 'الطلب سُلّم — لا يُسند' : 'الطلب ملغى — لا يُسند',
+      });
+    }
+
+    const driverId = String((req.body && req.body.driverId) || '').trim();
+
+    /* ===== السحب: يعود متاحاً للجميع ===== */
+    if (!driverId) {
+      const prevKey = (o.driver && typeof o.driver === 'object')
+        ? String(o.driver.id || o.driver.phone || '') : String(o.driverId || '');
+      await ref.update({
+        driver: null, driverId: null,
+        status: 'READY_FOR_PICKUP', statusAr: STATUS_AR.READY_FOR_PICKUP,
+        unassignedAt: new Date(), unassignedBy: 'admin',
+      });
+      updateCached('orders:all', l => l.map(x => (String(x.id) === id
+        ? { ...x, driver: null, driverId: null, status: 'READY_FOR_PICKUP' } : x)));
+      const io = req.app.get('socketio');
+      if (io) io.emit('order_updated', { orderId: id, status: 'READY_FOR_PICKUP', timestamp: new Date() });
+
+      // المندوب السابق يُخبَر — لا يبحث عن طلبٍ اختفى من شاشته
+      if (prevKey) {
+        notifyDriverById(req.app, prevKey, {
+          title: 'سُحب الطلب منك',
+          body: 'الإدارة أعادت توزيعه. لا شيء عليك — تابع طلباتك الأخرى.',
+          data: { orderId: id, type: 'unassigned' },
+        }).catch(() => {});
+      }
+      notifyDrivers(req.app, {
+        title: 'طلب متاح الآن 📦',
+        body: `${o.restaurant || 'محلّ'} — ${o.grandTotal || o.totalAmount || 0} ₪`,
+        data: { orderId: id, type: 'new_ready_order' },
+      }).catch(() => {});
+
+      console.log(`↩️ سُحب الطلب ${id} من ${prevKey || '—'} وأُعيد متاحاً`);
+      return res.json({ success: true, unassigned: true, previousDriver: prevKey || null });
+    }
+
+    /* ===== الإسناد لمندوب بعينه ===== */
+    const uSnap = await db.collection('users').doc(driverId).get();
+    meter.addReads(1, 'إسناد طلب');
+    if (!uSnap.exists) return res.status(404).json({ success: false, error: 'المندوب غير موجود' });
+    const u = uSnap.data() || {};
+    if (String(u.userType || '') !== 'driver') {
+      return res.status(400).json({ success: false, error: 'هذا الحساب ليس مندوباً' });
+    }
+    const uSt = String(u.status || 'approved');
+    if (uSt !== 'approved') {
+      return res.status(409).json({ success: false, error: `لا يمكن الإسناد — حساب المندوب ${uSt}` });
+    }
+
+    const driver = { id: driverId, name: u.name || '', phone: u.phone || '' };
+    await ref.update({
+      driver, driverId,
+      status: 'DRIVER_ASSIGNED', statusAr: STATUS_AR.DRIVER_ASSIGNED,
+      assignedBy: 'admin', assignedAt: new Date(),
+    });
+    updateCached('orders:all', l => l.map(x => (String(x.id) === id
+      ? { ...x, driver, driverId, status: 'DRIVER_ASSIGNED' } : x)));
+    const io2 = req.app.get('socketio');
+    if (io2) io2.emit('order_updated', { orderId: id, status: 'DRIVER_ASSIGNED', timestamp: new Date() });
+
+    /* إشعارٌ خاصّ به بقناة الإنذار — هذا ليس عرضاً يختار قبوله،
+     * هو إسنادٌ من الإدارة، فيستحق نغمة الكابتن لا همسة تحديث. */
+    notifyDriverById(req.app, driverId, {
+      title: '📌 أُسند إليك طلب',
+      body: `${o.restaurant || 'محلّ'} — ${o.grandTotal || o.totalAmount || 0} ₪ · من الإدارة`,
+      channel: 'alert',
+      data: { orderId: id, type: 'assigned' },
+    }).catch(() => {});
+
+    console.log(`📌 أُسند الطلب ${id} إلى ${driver.name || driverId} بقرار الإدارة`);
+    res.json({ success: true, assigned: driver });
+  } catch (e) { fail(req, res, e, 'إسناد طلب'); }
 });
 
 module.exports = router;
