@@ -1476,6 +1476,11 @@ app.post('/api/driver_chats', requireIdentity, async (req, res) => {
             || orderId === 'manager_monitor'
             || orderId.startsWith('admin_driver_');
           const targetRoom = isGlobal ? orderId : `order_room_${orderId}`;
+          /* والتطبيق قد يكون منضمّاً بالاسم المُلصَق ببادئة زائدة
+           * (order_room_admin_driver_…) — نبثّ للاسمين معاً فلا نعتمد
+           * على أيّ نسخةٍ من التطبيق يحملها المندوب. */
+          const altRoom = orderId.startsWith('admin_driver_')
+            ? `order_room_${orderId}` : null;
           const payload = {
             orderId,
             text,
@@ -1485,6 +1490,7 @@ app.post('/api/driver_chats', requireIdentity, async (req, res) => {
             timestamp:  new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })
           };
           io.to(targetRoom).emit('receive_message', payload);
+          if (altRoom) io.to(altRoom).emit('receive_message', payload);
           // الإدارة تراقب كل المحادثات من غرفة واحدة
           if (targetRoom !== 'manager_monitor') {
             io.to('manager_monitor').emit('receive_message', payload);
@@ -1920,6 +1926,26 @@ io.on('connection', (socket) => {
         } else if (room.startsWith('admin_driver_')) {
           const key = room.slice('admin_driver_'.length);
           allowed = key === myId || (!!myPhone && key === myPhone);
+        } else if (room.startsWith('order_room_admin_driver_')) {
+          /* ============================================================
+             بادئة زائدة يلصقها التطبيق — نتسامح معها بدل أن نرفض.
+
+             `ChatViewModel` في التطبيق يعرف ثلاث غرف عامة فقط
+             (global_driver_chat · global_zadna_chat · manager_monitor)،
+             وما عداها يعدّه غرفة طلب فيُركّب `order_room_<الاسم>`.
+             فغرفة الإدارة الخاصة `admin_driver_<المندوب>` تصل هنا باسم
+             `order_room_admin_driver_<المندوب>`، فيبحث الحارس عن طلبٍ
+             رقمه `admin_driver_...` — لا وجود له — فيردّ `join_rejected`.
+             والتطبيق لا يستمع لهذا الردّ أصلاً، فيصمت العطل تماماً:
+             **المندوب غير منضمّ لغرفته، ورسالتك تُبثّ إلى غرفة فارغة.**
+
+             وهذا بعينه ما وصفتَه: «لما أنا أبعث هم ما بيشوفوا، ولما هم
+             يبعثوا أنا بشوف» — لأن لوحتك تستطلع كل ١٥ ثانية وهو لا.
+
+             ونصحّحها هنا لا في التطبيق: فتعمل على الأجهزة المثبَّتة الآن
+             بلا انتظار بناء. والصلاحية تبقى كما هي — صاحب الغرفة وحده. */
+            const key2 = room.slice('order_room_admin_driver_'.length);
+            allowed = key2 === myId || (!!myPhone && key2 === myPhone);
         } else if (room === 'global_driver_chat' || room === 'global_zadna_chat') {
           // غرفة الشركاء: مندوب أو مطعم — لا زبون
           allowed = myType === 'driver' || myType === 'restaurant';
