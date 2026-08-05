@@ -383,8 +383,40 @@ router.post('/registered_partners/delete', adminOnly, async (req, res) => {
      *    «لا مانع» عن حسابٍ لا وجود له (أُصلح في server.js ليحظر)،
      *    لكن الكاش كان يحفظ «لا مانع» الأخيرة دقيقةً كاملة — تكفي
      *    مندوباً محذوفاً ليقبل طلباً ويُحصّل كاش زبونه. */
+    /* حارسٌ وأرشيف أُضيفا متأخراً لهذا المسار القديم.
+     *
+     * لا يشترط التكرار — غرضه مختلف: إنهاء تعاونٍ مع شريك، لا تنظيف
+     * حسابين لصاحبٍ واحد. لكنّ الطلب الحيّ يمنعه كما يمنع الآخر:
+     * مندوبٌ يحمل كيساً لا يُحذف مهما كان سبب الحذف.
+     *
+     * ونُؤرشف قبل المحو. كان هذا المسار يمحو بلا أثر، ونُسخ اللوحة
+     * القديمة على أي جهازٍ ما زالت تناديه — فلا يكفي أننا لم نعد
+     * نستعمله من الشاشة الجديدة. */
+    const preInfo = await db.collection('users').doc(String(id)).get();
+    meter.addReads(1, 'أرشفة قبل الحذف القديم');
+    if (!preInfo.exists) return res.status(404).json({ success: false, error: 'الحساب غير موجود' });
+    const preData = preInfo.data() || {};
+
+    const stillLive = await liveOrdersOf(db, id, String(preData.phone || ''));
+    if (stillLive.length) {
+      return res.status(409).json({
+        success: false,
+        error: `عليه ${stillLive.length} طلباً نشطاً (${stillLive.slice(0, 3).map(o => '#' + o.id).join('، ')}) — أنهِها أو ألغِها قبل الحذف`
+      });
+    }
+
     const shopId = await syncShopWithOwner(req, db, id,
       { status: 'rejected', isActive: false, isOpen: false, statusNote: 'حُذف حساب صاحبه' });
+
+    try {
+      await db.collection('deleted_users').doc(String(id)).set({
+        ...preData, deletedAt: new Date(),
+        deletedReason: 'حُذف من قائمة الشركاء (المسار القديم)',
+      });
+    } catch (e) {
+      console.warn('⚠️ تعذّرت الأرشفة قبل الحذف:', e.message);
+    }
+
     await db.collection('users').doc(String(id)).delete();
     const clr = req.app.get('clearStatusCache'); if (clr) clr(String(id));
     const io = req.app.get('socketio');
@@ -656,7 +688,7 @@ router.get('/registered_partners/duplicates', adminOnly, async (req, res) => {
 /** يجمع كل ما يلزم لقرار الحذف. يُنادى من المسارين — القراءة والتنفيذ
  *  ترى الحقائق نفسها، فلا يُعرض عليك تحذيرٌ ثم يُحذف على أساسٍ آخر. */
 async function inspectAccount(db, id) {
-  const { normPhone } = require('../utils/phone');
+  const { normPhone, isValidMobile } = require('../utils/phone');
 
   const doc = await db.collection('users').doc(String(id)).get();
   meter.addReads(1, 'فحص حساب قبل الحذف');
@@ -667,7 +699,25 @@ async function inspectAccount(db, id) {
   if (!raw) {
     return { ok: false, error: 'حسابٌ بلا رقم — لا يمكن إثبات أنه مكرَّر، فلا يُحذف من هنا' };
   }
-  const key = normPhone(raw) || raw;
+
+  /* الرقم يجب أن يكون **جوّالاً صالحاً**، لا نصّاً أياً كان.
+   *
+   * في شاشة الكشف نكتب `normPhone(p) || p` — نُبقي النصّ الخام كي لا
+   * نُخفي تكراراً محتملاً عن عينك. وهذا مقبولٌ هناك، لأن الكشف يعرض
+   * ولا يفعل.
+   *
+   * أمّا هنا فالنتيجة حذفٌ لا رجعة فيه. ولو سقطنا إلى النصّ الخام،
+   * لصار حسابانِ قيمةُ الهاتف فيهما "-" أو "لا يوجد" **مكرَّرَين** في
+   * نظر الحارس — فيسقط أهمُّ حراسةٍ عندك على قيمةٍ لا معنى لها.
+   *
+   * فالتكرار لا يُثبَت إلا برقمٍ يمكن الاتصال به. */
+  if (!isValidMobile(raw)) {
+    return {
+      ok: false,
+      error: `رقم هذا الحساب (${raw}) ليس جوّالاً صالحاً — لا يُثبَت به تكرار، فلا يُحذف من هنا. صحّح الرقم أو احذفه من Firebase.`
+    };
+  }
+  const key = normPhone(raw);
 
   /* نقرأ كل المستخدمين لا نُصفّي بالرقم: الأرقام مخزَّنة بصيغٍ مختلفة
    * (+970 و05 و00970)، واستعلامُ المساواة يفوّت التكرار الذي جئنا
@@ -680,7 +730,10 @@ async function inspectAccount(db, id) {
     const x = d.data() || {};
     const p = String(x.phone || '').trim();
     if (!p) return;
-    if ((normPhone(p) || p) !== key) return;
+    // هنا لا نسقط إلى النصّ الخام: التكرار الذي يُبيح الحذف لا يُثبَت
+    // إلا برقمٍ صالح، وقد اشترطناه على الحساب المحذوف — فلنشترطه على
+    // شبيهه أيضاً، وإلا صار النصّ الخام بابَ التفاف على الشرط.
+    if (normPhone(p) !== key) return;
     siblings.push({
       id: d.id,
       name: String(x.name || '—'),
@@ -694,6 +747,7 @@ async function inspectAccount(db, id) {
     ok: true,
     id: doc.id,
     phone: key,
+    rawPhone: raw,
     name: String(u.name || '—'),
     email: String(u.email || ''),
     userType: String(u.userType || 'customer'),
@@ -705,39 +759,112 @@ async function inspectAccount(db, id) {
   };
 }
 
-/** الطلبات الحيّة التي تخصّ هذا الحساب — زبوناً كان أو مندوباً. */
-const LIVE_STATUSES = [
-  'PENDING_RESTAURANT', 'ACCEPTED', 'PREPARING', 'READY_FOR_PICKUP',
-  'DRIVER_ASSIGNED', 'AT_RESTAURANT', 'PICKED_UP', 'ON_THE_WAY'
-];
+/* الدَّين الحقيقي على المندوب — لا `cashOnHand` وحده.
 
-async function liveOrdersOf(db, id) {
+   `cashOnHand` رقمٌ تشغيلي: ما في جيبه الآن، ولا يزيد إلا في مسارٍ
+   واحد أُضيف متأخراً (تحديث الطلب عند التسليم). أمّا الرقم المحاسبي
+   فهو ما جمعه من توصيلاتٍ مسلَّمة ناقص ما سوّاه.
+
+   والفرق ليس أكاديمياً: مندوبٌ عليه ثمانمئة شيكل من توصيلات الأسبوع
+   الماضي و`cashOnHand = 0` كان سيُعرض عليك **بلا تحذيرٍ واحد**. ثم
+   يُحذف، فيختفي الأثر ولا يبقى من يُطالَب.
+
+   ولذلك جعلتُه **مانعاً لا تحذيراً**، خلافاً لما اخترتَه للمحلّ
+   والكاش: المال الضائع لا يُسترجَع بندمٍ بعد ساعة. سوِّ الحساب أولاً
+   — والتسوية موجودة في اللوحة وتأخذ دقيقة. */
+async function debtOf(db, id) {
   const uid = String(id);
+  try {
+    const [ordSnap, setSnap] = await Promise.all([
+      db.collection('orders').where('status', '==', 'DELIVERED').get(),
+      db.collection('settlements').where('driverId', '==', uid).get(),
+    ]);
+    meter.addReads(ordSnap.size + setSnap.size + 2, 'دَين المندوب قبل الحذف');
 
-  /* استعلامٌ واحد على `status` ثم فلترةٌ في الذاكرة — لا استعلامانِ
-   * مركّبان. سببان، كلاهما يُفشل النسخة المركّبة في الإنتاج:
+    let owed = 0, delivered = 0;
+    ordSnap.forEach(d => {
+      const o = d.data() || {};
+      const drv = String((o.driver && (o.driver.id || o.driver.phone)) || o.driverId || '');
+      if (drv !== uid) return;
+      delivered++;
+      // ما يجب أن يورده للإدارة: قيمة الطلب ناقص أجرته
+      const total = Number(o.total || o.totalAmount || 0);
+      const fee   = Number(o.driverEarning || o.deliveryFee || 0);
+      owed += Math.max(0, total - fee);
+    });
+
+    let settled = 0;
+    setSnap.forEach(d => { settled += Number((d.data() || {}).amount || 0); });
+
+    return { balanceDue: Math.max(0, Math.round((owed - settled) * 100) / 100), delivered };
+  } catch (e) {
+    /* لا نبتلع الفشل فنقول «لا دَين عليه»: عند العجز عن الحساب نُرجع
+     * علامةً تمنع الحذف. الجهل بالمال يُعامَل معاملة الدَّين، لا العدم. */
+    console.error('⚠️ تعذّر حساب دَين الحساب قبل الحذف:', e.message);
+    return { balanceDue: null, delivered: 0, error: e.message };
+  }
+}
+
+/* الحالتان المنتهيتان — وما عداهما حيّ.
+ *
+ * قائمةٌ سوداء لا بيضاء، وهذا قرارٌ مقصود:
+ *
+ * القائمة البيضاء تسأل «هل هذه الحالة من الحالات الحيّة؟» — فطلبٌ
+ * بحالةٍ لم نتوقّعها، أو **بلا حقل حالةٍ أصلاً**، يُعدّ ميّتاً فيمرّ.
+ * والسوداء تسأل «هل انتهى؟» — فالمجهول يُعامَل معاملة الحيّ.
+ *
+ * والفرق ليس نظرياً: نُضيف حالةً جديدة بعد شهر وننسى هذه القائمة،
+ * فيُحذف حسابٌ عليه طلبٌ في الطريق. الخطأ في اتجاه «لا تحذف» يُكلّف
+ * دقيقة؛ وفي الاتجاه الآخر يُكلّف طلباً ضائعاً وزبوناً غاضباً.
+ */
+const DONE_STATUSES = ['DELIVERED', 'CANCELLED'];
+
+async function liveOrdersOf(db, id, rawPhone) {
+  const uid = String(id);
+  const { samePhone } = require('../utils/phone');
+
+  /* نقرأ مجموعة الطلبات كاملةً ونُصفّي في الذاكرة. والكلفة مقصودة:
    *
-   * ١ · `where(customerId).where(status,'in',…)` يطلب فهرساً مركّباً في
-   *     Firestore. غيابه لا يُرجع صفراً — يرمي خطأً. فيصير الحذف
-   *     مستحيلاً، أو أسوأ: نبتلع الخطأ فنظنّ الحساب نظيفاً.
+   * `where('status','in',[…])` **لا يُرجع الوثائق التي لا تحمل الحقل
+   * أصلاً** — وFirestore لا يفهرس الغائب. وطلبٌ بلا حقل `status` وارد،
+   * فالحفظ يمرّر ما أرسله التطبيق. أي أن الاستعلام «الذكي» كان
+   * سيُخفي بالضبط الطلبات التي جئنا نبحث عنها. و`not-in` يعاني العلّة
+   * نفسها.
    *
-   * ٢ · المندوب مخزَّن بصيغتين: `driverId` أحياناً و`driver.id` أحياناً.
-   *     استعلامُ `driverId` وحده يفوّت الطلبات التي تحمل الأخرى —
-   *     فنحذف مندوباً يحمل كيساً في الطريق. والطلبات النشطة عشراتٌ
-   *     لا آلاف، ففلترتها في الذاكرة أرخص من الخطأ. */
-  const snap = await db.collection('orders').where('status', 'in', LIVE_STATUSES).get();
+   * والحذف عمليةٌ نادرة — مرّاتٌ في السنة لا مرّاتٌ في الدقيقة. فقراءةُ
+   * المجموعة كاملةً مرّةً هي أرخص ثمنٍ لليقين في المنصّة كلّها. */
+  const snap = await db.collection('orders').get();
   meter.addReads(snap.size || 1, 'طلبات نشطة قبل الحذف');
 
   const out = [];
   snap.forEach(d => {
     const o = d.data() || {};
-    const drv = String((o.driver && o.driver.id) || o.driverId || '');
-    const cus = String(o.customerId || '');
-    const role = cus === uid ? 'زبون' : (drv === uid ? 'مندوب' : null);
-    if (!role) return;
+    const st = String(o.status || '');
+    if (DONE_STATUSES.includes(st)) return;            // انتهى — لا يمنع
+
+    /* ثلاث صيغٍ للمندوب في قاعدة البيانات، وكلّها واقعة:
+     *   `driverId` · `driver.id` · `driver.phone` (نسخ التطبيق القديمة)
+     * وإسنادُ المندوب عبر PATCH يكتب `driver` ولا يكتب `driverId` —
+     * فالاكتفاء بالأخير كان سيُفرغ النتيجة لمندوبٍ يحمل كيساً. */
+    const drvId    = String((o.driver && o.driver.id) || o.driverId || '');
+    const drvPhone = String((o.driver && o.driver.phone) || '');
+
+    const isDriver = (drvId && drvId === uid)
+                  || (rawPhone && drvId    && samePhone(drvId, rawPhone))
+                  || (rawPhone && drvPhone && samePhone(drvPhone, rawPhone));
+
+    /* والزبون كذلك: `customerId` كُتب متأخراً، والطلبات الأقدم منه
+     * لا تحمل إلا الرقم. فمن لا معرّف على طلبه يُقارَن برقمه. */
+    const cusId = String(o.customerId || '');
+    const isCustomer = cusId
+      ? cusId === uid
+      : !!(rawPhone && samePhone(o.customerPhone, rawPhone));
+
+    if (!isDriver && !isCustomer) return;
     out.push({
-      id: d.id, role,
-      status: String(o.status || ''),
+      id: d.id,
+      role: isCustomer ? 'زبون' : 'مندوب',
+      status: st || '(بلا حالة)',
       statusAr: String(o.statusAr || ''),
     });
   });
@@ -760,7 +887,11 @@ router.get('/registered_partners/:id/deletable', adminOnly, async (req, res) => 
       blockers.push('هذا الحساب ليس مكرَّراً — لا حساب آخر يحمل رقمه. الحذف من اللوحة للمكرَّر وحده.');
     }
 
-    const live = await liveOrdersOf(db, info.id);
+    const [live, debt] = await Promise.all([
+      liveOrdersOf(db, info.id, info.rawPhone),
+      debtOf(db, info.id),
+    ]);
+
     if (live.length) {
       blockers.push(
         `عليه ${live.length} ${live.length === 1 ? 'طلب نشط' : 'طلبات نشطة'}: ` +
@@ -769,11 +900,22 @@ router.get('/registered_partners/:id/deletable', adminOnly, async (req, res) => 
       );
     }
 
+    /* الدَّين مانع لا تحذير — والجهل بالدَّين مانعٌ أيضاً. لا نحذف
+     * حساباً لا نعرف ما عليه. */
+    if (debt.balanceDue === null) {
+      blockers.push('تعذّر حساب ما عليه من مال — لا نحذف حساباً لا نعرف ذمّته. أعد المحاولة بعد قليل.');
+    } else if (debt.balanceDue > 0) {
+      blockers.push(
+        `عليه ${debt.balanceDue} ₪ غير مسوّاة من ${debt.delivered} توصيلة — ` +
+        'سوِّ الحساب من تبويب المحفظة أولاً، ثم احذفه'
+      );
+    }
+
     if (info.ownsShop) {
-      warnings.push(`يملك المحلّ ${info.ownsShop} — بحذفه يفقد المحلّ مالكه، ولن يستطيع أحد دخول لوحته`);
+      warnings.push(`يملك المحلّ ${info.ownsShop} — سنُغلقه تلقائياً مع الحذف كي لا يبقى محلٌّ حيٌّ بلا مالك، فلن يستقبل طلبات بعدها`);
     }
     if (info.cashOnHand > 0) {
-      warnings.push(`معه ${Math.round(info.cashOnHand)} ₪ كاش غير مسوّى — يضيع أثر الدين بحذفه`);
+      warnings.push(`معه ${Math.round(info.cashOnHand)} ₪ كاش في جيبه — يضيع أثره بحذفه`);
     }
     if (info.devices > 0) {
       warnings.push(`عليه ${info.devices} ${info.devices === 1 ? 'جهاز مسجَّل' : 'أجهزة مسجَّلة'} — قد يكون هذا حسابه المستعمَل فعلاً`);
@@ -785,6 +927,7 @@ router.get('/registered_partners/:id/deletable', adminOnly, async (req, res) => 
         id: info.id, name: info.name, email: info.email, phone: info.phone,
         userType: info.userType, devices: info.devices,
         ownsShop: info.ownsShop, cashOnHand: info.cashOnHand,
+        balanceDue: debt.balanceDue, delivered: debt.delivered,
       },
       duplicateCount: info.duplicateCount,
       siblings: info.siblings.filter(s => s.id !== info.id),
@@ -792,8 +935,10 @@ router.get('/registered_partners/:id/deletable', adminOnly, async (req, res) => 
       blockers,
       warnings,
       canDelete: blockers.length === 0,
-      // آخر أربعة من المعرّف — ما يُطلب كتابته للتأكيد
-      confirmHint: info.id.slice(-4),
+      /* التأكيد بآخر أربعة من **الرقم** لا من المعرّف: المعرّف معروضٌ
+       * أمامك في الجدول، والنسخُ منه لا يُثبت أنك قرأت شيئاً. الرقم
+       * يُجبرك على معرفة صاحب الحساب الذي تحذفه. */
+      confirmHint: String(info.phone || '').slice(-4),
     });
   } catch (e) {
     console.error('❌ فحص القابلية للحذف:', e.message);
@@ -815,10 +960,11 @@ router.post('/registered_partners/:id/delete', adminOnly, async (req, res) => {
 
     /* التأكيد يُفحص أولاً: أرخص الفحوص، وأكثرها دلالةً على أن النداء
      * جاء من إنسانٍ قرأ ما أمامه لا من نصٍّ يدور في حلقة. */
-    if (confirm !== id.slice(-4)) {
+    const hint = String(info.phone || '').slice(-4);
+    if (confirm !== hint) {
       return res.status(400).json({
         success: false,
-        error: `للتأكيد اكتب آخر أربعة أحرف من معرّف الحساب (${id.slice(-4)})`
+        error: `للتأكيد اكتب آخر أربعة أرقام من جوّال صاحب الحساب`
       });
     }
 
@@ -829,38 +975,113 @@ router.post('/registered_partners/:id/delete', adminOnly, async (req, res) => {
       });
     }
 
-    const live = await liveOrdersOf(db, id);
+    const [live, debt] = await Promise.all([
+      liveOrdersOf(db, id, info.rawPhone),
+      debtOf(db, id),
+    ]);
+
     if (live.length) {
       return res.status(409).json({
         success: false,
         error: `عليه ${live.length} طلباً نشطاً (${live.slice(0, 3).map(o => '#' + o.id).join('، ')}) — أنهِها أو ألغِها قبل الحذف`
       });
     }
+    if (debt.balanceDue === null) {
+      return res.status(503).json({ success: false, error: 'تعذّر حساب ذمّته المالية — لم يُحذف شيء. أعد المحاولة' });
+    }
+    if (debt.balanceDue > 0) {
+      return res.status(409).json({
+        success: false,
+        error: `عليه ${debt.balanceDue} ₪ غير مسوّاة — سوِّ الحساب أولاً ثم احذفه`
+      });
+    }
 
-    /* أوّلاً نُطفئ أجهزته. لو حذفنا الوثيقة ثم فشل تنظيف الرموز، لبقي
-     * رمزُ FCM حيّاً يستقبل إشعاراتٍ لحسابٍ لا وجود له — وهي العلّة
-     * التي كلّفتنا يوماً. الترتيب هنا ليس ذوقاً. */
     const ref = db.collection('users').doc(id);
+
+    /* الأرشيف يُقرأ **قبل** أي كتابة.
+     *
+     * كان يُقرأ بعد إطفاء الأجهزة، فتذهب إلى `deleted_users` نسخةٌ
+     * مقصوصة: بلا `fcmDevices` ولا `worksAsDriver` — أي بلا الدليل
+     * نفسه الذي بُني عليه قرار «أيّهما الحساب الحقيقي». نُؤرشف
+     * الحساب كما هو، لا كما تركناه. */
+    const snapshot = (await ref.get()).data() || {};
+    meter.addReads(1, 'أرشفة قبل الحذف');
+
+    /* ثم نُطفئ أجهزته. لو حذفنا الوثيقة ثم فشل تنظيف الرموز، لبقي
+     * رمزُ FCM حيّاً يستقبل إشعاراتٍ لحسابٍ لا وجود له — وهي العلّة
+     * التي كلّفتنا يوماً. الترتيب هنا ليس ذوقاً.
+     *
+     * و`fcmTokens` بالجمع هي المستعملة فعلاً في الإرسال — نسيانُها
+     * يُبقي الإشعارات تصل بعد الحذف. */
     try {
-      await ref.update({ fcmDevices: [], fcmToken: null, worksAsDriver: false, onShift: false });
+      await ref.update({
+        fcmDevices: [], fcmTokens: [], fcmToken: null,
+        worksAsDriver: false, onShift: false
+      });
     } catch (e) {
       return res.status(500).json({ success: false, error: 'تعذّر إطفاء أجهزة الحساب — لم يُحذف شيء. أعد المحاولة' });
     }
 
-    /* أرشيفٌ قبل المحو. الحذف لا رجعة فيه — لكن الأثر يبقى، فإن
-     * تبيّن غداً أن الحساب كان هو الصحيح عرفنا ماذا كان فيه. */
-    const snapshot = (await ref.get()).data() || {};
-    await db.collection('deleted_users').doc(id).set({
-      ...snapshot,
-      deletedAt: new Date(),
-      deletedReason: 'حساب مكرَّر — حُذف من لوحة الإدارة',
-      keptSiblings: info.siblings.filter(s => s.id !== id).map(s => s.id),
-    });
+    /* من هنا فصاعداً: أي فشلٍ يترك الحساب مشلولاً — بلا أجهزة وخارج
+     * الدوام — وهو لم يُحذف. فنُعيد ما أطفأناه قبل أن نردّ بالخطأ. */
+    const rollback = async (why) => {
+      try {
+        await ref.update({
+          fcmDevices: snapshot.fcmDevices || [],
+          fcmTokens: snapshot.fcmTokens || [],
+          fcmToken: snapshot.fcmToken || null,
+          worksAsDriver: snapshot.worksAsDriver === true,
+          onShift: snapshot.onShift !== false,
+        });
+      } catch (e2) {
+        console.error('🚨 فشل التراجع أيضاً — الحساب مشلول:', id, e2.message);
+      }
+      console.error('❌ تراجعنا عن الحذف:', id, why);
+    };
 
-    await ref.delete();
+    try {
+      await db.collection('deleted_users').doc(id).set({
+        ...snapshot,
+        deletedAt: new Date(),
+        deletedReason: 'حساب مكرَّر — حُذف من لوحة الإدارة',
+        keptSiblings: info.siblings.filter(s => s.id !== id).map(s => s.id),
+      });
+    } catch (e) {
+      await rollback(e.message);
+      return res.status(500).json({ success: false, error: 'تعذّرت أرشفة الحساب — لم يُحذف شيء. أعد المحاولة' });
+    }
+
+    /* المحلّ يُغلق مع صاحبه — قبل حذف الحساب لا بعده.
+     *
+     * `syncShopWithOwner` تقرأ `ownedRestaurantId` من وثيقة المستخدم،
+     * فلو حذفناها أولاً لما وجدت المحلّ ولبقي حيّاً بلا مالك: يستقبل
+     * طلبات، ولا يصله إشعارٌ واحد لأن `notifyRestaurant` تبحث عن مالكٍ
+     * غير موجود. وهو بعينه العطل الذي طاردناه اليوم. */
+    let closedShop = null;
+    if (info.ownsShop) {
+      closedShop = await syncShopWithOwner(req, db, id, {
+        status: 'rejected', isActive: false, isOpen: false,
+        statusNote: 'حُذف حساب صاحبه — أعِد ربطه بمالكٍ جديد قبل تشغيله'
+      });
+      if (!closedShop) {
+        await rollback('تعذّر إغلاق المحلّ');
+        return res.status(500).json({
+          success: false,
+          error: 'تعذّر إغلاق محلّ هذا الحساب — لم يُحذف شيء. لن نترك محلّاً حيّاً بلا مالك.'
+        });
+      }
+    }
+
+    try {
+      await ref.delete();
+    } catch (e) {
+      await rollback(e.message);
+      return res.status(500).json({ success: false, error: 'تعذّر حذف الحساب — أُعيد كما كان. أعد المحاولة' });
+    }
 
     invalidate('partners:all');
-    console.log(`🗑️ حُذف حساب مكرَّر: ${info.name} [${id}] · رقم ${info.phone} · بقي ${info.duplicateCount - 1}`);
+    console.log(`🗑️ حُذف حساب مكرَّر: ${info.name} [${id}] · رقم ${info.phone} · بقي ${info.duplicateCount - 1}`
+      + (closedShop ? ` · وأُغلق محلّه ${closedShop}` : ''));
 
     res.json({
       success: true,
@@ -868,7 +1089,10 @@ router.post('/registered_partners/:id/delete', adminOnly, async (req, res) => {
       name: info.name,
       remaining: info.duplicateCount - 1,
       archived: true,
-      message: `حُذف حساب ${info.name}. نسخته محفوظة في deleted_users إن احتجتها.`
+      closedShop,
+      message: `حُذف حساب ${info.name}.`
+        + (closedShop ? ` وأُغلق محلّه ${closedShop} — أعِد ربطه بمالكٍ جديد قبل تشغيله.` : '')
+        + ' نسخته محفوظة في deleted_users إن احتجتها.'
     });
   } catch (e) {
     console.error('❌ حذف حساب مكرَّر:', e.message);
