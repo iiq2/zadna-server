@@ -46,6 +46,13 @@ const COLLECTIONS = [
   'users', 'restaurants', 'orders', 'zones',
   'partner_codes', 'mart_products', 'reports', 'wallets',
   'settlements',   // سجلّ التسويات — لا يُعوَّض إن ضاع
+  /* `ledger` — لنفس السبب حرفاً بحرف.
+   *
+   * دفترٌ لا يُنسخ ليس دفتراً: قيمته كلّها في أنه يبقى حين يُنكَر
+   * شيء. وهو أثقل من settlements لأن كل طلبٍ يخلّف ٣–٤ أسطر — لكن
+   * السطر نصفُ كيلوبايت، وألف طلبٍ شهرياً تعني نحو ٢ ميغا في السنة.
+   * ثمنٌ زهيد مقابل أن تملك جواباً حين يُسألك «متى دفعتُ؟». */
+  'ledger',
 ];
 
 async function dumpCollection(db, name, limit = 5000) {
