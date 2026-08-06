@@ -21,6 +21,7 @@ const r2m = (n) => Math.round((Number(n) || 0) * 100) / 100;
 /* دفتر الأستاذ — قيدٌ عند كل حركة مال. الطلب يحمل الصورة، والدفتر
  * يحمل القصّة: من فعل ماذا ومتى. راجع utils/ledger.js. */
 const ledger = require('../utils/ledger');
+const { normRef } = require('../utils/refs');   // نفس التطبيع الذي يستعمله مسار البنك
 
 /* رسالة الخطأ للزبون: عربية ومفيدة، والتفصيل يُسجَّل عندنا لا يُرسَل إليه.
    نأخذها من السيرفر ليكون لسان المنصّة واحداً في كل مسار. */
@@ -1238,6 +1239,9 @@ router.post('/:id/qr-claim', needsIdentity, async (req, res) => {
       paymentStatus: 'claim_pending',
       qrClaim: {
         reference,
+        /* الصيغة المطبَّعة بجانب الخام: الخام يُعرض للزبون كما كتبه،
+         * والمطبَّع هو ما يطابقه مسار البنك. */
+        refNorm: normRef(reference),
         amount: expected,
         at: new Date(),
         by: meId || mePhone || 'customer',
