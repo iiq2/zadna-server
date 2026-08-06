@@ -1693,6 +1693,13 @@ app.use('/api', partnersRouter);
 const walletRouter = require('./routes/wallet');
 app.use('/api', walletRouter);
 
+/* مطابقة تحويلات البنك — بمفتاحه الخاص لا بـADMIN_KEY.
+ * حدٌّ ضيّق للمعدّل: جوالك يرسل رسالةً أو رسالتين في الدقيقة، ومن
+ * يجرّب مفاتيح يرسل ألفاً. الحدّ يفرّق بينهما بلا أن يعيق الأول. */
+const bankSmsRouter = require('./routes/banksms');
+app.use('/api', rateLimit({ windowMs: 60000, max: 30, key: 'banksms',
+  message: 'طلبات كثيرة على مسار البنك' }), bankSmsRouter);
+
 const logsRouter = require('./routes/logs');
 app.use('/api', logsRouter);
 
