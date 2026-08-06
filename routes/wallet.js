@@ -38,6 +38,7 @@ async function selfOrAdmin(req, res, next, matches) {
 const money = require('../utils/money');
 const {
   RESTAURANT_COMMISSION,
+  MARKET_COMMISSION,
   DRIVER_COMMISSION,
   DEFAULT_DELIVERY_FEE,
   itemsTotal: orderTotal,
@@ -98,16 +99,34 @@ async function fetchDelivered(db) {
  * كما هو: طلبٌ سُلّم بنسبة ١٠٪ يبقى محاسَباً بها حتى لو رُفعت النسبة
  * اليوم — وإلا اختلفت التسوية عن الرقم الذي رآه المندوب يوم التسليم. */
 function orderBreakdown(o) {
-  const m = o.money || money.breakdown(o);
+  /* `applyPayment` لا `breakdown` وحدها للطلبات القديمة: هي التي تحمل
+   * حقول الدفع (`paidOnline` · `driverOwesZadna` · `zadnaOwesDriver`).
+   * وبدونها يُقرأ طلبٌ قديم كأنه كاش دائماً — وهو صحيح اليوم لأن كل
+   * القديم كاش، لكنه يصير كذباً يوم يمرّ طلبٌ إلكتروني بلا `money`. */
+  const m = o.money || money.applyPayment(money.breakdown(o), o);
+  const paidOnline = m.paidOnline === true;
   return {
     total: m.itemsTotal,
     fee: m.deliveryFee,
-    paidToRestaurant: m.payToRestaurant,       // ما يدفعه المندوب للمطعم
+    paidToRestaurant: m.payToRestaurant,       // ما يدفعه المندوب للمطعم (كاشاً)
     collectedFromCustomer: m.cashToCollect,    // ما يحصّله من الزبون
     restCommission: m.restaurantCommission,
     drvCommission: m.driverCommission,
-    owedToZadna: m.zadnaCommission,
-    driverNet: m.driverNet
+    owedToZadna: m.zadnaCommission,            // ربح زادنا — لا يتغيّر بطريقة الدفع
+    driverNet: m.driverNet,
+
+    /* الاتجاه: من يدين لمن. الحقلان محفوظان في الطلب منذ إنشائه،
+     * ونسقط إلى الاشتقاق للطلبات التي سبقتهما. */
+    paidOnline,
+    driverOwesZadna: m.driverOwesZadna != null
+      ? Number(m.driverOwesZadna)
+      : (paidOnline ? 0 : m.zadnaCommission),
+    zadnaOwesDriver: m.zadnaOwesDriver != null
+      ? Number(m.zadnaOwesDriver)
+      : (paidOnline ? m.driverNet : 0),
+    zadnaOwesRestaurant: m.owedToRestaurant != null
+      ? Number(m.owedToRestaurant)
+      : (paidOnline ? m.payToRestaurant : 0),
   };
 }
 
@@ -133,22 +152,75 @@ function topDriverToday(all, todayStart) {
 // يعرضه التطبيق وما يحسبه السيرفر — وهو ما حدث فعلاً حين أعفى التطبيق
 // المندوب بالكامل بينما لم يعفه السيرفر إطلاقاً.
 
-/** ما يستحقه زادنا من طلب واحد. */
+/* ============================================================
+   ما يدين به **المندوب** لزادنا من طلبٍ واحد.
+
+   وهذا ليس ربح زادنا — الفرق بينهما هو كل الفرق:
+
+   · ربح زادنا (`owedToZadna`) لا يتغيّر بطريقة الدفع. عشرة بالمئة
+     من الوجبة وعشرة من التوصيل، سواء دفع الزبون كاشاً أو ببطاقة.
+
+   · وما يدين به **المندوب** يتغيّر تماماً: بالكاش هو الذي قبض المال
+     فعليك أن تستردّ نصيبك منه. وبالبطاقة لم يقبض شيئاً — فمطالبتُه
+     بعمولةٍ اقتطعتَها أصلاً من المبلغ الذي وصلك **مطالبةٌ بمالٍ
+     مرّتين**.
+
+   وكانت هذه الدالة تخلط الاثنين. فأوّل طلبٍ إلكتروني كان سيُظهر على
+   مندوبٍ لم يقبض شيئاً ديناً بـ١١٫٥ ₪ — بينما الحقيقة أنك أنت تدين
+   له بـ١٣٫٥. خطأٌ بـ٢٥ ₪ في الاتجاه المعاكس، على كل طلب.
+   ============================================================ */
 function owedFor(b) {
+  if (b.paidOnline) return 0;
+  /* نقرأ `driverOwesZadna` المُجمَّد لا نُعيد جمع العمولتين.
+   * اليوم يتطابقان لأن الخصم صفر؛ ويوم تُبنى الكوبونات بـ`discountBy:
+   * 'zadna'` يفترقان — فنطالب المندوب بخصمٍ موّلتَه أنت. */
+  const saved = Number(b.driverOwesZadna);
+  if (Number.isFinite(saved)) return r2(saved);
   return r2(b.restCommission + b.drvCommission);
 }
 
-/** ما يبقى للمندوب من أجرة التوصيل بعد العمولة. */
+/** ما تدين به **زادنا للمندوب** — أجرته حين لا يقبضها من الزبون. */
+function zadnaOwesFor(b) {
+  if (!b.paidOnline) return 0;
+  const saved = Number(b.zadnaOwesDriver);
+  return r2(Number.isFinite(saved) ? saved : b.driverNet);
+}
+
+/** ما يبقى للمندوب من أجرة التوصيل بعد العمولة — دخلُه، أياً كان طريقه. */
 function driverNetFor(b) {
   return r2(b.fee - b.drvCommission);
 }
 
+/* ============================================================
+   التسوية لها اتجاه — وبدونه يصير دفعُك له مثل قبضك منه.
+
+   اليوم كل التسويات في اتجاهٍ واحد: المندوب يسلّمك ما عليه. فحقل
+   `amount` موجب ولا سؤال.
+
+   ومع الدفع الإلكتروني يظهر الاتجاه الثاني: **أنت تدفع له** أجرته.
+   ولو سُجّلت بنفس الشكل لجُمعت مع الأولى — فيبدو مندوبٌ قبضتَ منه
+   مئة ودفعتَ له مئة كأنه سدّد مئتين. ورصيده يصير سالباً بمئتين وهو
+   لم يتحرّك.
+
+   `direction`:
+     · `'in'`  — منه إليك (تسوية كاش · الافتراضي · كل القديم)
+     · `'out'` — منك إليه (أجرة توصيلٍ دُفع إلكترونياً)
+
+   والقديم بلا حقل يُقرأ `in` — وهو صحيحٌ تاريخياً لا افتراضاً كسولاً:
+   لم يكن هناك اتجاهٌ آخر يوم كُتب.
+   ============================================================ */
 async function settlementsOf(db, driverId) {
   const snap = await db.collection('settlements').where('driverId','==',String(driverId)).get();
-  let sum = 0; const items = [];
-  snap.forEach(d => { const s = d.data(); sum += Number(s.amount)||0; items.push({ id: d.id, ...s }); });
+  let paidIn = 0, paidOut = 0; const items = [];
+  snap.forEach(d => {
+    const s = d.data();
+    const amt = Number(s.amount) || 0;
+    const dir = String(s.direction || 'in');
+    if (dir === 'out') paidOut += amt; else paidIn += amt;
+    items.push({ id: d.id, ...s, direction: dir });
+  });
   items.sort((a,b) => ((b.createdAt&&b.createdAt._seconds)||0) - ((a.createdAt&&a.createdAt._seconds)||0));
-  return { sum: r2(sum), items };
+  return { sum: r2(paidIn), paidIn: r2(paidIn), paidOut: r2(paidOut), items };
 }
 
 // GET /api/wallet/driver/:id — كشف حساب المندوب (كم عليه لزادنا)
@@ -171,39 +243,69 @@ router.get('/wallet/driver/:id', needsIdentity,
     const isTop = topId === id;
     const isToday = (o) => { const d = orderDate(o); return d && d >= todayStart; };
 
-    let collected=0, paidRest=0, owed=0, net=0;
+    let collected=0, paidRest=0, owed=0, net=0, zadnaOwes=0, onlineCount=0;
     inPeriod.forEach(o => {
       const b = orderBreakdown(o);
-      collected += b.collectedFromCustomer; paidRest += b.paidToRestaurant;
+      collected += b.collectedFromCustomer;
+      // لم يدفع للمطعم شيئاً في الطلب الإلكتروني — دفعتَه أنت
+      paidRest += b.paidOnline ? 0 : b.paidToRestaurant;
       owed += owedFor(b);
       net  += driverNetFor(b);
-      
+      zadnaOwes += zadnaOwesFor(b);
+      if (b.paidOnline) onlineCount++;
     });
 
-    // الإجمالي التاريخي مقابل ما سدّده.
-    let owedAll = 0;
+    // الإجمالي التاريخي مقابل ما سدّده — في الاتجاهين.
+    let owedAll = 0, zadnaOwesAll = 0;
     mine.forEach(o => {
       const b = orderBreakdown(o);
       owedAll += owedFor(b);
+      zadnaOwesAll += zadnaOwesFor(b);
     });
-    const { sum: paid, items: settlements } = await settlementsOf(db, id);
+    const { paidIn, paidOut, items: settlements } = await settlementsOf(db, id);
+
+    /* ============================================================
+       الصافي — رقمٌ واحد يقول الحقيقة كاملة.
+
+         عليه  = عمولات طلبات الكاش  −  ما سدّده لك
+         له    = أجور طلباته المدفوعة إلكترونياً  −  ما دفعتَه له
+
+       ثم نطرح: موجبٌ يعني عليه، سالبٌ يعني لك عليه دَين.
+
+       ولا نعرض الرقمين وحدهما: مندوبٌ يقرأ «عليك ١٠٠» و«لك ٩٠» في
+       سطرين لا يعرف أيدفع أم يقبض. والصافي يقول «ادفع ١٠» بلا تفكير
+       — والتفصيل تحته لمن أراد.
+       ============================================================ */
+    const owesZadna  = r2(Math.max(0, owedAll - paidIn));
+    const zadnaOwesD = r2(Math.max(0, zadnaOwesAll - paidOut));
+    const netBalance = r2(owesZadna - zadnaOwesD);
 
     res.json({
       success: true, ownerType: 'driver', ownerId: id,
       period: req.query.period || 'all',
       deliveries: inPeriod.length,
+      onlineDeliveries: onlineCount,        // كم منها مدفوعٌ إلكترونياً
       collectedFromCustomers: r2(collected),
       paidToRestaurants: r2(paidRest),
       owedToZadna: r2(owed),
-      driverEarnings: r2(net),
+      zadnaOwesDriver: r2(zadnaOwes),       // أجوره من الطلبات الإلكترونية
+      driverEarnings: r2(net),              // دخله كاملاً — أياً كان طريق المال
       isTopDriverToday: isTop,
       waiverRate: 0,   // لا إعفاء — الجائزة عرض الاسم
       lifetimeOwed: r2(owedAll),
-      totalSettled: paid,
-      // لا ينزل تحت الصفر: تسديد زائد كان يجعل الدين سالباً، فيُخصم
-      // من ديون بقية المناديب في المجموع ويخفي مستحقات حقيقية.
-      balanceDue: r2(Math.max(0, owedAll - paid)),
-      overpaid: r2(Math.max(0, paid - owedAll)),
+      lifetimeZadnaOwes: r2(zadnaOwesAll),
+      totalSettled: paidIn,
+      totalPaidToDriver: paidOut,
+
+      /* `balanceDue` يبقى بمعناه القديم — عليه لك — كي لا تكذب شاشةٌ
+       * لم تُبنَ بعد. و`netBalance` هو الرقم الصحيح حين يختلط النوعان. */
+      balanceDue: owesZadna,
+      overpaid: r2(Math.max(0, paidIn - owedAll)),
+      zadnaOwesBalance: zadnaOwesD,
+      netBalance,                            // + عليه · − له
+      netDirection: netBalance > 0 ? 'driver_owes'
+                  : netBalance < 0 ? 'zadna_owes' : 'settled',
+
       settlements: settlements.slice(0, 20)
     });
   } catch (e) { res.status(500).json({ success:false, error:e.message }); }
@@ -222,14 +324,41 @@ router.get('/wallet/restaurant/:id', needsIdentity,
     const all = await fetchDelivered(db);
     const mine = all.filter(o => String(o.restaurantId) === id);
     const inPeriod = from ? mine.filter(o => { const d = orderDate(o); return d && d >= from; }) : mine;
-    let gross=0, comm=0, received=0;
-    inPeriod.forEach(o => { const b = orderBreakdown(o); gross += b.total; comm += b.restCommission; received += b.paidToRestaurant; });
+    let gross=0, comm=0, received=0, pending=0, onlineCount=0, rateSum=0, rateN=0;
+    inPeriod.forEach(o => {
+      const b = orderBreakdown(o);
+      gross += b.total; comm += b.restCommission;
+      if (b.paidOnline) {
+        // دُفع لزادنا — المطعم لم يقبض شيئاً بعد
+        pending += b.zadnaOwesRestaurant;
+        onlineCount++;
+      } else {
+        received += b.paidToRestaurant;
+      }
+      // النسبة كما جُمّدت في الطلب — لا الثابت الحالي
+      const m = o.money || {};
+      if (Number.isFinite(Number(m.restaurantRate))) { rateSum += Number(m.restaurantRate); rateN++; }
+    });
+
+    const isMarket = inPeriod.some(o => (o.money || {}).isMarketOrder === true)
+      || String(id).startsWith('mkt_');
+
     res.json({
-      success:true, ownerType:'restaurant', ownerId:id, period:req.query.period||'all',
+      success:true, ownerType: isMarket ? 'market' : 'restaurant', ownerId:id,
+      period:req.query.period||'all',
       ordersCount: inPeriod.length, gross: r2(gross),
-      commissionRate: RESTAURANT_COMMISSION, zadnaCommission: r2(comm),
+      /* النسبة المعروضة هي **متوسّط ما طُبّق فعلاً** في هذه الفترة، لا
+       * الثابت الحالي. فلو رفعتَ العمولة أمس، رأى الشريك الرقمين
+       * ممتزجين بحسب طلباته — وهو الصدق. وإن لم تُحفظ نسبةٌ في أي طلب
+       * (بيانات قديمة) نسقط إلى الثابت المناسب لنوعه. */
+      commissionRate: rateN ? r2(rateSum / rateN) : (isMarket ? MARKET_COMMISSION : RESTAURANT_COMMISSION),
+      zadnaCommission: r2(comm),
       receivedCash: r2(received),
-      note: 'المندوب يدفع للمطعم كاش وقت الاستلام — لا مستحقات معلّقة'
+      onlineOrders: onlineCount,
+      pendingFromZadna: r2(pending),      // ما لم يقبضه بعد — تدفعه أنت
+      note: pending > 0
+        ? `${r2(pending)} ₪ من طلباتٍ دُفعت إلكترونياً تُحوَّل لك من زادنا — والباقي قبضتَه نقداً وقت الاستلام`
+        : 'المندوب يدفع للمحلّ كاش وقت الاستلام — لا مستحقات معلّقة'
     });
   } catch (e) { res.status(500).json({ success:false, error:e.message }); }
 });
@@ -253,31 +382,46 @@ router.get('/wallet/summary', adminOnly, async (req, res) => {
      * يجمع كل الطلبات. فعمولةُ كل طلب بلا معرّف مطعم (مارت، قديم، يدوي)
      * كانت تُنسب للمناديب. نُرسل الرقمين صريحين فلا يبقى للطرح موضع. */
     let restCommTotal=0, drvCommTotal=0;
+    // ما يقع عليك أنت من ديون: للمطاعم وللمناديب من الطلبات الإلكترونية
+    let owedToPartners=0, owedToDrivers=0, onlineOrders=0, onlineVolume=0;
     all.forEach(o => {
       const b = orderBreakdown(o);
       volume += b.total; revenue += b.owedToZadna;
       restCommTotal += b.restCommission; drvCommTotal += b.drvCommission;
+      if (b.paidOnline) { onlineOrders++; onlineVolume += r2(b.total + b.fee); }
       const d = orderDate(o); if (d && d >= todayStart) revenueToday += b.owedToZadna;
       const did = driverKeyOf(o);
       if (did) {
-        if (!drivers[did]) drivers[did] = { id:did, name:driverNameOf(o), deliveries:0, collected:0, owed:0, owedToday:0, earnings:0 };
+        if (!drivers[did]) drivers[did] = { id:did, name:driverNameOf(o), deliveries:0, collected:0, owed:0, owedToday:0, earnings:0, zadnaOwes:0 };
         drivers[did].deliveries++; drivers[did].collected += b.collectedFromCustomer;
-        // نفس قاعدة الإعفاء المطبّقة في محفظة المندوب — رقم واحد للطرفين
+        // نفس القاعدة المطبّقة في محفظة المندوب — رقم واحد للطرفين
         const owedThis = owedFor(b);
         drivers[did].owed += owedThis;
         drivers[did].earnings += driverNetFor(b);
+        drivers[did].zadnaOwes += zadnaOwesFor(b);
+        // داخل النطاق كي يساوي الإجمالي مجموع المناديب — ولا يبقى فرقٌ لا يُسوّى
+        owedToDrivers += zadnaOwesFor(b);
         if (d && d >= todayStart) drivers[did].owedToday += owedThis;
       }
       const rid = String(o.restaurantId||'');
       if (rid) {
-        if (!rests[rid]) rests[rid] = { id:rid, name:o.restaurant||rid, orders:0, gross:0, commission:0 };
+        if (!rests[rid]) rests[rid] = { id:rid, name:o.restaurant||rid, orders:0, gross:0, commission:0, pending:0 };
         rests[rid].orders++; rests[rid].gross += b.total; rests[rid].commission += b.restCommission;
+        rests[rid].pending += b.zadnaOwesRestaurant;
+        owedToPartners += b.zadnaOwesRestaurant;
       }
     });
 
+    /* التسويات بالاتجاهين — الجمع الأعمى كان سيجعل دفعةً منك له
+     * تبدو كتسديدٍ منه إليك، فيظهر رصيده سالباً وهو لم يتحرّك. */
     const setSnap = await db.collection('settlements').get();
-    const settled = {};
-    setSnap.forEach(d => { const s = d.data(); settled[s.driverId] = (settled[s.driverId]||0) + (Number(s.amount)||0); });
+    const settled = {}, paidOutTo = {};
+    setSnap.forEach(d => {
+      const s = d.data();
+      const amt = Number(s.amount) || 0;
+      if (String(s.direction || 'in') === 'out') paidOutTo[s.driverId] = (paidOutTo[s.driverId]||0) + amt;
+      else settled[s.driverId] = (settled[s.driverId]||0) + amt;
+    });
 
     /* ============================================================
        `cashOnHand` — ما يحمله المندوب نقداً في جيبه الآن.
@@ -306,16 +450,25 @@ router.get('/wallet/summary', adminOnly, async (req, res) => {
       console.warn('⚠️ تعذّرت قراءة كاش المناديب:', e.message);
     }
 
-    const driversList = Object.values(drivers).map(d => ({
-      ...d, collected:r2(d.collected), owed:r2(d.owed), owedToday:r2(d.owedToday),
-      earnings:r2(d.earnings), settled:r2(settled[d.id]||0),
-      cashOnHand: r2(cashOf[d.id] || 0),
-      balanceDue:r2(Math.max(0, d.owed - (settled[d.id]||0))),
-      overpaid:r2(Math.max(0, (settled[d.id]||0) - d.owed))
-    })).sort((a,b) => b.balanceDue - a.balanceDue);
+    const driversList = Object.values(drivers).map(d => {
+      const owesZadna  = r2(Math.max(0, d.owed - (settled[d.id]||0)));
+      const zadnaOwesD = r2(Math.max(0, d.zadnaOwes - (paidOutTo[d.id]||0)));
+      return {
+        ...d, collected:r2(d.collected), owed:r2(d.owed), owedToday:r2(d.owedToday),
+        earnings:r2(d.earnings), settled:r2(settled[d.id]||0),
+        cashOnHand: r2(cashOf[d.id] || 0),
+        balanceDue: owesZadna,
+        overpaid: r2(Math.max(0, (settled[d.id]||0) - d.owed)),
+        zadnaOwes: r2(d.zadnaOwes),
+        paidToDriver: r2(paidOutTo[d.id] || 0),
+        zadnaOwesBalance: zadnaOwesD,
+        // + عليه لك · − لك عليه. الرقم الذي يُقرأ بلا حساب يدوي.
+        netBalance: r2(owesZadna - zadnaOwesD),
+      };
+    }).sort((a,b) => b.netBalance - a.netBalance);
 
     const restsList = Object.values(rests).map(r => ({
-      ...r, gross:r2(r.gross), commission:r2(r.commission)
+      ...r, gross:r2(r.gross), commission:r2(r.commission), pending:r2(r.pending)
     })).sort((a,b) => b.gross - a.gross);
 
     res.json({
@@ -328,9 +481,26 @@ router.get('/wallet/summary', adminOnly, async (req, res) => {
         driverCommission: r2(drvCommTotal),
         revenueToday: r2(revenueToday),
         pendingFromDrivers: r2(driversList.reduce((s,d)=>s+d.balanceDue,0)),
-        totalSettled: r2(Object.values(settled).reduce((s,v)=>s+v,0))
+        totalSettled: r2(Object.values(settled).reduce((s,v)=>s+v,0)),
+
+        /* ============================================================
+           ما عليك أنت — وهو الوجه الآخر للدفع الإلكتروني.
+
+           بالكاش لا تدين لأحد: المال يمرّ بين الزبون والمندوب والمطعم
+           ولا يلمسك. وبالبطاقة يصلك كلّه، فتصير أمينَ صندوقٍ عليه
+           التزامات. ولو لم يظهر هذا الرقم في لوحتك لأنفقتَ مالاً ليس
+           لك وأنت تظنّه ربحاً.
+           ============================================================ */
+        onlineOrders,
+        onlineVolume: r2(onlineVolume),
+        owedToPartners: r2(owedToPartners),   // للمطاعم والماركتات
+        owedToDrivers:  r2(owedToDrivers),    // أجور المناديب
+        totalOwedByZadna: r2(owedToPartners + owedToDrivers),
+        paidOutToDrivers: r2(Object.values(paidOutTo).reduce((s,v)=>s+v,0)),
       },
-      model: 'المندوب يدفع للمطعم مباشرة ويسدّد عمولة زادنا يومياً'
+      model: onlineOrders > 0
+        ? 'مختلط: الكاش يمرّ بالمندوب، والإلكتروني يصلك أنت فتوزّعه'
+        : 'المندوب يدفع للمطعم مباشرة ويسدّد عمولة زادنا يومياً'
     });
   } catch (e) { res.status(500).json({ success:false, error:e.message }); }
 });
@@ -345,6 +515,11 @@ router.post('/wallet/settlement', adminOnly, async (req, res) => {
     const amt = Number(amount);
     if (!amt || amt <= 0) return res.status(400).json({ success:false, error:'المبلغ غير صحيح' });
 
+    /* اتجاه التسوية. الافتراضي `in` — منه إليك — وهو كل ما كان قبل
+     * الدفع الإلكتروني. ولا نستنتجه من إشارة المبلغ: مبلغٌ سالب يُخطئ
+     * إدخاله أحدٌ فينقلب المعنى بلا أن يقصد. النيّة تُكتب. */
+    const direction = String((req.body || {}).direction || 'in') === 'out' ? 'out' : 'in';
+
     // ===== منع التسوية المكررة =====
     // ضغطتان متتاليتان على «استلمت» كانتا تُسجّلان تسويتين، فيُشطب من دَين
     // المندوب ضِعف ما دفع فعلاً. نرفض أي مبلغ مطابق لنفس المندوب خلال
@@ -357,7 +532,9 @@ router.post('/wallet/settlement', adminOnly, async (req, res) => {
       const dup = recent.docs.find(d => {
         const s = d.data();
         const t = s.createdAt && s.createdAt.toDate ? s.createdAt.toDate() : new Date(s.createdAt || 0);
-        return Number(s.amount) === amt && t > twoMinAgo;
+        // الاتجاه جزءٌ من الهوية: قبضُك منه ١٠٠ ودفعُك له ١٠٠ في الدقيقة
+        // نفسها حدثان مختلفان لا تكرار
+        return Number(s.amount) === amt && String(s.direction || 'in') === direction && t > twoMinAgo;
       });
       if (dup) {
         return res.status(409).json({
@@ -383,9 +560,10 @@ router.post('/wallet/settlement', adminOnly, async (req, res) => {
        (تسويتان في نفس اللحظة) يُلحق حرفٌ بدل أن تفشل العملية —
        فالمال أهمّ من جمال الرقم. */
     let receiptNo = '';
+    const prefix = direction === 'out' ? 'PAY-' : 'SET-';   // PAY = دفعتَ له · SET = سدّد لك
     try {
       const cnt = await db.collection('settlements').count().get();
-      receiptNo = 'SET-' + String((cnt.data().count || 0) + 1).padStart(4, '0');
+      receiptNo = prefix + String((cnt.data().count || 0) + 1).padStart(4, '0');
       const clash = await db.collection('settlements').where('receiptNo', '==', receiptNo).limit(1).get();
       if (!clash.empty) receiptNo += '-' + Math.random().toString(36).slice(2, 4).toUpperCase();
     } catch (e) {
@@ -395,6 +573,7 @@ router.post('/wallet/settlement', adminOnly, async (req, res) => {
     const doc = {
       driverId: String(driverId), driverName: driverName || '',
       amount: amt, note: note || '',
+      direction,                    // 'in' منه إليك · 'out' منك إليه
       receiptNo,
       // من سجّلها ومتى — التسوية فعلٌ مالي يستحق توقيعاً
       recordedBy: String((req.user && req.user.userId) || 'admin'),
@@ -402,20 +581,27 @@ router.post('/wallet/settlement', adminOnly, async (req, res) => {
     };
     const ref = await db.collection('settlements').add(doc);
 
-    /* التسوية تُنقص كاش جيبه — وإلا بقي فوق السقف بعد أن دفع.
-     * لا ينزل تحت الصفر: من سدّد أكثر ممّا عليه لا يصير دائناً بجيبه. */
-    try {
-      const FV = require('firebase-admin').firestore.FieldValue;
-      const uref = db.collection('users').doc(String(driverId));
-      const u = await uref.get();
-      const cur = Number((u.exists ? u.data() : {}).cashOnHand || 0);
-      await uref.update({ cashOnHand: Math.max(0, cur - amt) });
-    } catch (e) {
-      console.warn('⚠️ تعذّر إنقاص كاش المندوب بعد التسوية:', e.message);
+    /* كاش جيبه يتغيّر مع الاتجاه:
+     *
+     * · سدّد لك (`in`)  → خرج المال من جيبه، فينقص كاشه ويعود تحت السقف.
+     * · دفعتَ له (`out`) → **لا نزيد كاشه**. لأن `cashOnHand` رقمٌ تشغيلي
+     *   يقيس «كم من مال زادنا في جيبه» لا «كم يملك»، وسقف الكاش يحرس
+     *   الأول. وأجرته صارت ملكه، فزيادتها هنا تخنقه بسقفٍ لا يخصّها.
+     *
+     * ولا ينزل تحت الصفر: من سدّد أكثر ممّا عليه لا يصير دائناً بجيبه. */
+    if (direction === 'in') {
+      try {
+        const uref = db.collection('users').doc(String(driverId));
+        const u = await uref.get();
+        const cur = Number((u.exists ? u.data() : {}).cashOnHand || 0);
+        await uref.update({ cashOnHand: Math.max(0, cur - amt) });
+      } catch (e) {
+        console.warn('⚠️ تعذّر إنقاص كاش المندوب بعد التسوية:', e.message);
+      }
     }
 
     _cache = { at: 0, data: null }; // إبطال الكاش
-    console.log(`🧾 تسوية ${receiptNo}: ${driverName || driverId} — ${amt} ₪`);
+    console.log(`🧾 ${direction === 'out' ? 'دفعة لمندوب' : 'تسوية'} ${receiptNo}: ${driverName || driverId} — ${amt} ₪`);
     res.status(201).json({ success:true, id:ref.id, ...doc });
   } catch (e) { res.status(500).json({ success:false, error:e.message }); }
 });

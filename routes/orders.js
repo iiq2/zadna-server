@@ -470,6 +470,8 @@ router.post('/', needsIdentity, async (req, res) => {
           data: { orderId: savedId, type: 'new_ready_order' },
           restaurantLat: shopDoc ? Number(shopDoc.lat) : undefined,
           restaurantLng: shopDoc ? Number(shopDoc.lng) : undefined,
+          // المدفوع إلكترونياً لا يضع نقداً في جيبه — فلا يحجبه سقف الكاش
+          paidOnline: orderData.paidOnline === true,
         }).catch(() => {});
 
         /* وصاحب الماركت يُخطَر — وكان لا يُخطَر إطلاقاً.
@@ -911,6 +913,7 @@ router.patch('/:id', needsIdentity, async (req, res) => {
             body: `${cur.restaurant || 'مطعم'} — ${total} ₪`,
             data: { orderId: String(id), type: 'new_ready_order' },
             restaurantLat: rLat, restaurantLng: rLng,
+            paidOnline: cur.paidOnline === true,
           }).catch(() => {});
         }
       }
@@ -940,6 +943,119 @@ router.patch('/:id', needsIdentity, async (req, res) => {
        بلا مخرج لأن المطعم كان سريعاً.
    ============================================================ */
 const GRACE_MS = 90 * 1000;
+
+/* ============================================================
+   POST /api/orders/:id/payment — الباب الوحيد الذي يجعل طلباً مدفوعاً.
+
+   ولماذا مسارٌ خاصّ ولا يكفي `PATCH` بحقلٍ واحد؟
+
+   لأن `paidOnline` ليست علامةً تُرفع — هي **حدثٌ يقلب كل الحساب**.
+   والمال محسوبٌ ومُجمَّدٌ داخل الطلب منذ إنشائه (`order.money`)، وكل
+   قارئ يُفضّل المُجمَّد على إعادة الحساب — وهذا صحيحٌ ومقصود: طلبٌ
+   سُلّم بنسبةٍ يبقى محاسَباً بها.
+
+   فلو رفعنا العلامة وحدها لبقي `cashToCollect` كما جُمّد: **المندوب
+   يذهب يطالب زبوناً دفع بالبطاقة بمئةٍ وخمسة عشر شيكلاً**. وتُطالبه
+   أنت بعمولةٍ اقتطعتَها أصلاً من المال الذي وصلك — تحصيلٌ مرّتين.
+
+   فالقاعدة: **من يرفع العلامة يُعيد الحساب في النداء نفسه.** لا يمرّ
+   أحدهما دون الآخر، ولا يُترك للمستقبل أن يتذكّر.
+
+   ومن يستطيع مناداته: الإدارة وحدها (أو ويب-هوك البوابة بمفتاحها).
+   لا التطبيق — من يقول «دفعتُ» هو مزوّد الدفع لا الجهاز الذي بيد
+   الزبون.
+   ============================================================ */
+router.post('/:id/payment', async (req, res) => {
+  try {
+    const requireAdmin = req.app.get('requireAdmin');
+    if (!requireAdmin) return res.status(503).json({ success: false, error: 'الحماية غير مضبوطة' });
+    // نغلّف يدوياً كي نُرجع رسالةً عربية بدل تمرير الطلب
+    await new Promise((resolve, reject) =>
+      requireAdmin(req, res, (e) => (e ? reject(e) : resolve())));
+  } catch (e) {
+    return; // الحارس ردّ بنفسه
+  }
+
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'لا قاعدة بيانات' });
+
+    const b = req.body || {};
+    const id = String(req.params.id);
+    const ref = db.collection('orders').doc(id);
+    const snap = await ref.get();
+    meter.addReads(1, 'تأكيد دفع');
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+
+    const cur = snap.data() || {};
+    const status = String(cur.status || '');
+    if (status === 'CANCELLED') {
+      return res.status(409).json({
+        success: false,
+        error: 'الطلب ملغيّ — لا يُعلَّم مدفوعاً. سجّل استرداداً بدل ذلك.'
+      });
+    }
+    if (cur.paidOnline === true) {
+      return res.json({ success: true, already: true, money: cur.money, message: 'مسجَّل مدفوعاً سابقاً' });
+    }
+
+    const method = ['card', 'wallet'].includes(String(b.method)) ? String(b.method) : 'card';
+
+    /* المرجع من البوابة — بدونه لا سبيل لمطابقة كشفك بكشفها عند خلاف.
+     * ونجعله مطلوباً: تأكيدُ دفعٍ بلا مرجع كلامٌ لا وثيقة. */
+    const reference = String(b.reference || '').trim().slice(0, 120);
+    if (!reference) {
+      return res.status(400).json({ success: false, error: 'مرجع العملية من البوابة مطلوب' });
+    }
+
+    /* لا نصدّق مبلغاً من الخارج: نتحقّق أنه يطابق ما حسبناه نحن.
+     * بوابةٌ تقول «دُفع ٥٠» على طلبٍ ثمنه ١١٥ إمّا خطأٌ أو تلاعب. */
+    const expected = Number((cur.money && cur.money.grandTotal) != null
+      ? cur.money.grandTotal : cur.grandTotal);
+    const paidAmt = Number(b.amount);
+    if (Number.isFinite(paidAmt) && Number.isFinite(expected) && Math.abs(paidAmt - expected) > 0.01) {
+      return res.status(409).json({
+        success: false,
+        error: `المبلغ المدفوع (${paidAmt}) لا يطابق قيمة الطلب (${expected}) — لم يُعلَّم مدفوعاً`
+      });
+    }
+
+    /* وهنا بيت القصيد: نُعيد بناء `money` كاملاً بحقول الدفع الجديدة.
+     * والنسب تبقى مجمَّدة لأن `breakdown` تقرأ `o.money.restaurantRate`
+     * أولاً — فالطلب يُحاسَب بنسبته لا بنسبة اليوم. */
+    const patched = { ...cur, paidOnline: true, paymentStatus: 'paid', paymentMethod: method };
+    const m = applyPayment(breakdown(patched), patched);
+
+    await ref.update({
+      paidOnline: true,
+      paymentStatus: 'paid',
+      paymentMethod: method,
+      paymentReference: reference,
+      paidAt: new Date(),
+      money: m,
+      grandTotal: m.grandTotal,
+    });
+
+    // الكاش يحمل نسخةً بـ`cashToCollect` القديمة — ولو بقيت لطالب المندوب بها
+    invalidate('orders:all');
+
+    const io = req.app.get('socketio');
+    if (io) io.emit('order_paid', { orderId: id, method, money: m });
+
+    console.log(`💳 دُفع إلكترونياً: #${id} · ${m.grandTotal} ₪ · ${method} · مرجع ${reference}`
+      + ` — عليك للمحلّ ${m.owedToRestaurant} وللمندوب ${m.owedToDriver}`);
+
+    res.json({
+      success: true,
+      orderId: id,
+      money: m,
+      note: 'أُعيد حساب المال: المندوب لا يحصّل ولا يدين — وأنت تدين للمحلّ والمندوب',
+    });
+  } catch (e) {
+    console.error('❌ تأكيد الدفع:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 router.post('/:id/cancel', needsIdentity, async (req, res) => {
   try {
@@ -1004,13 +1120,40 @@ router.post('/:id/cancel', needsIdentity, async (req, res) => {
     }
 
     const reason = String((req.body && req.body.reason) || '').slice(0, 200).trim();
+
+    /* ============================================================
+       إلغاءُ طلبٍ **دُفع ثمنه** ليس إلغاءً — هو دَينٌ عليك للزبون.
+
+       ثلاث رسائل في هذا الملفّ تقول للزبون «لم يُخصم منك شيء». وهي
+       صحيحة في الكاش (لم يدفع بعد)، وكذبٌ صريح في الإلكتروني (دفع
+       ووصلك ماله).
+
+       فنُعلّم الطلب بأن استرداداً مستحقّاً، ويظهر في اللوحة. ولا
+       نُنفّذ الاسترداد آلياً: إعادةُ المال تمرّ ببوابة الدفع بمسارها
+       الخاص، وقرارُ الإرجاع قرارُك أنت. لكن **لا يضيع الأثر**. */
+    const wasPaid = o.paidOnline === true || o.paymentStatus === 'paid';
+    const refundAmt = wasPaid
+      ? Number((o.money && o.money.grandTotal) != null ? o.money.grandTotal : o.grandTotal) || 0
+      : 0;
+
     await ref.update({
       status: 'CANCELLED',
       statusAr: STATUS_AR.CANCELLED,
       cancelledBy: req.isAdmin ? 'admin' : 'customer',
       cancelReason: reason,
       cancelledAt: new Date(),
+      ...(wasPaid ? {
+        refundDue: refundAmt,
+        refundStatus: 'pending',
+        paymentStatus: 'refund_pending',
+      } : {}),
     });
+
+    if (wasPaid) {
+      console.warn(`💸 إلغاء طلبٍ مدفوع #${id} — استرداد مستحقّ ${refundAmt} ₪ للزبون ${o.customerPhone || ''}`);
+      const io2 = req.app.get('socketio');
+      if (io2) io2.emit('refund_due', { orderId: String(id), amount: refundAmt, phone: o.customerPhone || '' });
+    }
     /* statusAr مع status — لا أحدهما.
      *
      * التطبيق يقرأ `statusAr` **قبل** `status` (سطر ١١١ في
@@ -1169,7 +1312,9 @@ async function sweepReadyUnclaimed(app, db, o) {
       if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
       notifyCustomer(app, o.customerPhone, {
         title: 'اعتذارنا — أُلغي طلبك',
-        body: 'لم نستطع توصيله. لم يُخصم منك شيء — نأسف على الانتظار',
+        body: (o.paidOnline === true)
+          ? 'لم نستطع توصيله. المبلغ سيُعاد إليك — نأسف على الانتظار'
+          : 'لم نستطع توصيله. لم يُخصم منك شيء — نأسف على الانتظار',
         channel: 'update', data: { orderId: id, type: 'status', status: 'CANCELLED' },
       }).catch(() => {});
       console.warn(`🧹 أُلغي طلب مهجور ${id} — عمره ${Math.round(age / 3600000)} ساعة`);
@@ -1188,6 +1333,7 @@ async function sweepReadyUnclaimed(app, db, o) {
       title: 'طلب ما زال بانتظار مندوب 📦',
       body: `${o.restaurant || 'محلّ'} — ${o.grandTotal || o.totalAmount || 0} ₪`,
       data: { orderId: id, type: 'new_ready_order' },
+      paidOnline: o.paidOnline === true,
     }).catch(() => {});
   };
 
@@ -1264,7 +1410,9 @@ function startRestaurantTimeout(app) {
           if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
           notifyCustomer(app, o.customerPhone, {
             title: 'اعتذارنا — أُلغي طلبك',
-            body: 'المطعم لم يردّ. لم يُخصم منك شيء، وجرّب مطعماً آخر',
+            body: (o.paidOnline === true)
+              ? 'المطعم لم يردّ. المبلغ سيُعاد إليك، وجرّب مطعماً آخر'
+              : 'المطعم لم يردّ. لم يُخصم منك شيء، وجرّب مطعماً آخر',
             channel: 'update', data: { orderId: id, type: 'status', status: 'CANCELLED' },
           }).catch(() => {});
           console.warn(`⏰ أُلغي الطلب ${id} — المطعم ${o.restaurantId} لم يردّ خلال ${EXPIRE_MS / 60000} دقيقة`);
@@ -1360,7 +1508,9 @@ router.post('/:id/reject_by_shop', needsIdentity, async (req, res) => {
     // الصدق مع الزبون: السبب الحقيقي بلسان مهذّب، لا «أُلغي» غامضة
     notifyCustomer(req.app, o.customerPhone, {
       title: 'اعتذارنا — المحلّ لم يستطع تلبية طلبك',
-      body: `${reasonAr}. لم يُخصم منك شيء — جرّب محلاً آخر أو أعد المحاولة لاحقاً`,
+      body: (o.paidOnline === true)
+        ? `${reasonAr}. المبلغ سيُعاد إليك — جرّب محلاً آخر`
+        : `${reasonAr}. لم يُخصم منك شيء — جرّب محلاً آخر أو أعد المحاولة لاحقاً`,
       channel: 'update', data: { orderId: id, type: 'status', status: 'CANCELLED' },
     }).catch(() => {});
 
@@ -1415,7 +1565,9 @@ router.get('/:id/candidates', async (req, res) => {
     const snap = await db.collection('users').where('userType', '==', 'driver').get();
     meter.addReads(snap.size, 'مرشّحو الإسناد');
     const locs = req.app.get('lastDriverLocation') || new Map();
-    const cap = Number(process.env.ZADNA_CASH_CAP || 800);
+    /* سقف الكاش يُلغى للطلب المدفوع إلكترونياً — لا يضع في جيبه شيئاً.
+     * وهنا نعرف الطلب (خلافاً لـ`notifyDrivers`)، فالفحص أدقّ. */
+    const cap = (o.paidOnline === true) ? 0 : Number(process.env.ZADNA_CASH_CAP || 800);
 
     const out = [];
     snap.forEach(d => {
@@ -1497,6 +1649,7 @@ router.post('/:id/assign', async (req, res) => {
         title: 'طلب متاح الآن 📦',
         body: `${o.restaurant || 'محلّ'} — ${o.grandTotal || o.totalAmount || 0} ₪`,
         data: { orderId: id, type: 'new_ready_order' },
+        paidOnline: o.paidOnline === true,
       }).catch(() => {});
 
       console.log(`↩️ سُحب الطلب ${id} من ${prevKey || '—'} وأُعيد متاحاً`);

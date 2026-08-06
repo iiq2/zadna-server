@@ -436,7 +436,7 @@ async function activeLoadByDriver(db) {
 /** آخر مرّة نُبّه فيها مندوبٌ بأنه فوق سقف الكاش — لئلا يُقصف بكل طلب. */
 const _capNoticed = new Map();
 
-async function notifyDrivers(app, { title, body, data, restaurantLat, restaurantLng }) {
+async function notifyDrivers(app, { title, body, data, restaurantLat, restaurantLng, paidOnline }) {
   const db = app.get('db');
   if (!db) return;
   try {
@@ -510,8 +510,18 @@ async function notifyDrivers(app, { title, body, data, restaurantLat, restaurant
 
          ZADNA_CASH_CAP=0 على Render يُعطّله كلياً إن أردت.
          ============================================================ */
+      /* والطلب المدفوع إلكترونياً **يتجاوز السقف** — وهذا ليس استثناءً
+       * بل تطبيقٌ للقاعدة نفسها.
+       *
+       * السقف يحرس **نقدَك في جيبه**. وطلبٌ دفع ثمنَه الزبون ببطاقة لا
+       * يضع في جيبه شيكلاً واحداً — بل أنت من تدين له بأجرته بعده.
+       * فمنعُه منه يحرم مندوباً ومنصّةً وزبوناً من طلبٍ لا خطر فيه
+       * إطلاقاً، ويترك المندوب محبوساً بلا سبيلٍ للعمل حتى يسوّي.
+       *
+       * بل هو عكس ذلك: الطلبات الإلكترونية هي التي **تُخرجه** من
+       * الحبس، لأنها تُنقص ما تدين به له لا تزيد ما يحمله. */
       const cap = Number(process.env.ZADNA_CASH_CAP || 800);
-      if (cap > 0 && Number(u.cashOnHand || 0) >= cap) {
+      if (!paidOnline && cap > 0 && Number(u.cashOnHand || 0) >= cap) {
         overCap.push({ id: d.id, name: u.name || d.id, cash: Number(u.cashOnHand || 0) });
         return;
       }

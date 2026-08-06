@@ -781,22 +781,48 @@ async function debtOf(db, id) {
     ]);
     meter.addReads(ordSnap.size + setSnap.size + 2, 'دَين المندوب قبل الحذف');
 
-    let owed = 0, delivered = 0;
+    /* الحساب من `utils/money` لا بمعادلةٍ مكتوبة هنا.
+     *
+     * كنتُ أحسب `owed = الثمن − الأجرة` — وهو **ليس دَينه**: ذاك ما
+     * يدفعه للمطعم نقداً في يده، لا ما يورده لك. فمندوبٌ عليه ١١٫٥
+     * كان يظهر عليه ٨٥ — سبعة أضعاف، فيُمنع حذف حساباتٍ نظيفة، وأخطر
+     * منه: يُبنى على الرقم قرارٌ مالي خاطئ.
+     *
+     * والمصدر الوحيد هو الوحدة التي تحسب لكل الشاشات — فلا يختلف
+     * رقمٌ هنا عن رقمٍ في المحفظة. */
+    const money = require('../utils/money');
+
+    let owed = 0, zadnaOwes = 0, delivered = 0;
     ordSnap.forEach(d => {
-      const o = d.data() || {};
+      const o = { id: d.id, ...(d.data() || {}) };
       const drv = String((o.driver && (o.driver.id || o.driver.phone)) || o.driverId || '');
       if (drv !== uid) return;
       delivered++;
-      // ما يجب أن يورده للإدارة: قيمة الطلب ناقص أجرته
-      const total = Number(o.total || o.totalAmount || 0);
-      const fee   = Number(o.driverEarning || o.deliveryFee || 0);
-      owed += Math.max(0, total - fee);
+      const m = o.money || money.applyPayment(money.breakdown(o), o);
+      // المدفوع إلكترونياً لا يدين به المندوب — بل أنت تدين له بأجرته
+      if (m.paidOnline === true) {
+        zadnaOwes += Number(m.zadnaOwesDriver != null ? m.zadnaOwesDriver : m.driverNet) || 0;
+      } else {
+        owed += Number(m.driverOwesZadna != null ? m.driverOwesZadna : m.zadnaCommission) || 0;
+      }
     });
 
-    let settled = 0;
-    setSnap.forEach(d => { settled += Number((d.data() || {}).amount || 0); });
+    /* التسويات بالاتجاهين: دفعةٌ منك إليه (`out`) ليست تسديداً منه.
+     * جمعُهما أعمى كان يمحو ديناً حقيقياً بمالٍ دفعتَه أنت. */
+    let paidIn = 0, paidOut = 0;
+    setSnap.forEach(d => {
+      const s = d.data() || {};
+      const amt = Number(s.amount) || 0;
+      if (String(s.direction || 'in') === 'out') paidOut += amt; else paidIn += amt;
+    });
 
-    return { balanceDue: Math.max(0, Math.round((owed - settled) * 100) / 100), delivered };
+    const r2 = (n) => Math.round(n * 100) / 100;
+    const owes = Math.max(0, r2(owed - paidIn));
+    const dueToHim = Math.max(0, r2(zadnaOwes - paidOut));
+
+    /* `balanceDue` هنا يعني «هل يمنع الحذف؟» — فنُرجع الصافي الموجب.
+     * ومن له عندك مالٌ لا يُمنع حذفه بسببه (لكن يُحذَّر منه أدناه). */
+    return { balanceDue: Math.max(0, r2(owes - dueToHim)), owesZadna: owes, zadnaOwes: dueToHim, delivered };
   } catch (e) {
     /* لا نبتلع الفشل فنقول «لا دَين عليه»: عند العجز عن الحساب نُرجع
      * علامةً تمنع الحذف. الجهل بالمال يُعامَل معاملة الدَّين، لا العدم. */
