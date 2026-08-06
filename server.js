@@ -1787,6 +1787,126 @@ app.get('/api/config/rates', (req, res) => {
   });
 });
 
+/* ============================================================
+   GET /api/config/payment — أين يحوّل الزبون؟
+
+   شاشة بلاغ QR تعرض حساب زادنا البنكي. ولو حُفر الرقم في التطبيق
+   لصار تغييرُ الحساب يوماً يستوجب بناء ثلاث نكهات وتنزيلها على كل
+   جوال — بينما هنا يتغيّر متغيّرٌ على Render ويسري فوراً.
+
+   من البيئة: `PAYMENT_BANK` (اسم البنك) · `PAYMENT_ACCOUNT_NAME`
+   (اسم صاحب الحساب) · `PAYMENT_ACCOUNT` (رقم الحساب/الآيبان).
+
+   وبلا حارس عمداً: رقم حسابٍ تستقبل عليه ليس سرّاً — هو ما تطبعه
+   على ملصق QR في كل مطعم. و`configured:false` تجعل التطبيق يقول
+   «التحويل غير متاح حالياً» بدل أن يعرض حقولاً فارغة.
+   ============================================================ */
+/* ═══ توليد كود QR بمبلغ الطلب — لماذا هنا لا في التطبيق ═══
+
+   كود ملصق البنك بصيغة EMVCo (نظام IPS الفلسطيني): حقول TLV يختمها
+   CRC-16. حشرُ المبلغ (Tag 54) يعني إعادة بناء النصّ وختمه من جديد.
+
+   ولو كُتب هذا البناء في كوتلن أيضاً لصار «حقيقةً في مكانين» — وهو
+   النمط الذي أنتج كل أعطالنا (normRef وقعت مرّتين). فالسيرفر يبني
+   والتطبيق يرسم صورةً مما استلم، لا يفهم محتواها ولا يعدّله.
+
+   القالب من `PAYMENT_QR_TEMPLATE`: النصّ الكامل لملصق البنك كما هو
+   (يُقرأ بأي قارئ QR). ليس سرّاً — هو المطبوع على ملصقات المطاعم.
+   والتحقق صارم: قالبٌ بلا `6304` ليس EMV فنرفضه بدل توليد كودٍ
+   يرفضه بنك الزبون بعد أن يمسحه واقفاً على الكاشير. */
+/* `utf8` لا `ascii`.
+ *
+ * المواصفة تحسب الختم على **بايتات** النصّ، و`Buffer.from(s,'ascii')`
+ * تأخذ البايت الأدنى من كل محرف: فـ«زادنا» تصير خمسة بايتات مشوّهة
+ * بدل عشرة، والختم يخرج خاطئاً — ويرفض بنكُ الزبون الكودَ وهو واقفٌ
+ * أمام الكاشير، ولا رسالة تقول لماذا.
+ *
+ * ولا يغيّر هذا شيئاً في القالب الحالي: النصّ اللاتيني الخالص يُنتج
+ * نفس البايتات بالترميزين. فُحص على ١٥ حالة في ثلاثة قوالب — مخرجاتٌ
+ * متطابقة حرفاً بحرف. الإصلاح يرفع فخّاً كامناً ولا يمسّ ما جُرّب. */
+const EMV_CRC = (s) => {
+  let crc = 0xFFFF;
+  for (const ch of Buffer.from(s, 'utf8')) {
+    crc ^= ch << 8;
+    for (let i = 0; i < 8; i++) crc = ((crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1) & 0xFFFF;
+  }
+  return crc.toString(16).toUpperCase().padStart(4, '0');
+};
+
+/* تحليل حقول TLV العليا: كل حقل «رقمان للوسم + رقمان للطول + قيمة».
+ * ونُرجع `null` عند أوّل ما لا ينطبق — قالبٌ لا يُحلَّل لا نخمّن فيه. */
+function emvFields(s) {
+  const out = [];
+  let i = 0;
+  while (i + 4 <= s.length) {
+    const tag = s.slice(i, i + 2);
+    const len = parseInt(s.slice(i + 2, i + 4), 10);
+    if (!Number.isFinite(len) || i + 4 + len > s.length) return null;
+    out.push({ tag, val: s.slice(i + 4, i + 4 + len) });
+    i += 4 + len;
+  }
+  return i === s.length ? out : null;
+}
+
+function emvWithAmount(template, amount) {
+  const base = String(template || '').trim();
+  // آخر ٨ محارف: "6304" + CRC. غيابها = ليس قالب EMV صالحاً
+  if (base.length < 12 || base.slice(-8, -4) !== '6304') return null;
+  const body = base.slice(0, -8);
+  const amt = Number(amount);
+  if (!Number.isFinite(amt) || amt <= 0 || amt > 100000) return null;
+  const amtStr = amt.toFixed(2);                       // منزلتان دائماً — المطابقة حرفية
+
+  const fields = emvFields(body);
+  let rebuilt;
+
+  if (fields) {
+    /* الوسم ٥٤ موجودٌ سلفاً؟ **يُستبدل ولا يُضاف.**
+     *
+     * لو حمل ملصقٌ مبلغاً ثابتاً — وبعض الملصقات تحمله — لأنتج البحثُ
+     * النصّي كوداً فيه مبلغان، فيقرأ بنكُ الزبون أوّلَهما أو يرفض
+     * الكود. والاحتمال بعيدٌ في ملصق يزن اليوم، لكنه قريبٌ يوم يبدّله. */
+    const at54 = fields.findIndex(f => f.tag === '54');
+    if (at54 >= 0) fields[at54] = { tag: '54', val: amtStr };
+    else {
+      // بعد العملة (٥٣) حفاظاً على الترتيب التصاعدي الذي تتوقّعه المواصفة
+      const at53 = fields.findIndex(f => f.tag === '53');
+      fields.splice(at53 >= 0 ? at53 + 1 : fields.length, 0, { tag: '54', val: amtStr });
+    }
+    rebuilt = fields.map(f => f.tag + String(f.val.length).padStart(2, '0') + f.val).join('') + '6304';
+  } else {
+    /* تعذّر التحليل؟ نسقط إلى الحشر النصّي بدل رفض قالبٍ قد يعمل.
+     * فالقالب مجرَّبٌ ميدانياً، ورفضُه لأن محلّلنا لم يفهمه خسارةٌ
+     * بلا مقابل. */
+    const tag54 = `54${String(amtStr.length).padStart(2, '0')}${amtStr}`;
+    const cur = body.indexOf('5303');
+    const cut = cur >= 0 ? cur + 7 : body.length;      // 5303xxx = 7 محارف
+    rebuilt = body.slice(0, cut) + tag54 + body.slice(cut) + '6304';
+  }
+
+  return rebuilt + EMV_CRC(rebuilt);
+}
+
+app.get('/api/config/payment', (req, res) => {
+  const bank = String(process.env.PAYMENT_BANK || '').trim();
+  const name = String(process.env.PAYMENT_ACCOUNT_NAME || '').trim();
+  const account = String(process.env.PAYMENT_ACCOUNT || '').trim();
+  const template = String(process.env.PAYMENT_QR_TEMPLATE || '').trim();
+
+  /* المبلغ اختياري: بلاه يُرجَع القالب الثابت كما هو (ملصق عام)،
+   * ومعه يُرجَع كودٌ خاص بهذا المبلغ — تطلبه شاشة التتبّع بمبلغ
+   * الطلب الذي حسبه money.js، فلا يكتب الزبون رقماً بيده. */
+  const amount = req.query.amount;
+  const qrPayload = amount != null ? emvWithAmount(template, amount) : (template || null);
+
+  res.json({
+    configured: !!(bank && account),
+    bank, accountName: name, account,
+    qrPayload,                       // null = القالب غير مضبوط أو المبلغ فاسد
+    note: 'حوّل المبلغ بالضبط ثم اكتب رقم العملية في التطبيق',
+  });
+});
+
 app.get('/api/health', (req, res) => {
   /* الاستهلاك في نفس شاشة الصحة.
    *
