@@ -3,6 +3,7 @@ const router = express.Router();
 /* عدّاد القراءات — قراءةٌ لا تُحصى تجعل مقياس الحصة يكذب، والمقياس
  * الذي يكذب أسوأ من غيابه. */
 const meter = require('../utils/meter');
+const ledger = require('../utils/ledger');   // كل تسوية سطرٌ في الدفتر
 
 const getDb = (req) => req.app.get('db');
 /** تسجيل تسوية يخفض دين مندوب — للإدارة وحدها. كان مفتوحاً للإنترنت. */
@@ -127,6 +128,15 @@ function orderBreakdown(o) {
     zadnaOwesRestaurant: m.owedToRestaurant != null
       ? Number(m.owedToRestaurant)
       : (paidOnline ? m.payToRestaurant : 0),
+
+    /* الحالة الهجينة: المندوب دفع للمحلّ نقداً، ثم وصلك تحويل الزبون
+     * فأُكّد الطلب مدفوعاً. المحلّ قبض فعلاً — لكن `payToRestaurant`
+     * صُفِّرت و`owedToRestaurant` صُفِّرت، فيصير المحلّ كأنه لم يقبض
+     * شيئاً ولا ينتظر شيئاً: تسعون تختفي من كشفه.
+     *
+     * `driverPaidRestaurant` يكتبه مسار الدفع في هذه الحالة وحدها،
+     * فنعدّه مقبوضاً نقداً — وهو ما حدث حرفياً. */
+    cashPaidByDriver: Number(m.driverPaidRestaurant) || 0,
   };
 }
 
@@ -331,6 +341,8 @@ router.get('/wallet/restaurant/:id', needsIdentity,
       if (b.paidOnline) {
         // دُفع لزادنا — المطعم لم يقبض شيئاً بعد
         pending += b.zadnaOwesRestaurant;
+        // إلّا أن يكون المندوب دفع له نقداً قبل أن يصلك التحويل
+        received += b.cashPaidByDriver;
         onlineCount++;
       } else {
         received += b.paidToRestaurant;
@@ -581,6 +593,24 @@ router.post('/wallet/settlement', adminOnly, async (req, res) => {
     };
     const ref = await db.collection('settlements').add(doc);
 
+    /* التسوية أوضح لحظةٍ يتحرّك فيها مالُك أنت — فهي أهمّ قيدٍ في
+     * الدفتر. `in` سدّد لك · `out` دفعتَ له. والإيصال هو المرجع الذي
+     * يُسأل به لاحقاً. */
+    ledger.record(db, {
+      kind: direction === 'in' ? ledger.KINDS.SETTLE_IN : ledger.KINDS.SETTLE_OUT,
+      orderId: null,
+      amount: amt,
+      direction,
+      actorId: String((req.user && req.user.userId) || 'admin'),
+      actorRole: 'admin',
+      actorName: driverName || '',
+      reference: receiptNo,
+      note: note || (direction === 'in'
+        ? `سدّد المندوب ${driverName || driverId} عمولات زادنا`
+        : `دُفع للمندوب ${driverName || driverId}`),
+      meta: { driverId: String(driverId), settlementId: ref.id },
+    }).catch(() => {});
+
     /* كاش جيبه يتغيّر مع الاتجاه:
      *
      * · سدّد لك (`in`)  → خرج المال من جيبه، فينقص كاشه ويعود تحت السقف.
@@ -616,6 +646,92 @@ router.get('/wallet/settlements', adminOnly, async (req, res) => {
     list.sort((a,b) => ((b.createdAt&&b.createdAt._seconds)||0) - ((a.createdAt&&a.createdAt._seconds)||0));
     res.json(list.slice(0, 100));
   } catch (e) { res.status(500).json({ error:e.message }); }
+});
+
+/* ═══════════════════ الدفتر: ثلاثة أبوابٍ للقراءة ═══════════════════
+ *
+ * لا بابَ للكتابة هنا عمداً. القيد يُكتب من حيث يقع الحدث — إنشاءُ
+ * الطلب في orders.js، والتسوية أعلاه — لا من نداءٍ خارجي. فمسارُ
+ * كتابةٍ مفتوح يعني أن أحدهم قد يكتب في دفترك ما لم يقع.
+ * والتصحيح بقيدٍ مضادّ (reverse) لا بتعديل. */
+
+/* GET /api/ledger/order/:id — قصّة طلبٍ واحد مرتّبةً زمنياً.
+ *
+ * `needsIdentity` وحدها لا تكفي هنا: أي مستخدمٍ مسجَّل كان سيقرأ قصّة
+ * أي طلب — بمبالغه واسم زبونه وهاتفه في الملاحظات. فنسأل عن الطلب
+ * أوّلاً ونتحقّق أن السائل طرفٌ فيه.
+ *
+ * والقراءة الإضافية مقبولة: هذه شاشة خلاف لا شاشة تُفتح كل ثانية. */
+router.get('/ledger/order/:id', needsIdentity, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.json({ orderId: req.params.id, entries: [] });
+
+    if (!req.isAdmin) {
+      const me = req.user || {};
+      const meId = String(me.userId || me.id || '');
+      const mePhone = String(me.phone || '');
+      const snap = await db.collection('orders').doc(String(req.params.id)).get();
+      const o = snap.exists ? (snap.data() || {}) : null;
+      if (!o) return res.status(404).json({ error: 'لا طلب بهذا الرقم' });
+
+      const drv = o.driver || {};
+      const isParty =
+        (meId && (String(o.customerId || '') === meId ||
+                  String(o.driverId || '') === meId ||
+                  String(drv.id || '') === meId ||
+                  String(o.restaurantId || '') === meId)) ||
+        (mePhone && (String(o.customerPhone || '') === mePhone ||
+                     String(drv.phone || '') === mePhone));
+
+      if (!isParty) {
+        return res.status(403).json({ error: 'هذا الطلب ليس لك' });
+      }
+    }
+    /* storyOf تُرجع مصفوفةً عاريةً — نلفّها بشكلٍ ثابت. الردّ الذي
+     * يكون مرّةً مصفوفةً ومرّةً كائناً يكسر القارئ في الحالة النادرة. */
+    const entries = await ledger.storyOf(db, req.params.id);
+    res.json({ orderId: String(req.params.id), count: entries.length, entries });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/ledger/movement?from=&to= — حركة اليوم (الافتراضي: آخر ٢٤ ساعة)
+router.get('/ledger/movement', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.json(null);
+    const q = req.query || {};
+    const out = await ledger.movement(
+      db,
+      q.from ? new Date(q.from) : undefined,
+      q.to ? new Date(q.to) : undefined
+    );
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* POST /api/ledger/:id/reverse — التصحيح الوحيد المسموح.
+ * لا يمسّ القيد الأصلي: يكتب قيداً مضادّاً ويُشير إليه. فالخطأ يبقى
+ * مرئياً مع تصحيحه — وهذا ما يجعل الدفتر شهادةً لا سرداً قابلاً
+ * للتنقيح. والسببُ إلزاميّ: تصحيحٌ بلا سبب يُفسد الدفتر أكثر ممّا
+ * يُصلح. */
+router.post('/ledger/:id/reverse', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(500).json({ success: false, error: 'لا قاعدة بيانات' });
+    const reason = String((req.body || {}).reason || '').trim();
+    if (reason.length < 3) {
+      return res.status(400).json({ success: false, error: 'اكتب سبب التصحيح — القيد المضادّ بلا سبب لا يُفهم لاحقاً' });
+    }
+    const out = await ledger.reverse(db, req.params.id, {
+      actorId: String((req.user && req.user.userId) || 'admin'),
+      actorRole: 'admin',
+      actorName: (req.user && req.user.name) || 'الإدارة',
+      reason,
+    });
+    if (!out) return res.status(400).json({ success: false, error: 'تعذّر التصحيح — قد يكون القيد غير موجود أو مصحَّحاً سلفاً' });
+    res.status(201).json({ success: true, entry: out });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 module.exports = router;
