@@ -91,7 +91,35 @@ console.log('\n═══ ٦ · القرش لا يضيع ═══');
   ok('٠٫١+٠٫٢ ثم دفع ٠٫٣ → صفر (لا 0.0000000004)', r2c.balanceDue === 0, `balanceDue=${r2c.balanceDue}`);
 }
 
-console.log('\n═══ ٧ · حارس التكرار — دفعتان متطابقتان بدقيقتين ═══');
+console.log('\n═══ ٧ · الاسترداد بمبلغٍ سالب — لا بحذف الدفعة ═══');
+{
+  /* دفعتَ ٤٠٠ وعليك ٣٤٥ → فائض ٥٥. تسترده فتُسجَّل دفعةٌ بـ−٥٥.
+   * الجمع يعود صحيحاً، **والدفعة الأصلية تبقى في السجلّ**: الشريك
+   * قبض ثم أعاد، وهذان حدثان لا حدثٌ ملغى. */
+  const before = partnerRow(345, [{ amount: 400 }]);
+  ok('قبل الاسترداد — فائض ٥٥', before.overpaid === 55 && before.balanceDue === 0);
+
+  const after = partnerRow(345, [{ amount: 400 }, { amount: -55 }]);
+  ok('بعد الاسترداد — لا فائض', after.overpaid === 0, `overpaid=${after.overpaid}`);
+  ok('ولا مستحقّ', after.balanceDue === 0, `balanceDue=${after.balanceDue}`);
+  ok('والمدفوع الصافي ٣٤٥', after.paidOut === 345, `paidOut=${after.paidOut}`);
+
+  /* استردادٌ جزئي: تسترد ٣٠ من ٥٥ فيبقى ٢٥ فائضاً. */
+  const part = partnerRow(345, [{ amount: 400 }, { amount: -30 }]);
+  ok('استرداد جزئي — يبقى ٢٥ فائضاً', part.overpaid === 25, `overpaid=${part.overpaid}`);
+
+  /* استردادٌ يتجاوز الفائض يقلب الاتجاه: صار عليك له. */
+  const flip = partnerRow(345, [{ amount: 400 }, { amount: -100 }]);
+  ok('استرداد يتجاوز الفائض → صار عليك له ٤٥', flip.balanceDue === 45, `balanceDue=${flip.balanceDue}`);
+  ok('ولا فائض', flip.overpaid === 0);
+
+  /* السجلّ لا يُقصّ: الدفعتان تبقيان سطرين. */
+  const entries = [{ amount: 400, receiptNo: 'PRT-0001' }, { amount: -55, receiptNo: 'PRT-R-0002' }];
+  ok('السجلّ يحفظ الحدثين لا واحداً', entries.length === 2);
+  ok('وإيصال الاسترداد يُميَّز بـPRT-R', entries[1].receiptNo.startsWith('PRT-R-'));
+}
+
+console.log('\n═══ ٨ · حارس التكرار — دفعتان متطابقتان بدقيقتين ═══');
 {
   /* الحارس في السيرفر يرفض المطابقة خلال دقيقتين. هنا نتأكّد أن
    * السلوك المقصود واضح: دفعةٌ واحدة تُحتسب لا اثنتان. */
