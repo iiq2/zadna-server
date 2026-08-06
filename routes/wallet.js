@@ -734,4 +734,202 @@ router.post('/ledger/:id/reverse', adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+/* ═══════════════ الجانب الخارج من المال ═══════════════
+ *
+ * كان الدفتر يعرف أن عليك دَيناً ولا يعرف أنك سدّدته. `refund_due`
+ * يُكتب عند إلغاء طلبٍ مدفوع، و`owedToRestaurant` يُحسب في كل طلب —
+ * ثم لا شيء. فلو أعدتَ المال للزبون فعلاً بقي الدَّين قائماً في
+ * نظامك أبداً، وتراكمت عليك التزاماتٌ سدّدتَها.
+ *
+ * وأخطر من الرقم الخاطئ: زبونٌ يطالبك بمالٍ أعدتَه، ولا وثيقة لك.
+ * ══════════════════════════════════════════════════════ */
+
+/* POST /api/refunds/:orderId/paid — نفّذتُ الاسترداد.
+ *
+ * لا يُنفّذ التحويل — يُسجّله. إعادة المال تمرّ ببنكك أو بوابتك
+ * بمسارها، وسيرفرٌ يحرّك أموالاً حقيقية بنداءٍ واحد بابُ كارثة.
+ * ما يفعله: يُغلق الدَّين ويكتب القيد بمرجعه. */
+router.post('/refunds/:orderId/paid', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'لا قاعدة بيانات' });
+
+    const id = String(req.params.orderId);
+    const ref = db.collection('orders').doc(id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+
+    const o = snap.data() || {};
+    const due = Number(o.refundDue || 0);
+
+    if (!due || due <= 0) {
+      return res.status(409).json({ success: false, error: 'لا استرداد مستحقّ على هذا الطلب' });
+    }
+    /* الحارس الذي يمنع الدفع مرّتين: زرٌّ يُضغط مرّتين بالخطأ، أو
+     * صفحتان مفتوحتان — ومئةُ شيكل تخرج ضعفين بلا أثرٍ للسبب. */
+    if (String(o.refundStatus || '') === 'paid') {
+      return res.json({ success: true, already: true, message: 'مسجَّل مسدَّداً سابقاً', paidAt: o.refundPaidAt });
+    }
+
+    const reference = String((req.body || {}).reference || '').trim().slice(0, 120);
+    if (reference.length < 3) {
+      return res.status(400).json({ success: false, error: 'اكتب مرجع التحويل — استردادٌ بلا مرجع لا يُثبَت' });
+    }
+
+    const method = String((req.body || {}).method || 'transfer').slice(0, 30);
+
+    await ref.update({
+      refundStatus: 'paid',
+      refundPaidAt: new Date(),
+      refundReference: reference,
+      refundMethod: method,
+      paymentStatus: 'refunded',
+    });
+    invalidate('orders:all');
+
+    ledger.record(db, {
+      kind: ledger.KINDS.REFUND_PAID,
+      orderId: id,
+      amount: due,
+      direction: 'out',              // خرج من خزنتك فعلاً
+      actorId: String((req.user && req.user.userId) || 'admin'),
+      actorRole: 'admin',
+      actorName: o.customerName || '',
+      reference,
+      note: `أُعيد للزبون ${o.customerPhone || ''} بـ${method}`,
+      meta: { phone: o.customerPhone || '', method },
+    }).catch(() => {});
+
+    const io = req.app.get('socketio');
+    if (io) io.emit('refund_paid', { orderId: id, amount: due });
+
+    console.log(`💸 نُفّذ استرداد #${id} · ${due} ₪ · مرجع ${reference}`);
+    res.json({ success: true, orderId: id, amount: due, reference });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/* POST /api/payouts/partner — دفعتُ لمحلٍّ مستحقّاته.
+ *
+ * نظير `settlement` لكن للمحلّات: ما تدين به لمطعمٍ أو ماركت من
+ * طلباتٍ وصلك ثمنها. بإيصالٍ مرقّم كأختها — الشريك الذي يقبض بلا
+ * إيصال يسألك بعد شهرين وليس لأحدكما ورقة. */
+router.post('/payouts/partner', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'لا قاعدة بيانات' });
+
+    const b = req.body || {};
+    const partnerId = String(b.partnerId || '').trim();
+    const amt = r2(Number(b.amount));
+
+    if (!partnerId) return res.status(400).json({ success: false, error: 'حدّد الشريك' });
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ success: false, error: 'المبلغ يجب أن يكون أكبر من صفر' });
+    }
+
+    const reference = String(b.reference || '').trim().slice(0, 120);
+    if (reference.length < 3) {
+      return res.status(400).json({ success: false, error: 'اكتب مرجع التحويل أو رقم الإيصال' });
+    }
+
+    /* حارسُ التكرار نفسه المستعمل في التسويات: نفس المبلغ لنفس الشريك
+     * خلال دقيقتين غالباً ضغطةٌ مكرّرة لا دفعتان. */
+    const twoMinAgo = Date.now() - 120000;
+    const recent = await db.collection('partner_payouts')
+      .where('partnerId', '==', partnerId).get();
+    let dup = null;
+    recent.forEach(d => {
+      const s = d.data() || {};
+      const t = (s.createdAt && s.createdAt._seconds) ? s.createdAt._seconds * 1000 : 0;
+      if (Number(s.amount) === amt && t > twoMinAgo) dup = { id: d.id, ...s };
+    });
+    if (dup) {
+      return res.json({ success: true, already: true, message: 'سُجّلت دفعةٌ مطابقة قبل قليل', payout: dup });
+    }
+
+    let receiptNo;
+    try {
+      const cnt = await db.collection('partner_payouts').count().get();
+      receiptNo = 'PRT-' + String((cnt.data().count || 0) + 1).padStart(4, '0');
+    } catch (e) {
+      receiptNo = 'PRT-' + Date.now().toString().slice(-6);
+    }
+
+    const doc = {
+      partnerId, partnerName: String(b.partnerName || '').slice(0, 120),
+      amount: amt, note: String(b.note || '').slice(0, 300),
+      reference, receiptNo,
+      recordedBy: String((req.user && req.user.userId) || 'admin'),
+      createdAt: new Date(),
+    };
+    const ref = await db.collection('partner_payouts').add(doc);
+
+    ledger.record(db, {
+      kind: ledger.KINDS.PARTNER_PAYOUT,
+      orderId: null,
+      amount: amt,
+      direction: 'out',
+      actorId: String((req.user && req.user.userId) || 'admin'),
+      actorRole: 'admin',
+      actorName: doc.partnerName,
+      reference: receiptNo,
+      note: doc.note || `دُفع للشريك ${doc.partnerName || partnerId} — مرجع ${reference}`,
+      meta: { partnerId, payoutId: ref.id, bankReference: reference },
+    }).catch(() => {});
+
+    _cache = { at: 0, data: null };
+    console.log(`🧾 دفعة شريك ${receiptNo}: ${doc.partnerName || partnerId} — ${amt} ₪`);
+    res.status(201).json({ success: true, id: ref.id, ...doc });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/* GET /api/refunds/pending — ما عليك للزبائن ولم يُسدَّد بعد.
+ * قائمة عملٍ لا تقرير: كل سطرٍ فيها زبونٌ ينتظر ماله. */
+router.get('/refunds/pending', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.json({ count: 0, total: 0, items: [] });
+    const snap = await db.collection('orders').where('refundStatus', '==', 'pending').get();
+    meter.addReads(snap.size || 1, 'استردادات معلّقة');
+    const items = [];
+    snap.forEach(d => {
+      const o = d.data() || {};
+      items.push({
+        orderId: d.id,
+        amount: Number(o.refundDue || 0),
+        customerName: o.customerName || '',
+        customerPhone: o.customerPhone || '',
+        cancelledAt: o.cancelledAt || null,
+        cancelReason: o.cancelReason || '',
+        paymentReference: o.paymentReference || null,
+      });
+    });
+    items.sort((a, b) => b.amount - a.amount);
+    res.json({
+      count: items.length,
+      total: r2(items.reduce((s, x) => s + x.amount, 0)),
+      items,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* GET /api/reconcile — هل الأرقام متّزنة؟
+ *
+ * فحصٌ ثقيل نسبياً (يقرأ الطلبات والمناديب والتسويات)، فلا يُنادى في
+ * كل تحديث شاشة. تفتحه أنت مرّةً في اليوم، أو يناديه فحصٌ مجدول. */
+router.get('/reconcile', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    const reconcile = require('../utils/reconcile');
+    const out = await reconcile.fullCheck(db, {
+      since: req.query.since ? new Date(req.query.since).getTime() : undefined,
+    });
+    res.json(out);
+  } catch (e) { res.status(500).json({ severity: 'alert', error: e.message }); }
+});
+
 module.exports = router;
