@@ -922,8 +922,21 @@ router.post('/payouts/partner', adminOnly, async (req, res) => {
     const amt = r2(Number(b.amount));
 
     if (!partnerId) return res.status(400).json({ success: false, error: 'حدّد الشريك' });
-    if (!Number.isFinite(amt) || amt <= 0) {
-      return res.status(400).json({ success: false, error: 'المبلغ يجب أن يكون أكبر من صفر' });
+    if (!Number.isFinite(amt) || amt === 0) {
+      return res.status(400).json({ success: false, error: 'المبلغ يجب أن يكون رقماً غير صفر' });
+    }
+    /* ============================================================
+       المبلغ السالب = استردادُ فائضٍ دفعتَه.
+
+       ولماذا نسمح به هنا بدل حذف الدفعة الأصلية: الحذف يمحو أثر
+       خطأٍ وقع فعلاً — والشريك قبض المال ثم أعاده، وهذان حدثان لا
+       حدثٌ ملغى. فالجمع يبقى صحيحاً (٤٠٠ + −٥٥ = ٣٤٥) والسجلّ
+       يبقى صادقاً.
+
+       والسقف يمنع خطأً بإشارةٍ ضخمة: لا استرداد يتجاوز ما دفعتَه. */
+    const isReversal = amt < 0;
+    if (Math.abs(amt) > 1000000) {
+      return res.status(400).json({ success: false, error: 'المبلغ خارج الحدّ المعقول' });
     }
 
     const reference = String(b.reference || '').trim().slice(0, 120);
@@ -949,15 +962,15 @@ router.post('/payouts/partner', adminOnly, async (req, res) => {
     let receiptNo;
     try {
       const cnt = await db.collection('partner_payouts').count().get();
-      receiptNo = 'PRT-' + String((cnt.data().count || 0) + 1).padStart(4, '0');
+      receiptNo = (isReversal ? 'PRT-R-' : 'PRT-') + String((cnt.data().count || 0) + 1).padStart(4, '0');
     } catch (e) {
-      receiptNo = 'PRT-' + Date.now().toString().slice(-6);
+      receiptNo = (isReversal ? 'PRT-R-' : 'PRT-') + Date.now().toString().slice(-6);
     }
 
     const doc = {
       partnerId, partnerName: String(b.partnerName || '').slice(0, 120),
       amount: amt, note: String(b.note || '').slice(0, 300),
-      reference, receiptNo,
+      reference, receiptNo, isReversal,
       recordedBy: String((req.user && req.user.userId) || 'admin'),
       createdAt: new Date(),
     };
@@ -966,14 +979,18 @@ router.post('/payouts/partner', adminOnly, async (req, res) => {
     ledger.record(db, {
       kind: ledger.KINDS.PARTNER_PAYOUT,
       orderId: null,
-      amount: amt,
-      direction: 'out',
+      /* الدفتر يحمل موجباً واتجاهاً — لا سالباً باتجاهٍ واحد. فقيدٌ
+       * بمبلغٍ سالب واتجاه `out` يُحسب مرّتين خطأً في أي جمعٍ لاحق. */
+      amount: Math.abs(amt),
+      direction: isReversal ? 'in' : 'out',
       actorId: String((req.user && req.user.userId) || 'admin'),
       actorRole: 'admin',
       actorName: doc.partnerName,
       reference: receiptNo,
-      note: doc.note || `دُفع للشريك ${doc.partnerName || partnerId} — مرجع ${reference}`,
-      meta: { partnerId, payoutId: ref.id, bankReference: reference },
+      note: doc.note || (isReversal
+        ? `استُرد فائضٌ من الشريك ${doc.partnerName || partnerId} — مرجع ${reference}`
+        : `دُفع للشريك ${doc.partnerName || partnerId} — مرجع ${reference}`),
+      meta: { partnerId, payoutId: ref.id, bankReference: reference, isReversal },
     }).catch(() => {});
 
     _cache = { at: 0, data: null };
