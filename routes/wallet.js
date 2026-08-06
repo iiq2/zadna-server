@@ -355,6 +355,28 @@ router.get('/wallet/restaurant/:id', needsIdentity,
     const isMarket = inPeriod.some(o => (o.money || {}).isMarketOrder === true)
       || String(id).startsWith('mkt_');
 
+    /* ما دفعتَه له فعلاً — يُطرح هنا كما يُطرح في كشف المدير.
+     * ولو طُرح في أحدهما دون الآخر لصار عندك رقمان لنفس الحقيقة،
+     * وصاحبُ المحلّ يقرأ غير ما تقرأ ويأتيك بورقة. */
+    let paidOut = 0;
+    try {
+      const paySnap = await db.collection('partner_payouts')
+        .where('partnerId', '==', id).get();
+      paySnap.forEach(d => {
+        const p = d.data() || {};
+        /* الفترة تُطبَّق على الدفعات كما تُطبَّق على الطلبات — وإلّا
+         * ظهر «هذا الأسبوع» مستحقّاً أقلّ ممّا هو لأن دفعةً قديمة خُصمت. */
+        if (!from) { paidOut += Number(p.amount) || 0; return; }
+        const t = p.createdAt && p.createdAt.toDate ? p.createdAt.toDate()
+                : (p.createdAt && p.createdAt._seconds ? new Date(p.createdAt._seconds * 1000) : null);
+        if (t && t >= from) paidOut += Number(p.amount) || 0;
+      });
+      meter.addReads(paySnap.size, 'دفعات شريك');
+    } catch (e) {
+      console.warn('⚠️ تعذّرت قراءة دفعات الشريك:', e.message);
+    }
+    const stillOwed = r2(Math.max(0, pending - paidOut));
+
     res.json({
       success:true, ownerType: isMarket ? 'market' : 'restaurant', ownerId:id,
       period:req.query.period||'all',
@@ -367,10 +389,17 @@ router.get('/wallet/restaurant/:id', needsIdentity,
       zadnaCommission: r2(comm),
       receivedCash: r2(received),
       onlineOrders: onlineCount,
-      pendingFromZadna: r2(pending),      // ما لم يقبضه بعد — تدفعه أنت
-      note: pending > 0
-        ? `${r2(pending)} ₪ من طلباتٍ دُفعت إلكترونياً تُحوَّل لك من زادنا — والباقي قبضتَه نقداً وقت الاستلام`
-        : 'المندوب يدفع للمحلّ كاش وقت الاستلام — لا مستحقات معلّقة'
+      /* ثلاثة أرقام بدل واحد. `pendingFromZadna` صار **الصافي** لأنه
+       * الرقم الذي يقرؤه صاحب المحلّ ويبني عليه، وما نشأ إجمالاً
+       * محفوظ في `grossOwed` لمن يدقّق. */
+      pendingFromZadna: stillOwed,        // ما لم يقبضه بعد — تدفعه أنت
+      grossOwed: r2(pending),             // ما نشأ له عليك في الفترة
+      paidByZadna: r2(paidOut),           // ما حوّلتَه له فعلاً
+      note: stillOwed > 0
+        ? `${stillOwed} ₪ من طلباتٍ دُفعت إلكترونياً تُحوَّل لك من زادنا — والباقي قبضتَه نقداً وقت الاستلام`
+        : (paidOut > 0
+            ? `حُوِّل لك ${r2(paidOut)} ₪ — لا مستحقات معلّقة`
+            : 'المندوب يدفع للمحلّ كاش وقت الاستلام — لا مستحقات معلّقة')
     });
   } catch (e) { res.status(500).json({ success:false, error:e.message }); }
 });
@@ -436,6 +465,33 @@ router.get('/wallet/summary', adminOnly, async (req, res) => {
     });
 
     /* ============================================================
+       دفعاتك للشركاء — الطرف الذي كان يُكتب ولا يُقرأ.
+
+       `partner_payouts` كانت تُسجَّل بإيصالٍ مرقّم منذ بُنيت، ولم
+       يقرأها أي حساب. فكان `pending` يجمع ما عليك من كل طلبٍ دُفع
+       إلكترونياً **ولا ينقص أبداً** — تدفع للمطعم تسعين وتبقى لوحتك
+       تقول إنك مدينٌ له بها، ويكبر الرقم مع كل طلب QR.
+
+       ولاحظ الفرق: المندوب كان مغلقاً من الطرفين (`settled` تُقرأ في
+       ثمانية مواضع)، والشريك مفتوحاً من طرفٍ واحد. نفس العطب الذي
+       يتكرّر في هذا المشروع — حقيقةٌ نصفُها مكتوب.
+       ============================================================ */
+    const payoutTo = {};
+    try {
+      const paySnap = await db.collection('partner_payouts').get();
+      paySnap.forEach(d => {
+        const p = d.data() || {};
+        const pid = String(p.partnerId || '');
+        if (pid) payoutTo[pid] = (payoutTo[pid] || 0) + (Number(p.amount) || 0);
+      });
+      meter.addReads(paySnap.size, 'دفعات الشركاء');
+    } catch (e) {
+      /* لا نُسقط الكشف كلّه لأن مجموعةً غابت — لكن لا نصمت أيضاً:
+       * صمتٌ هنا يعني أرقاماً مضخَّمة تُقرأ كأنها صحيحة. */
+      console.warn('⚠️ تعذّرت قراءة دفعات الشركاء — أرقام المستحقّ قد تكون أعلى من الواقع:', e.message);
+    }
+
+    /* ============================================================
        `cashOnHand` — ما يحمله المندوب نقداً في جيبه الآن.
 
        يختلف عن `balanceDue`: الأخير رقمٌ محاسبي (كم عليه إجمالاً)،
@@ -479,9 +535,23 @@ router.get('/wallet/summary', adminOnly, async (req, res) => {
       };
     }).sort((a,b) => b.netBalance - a.netBalance);
 
-    const restsList = Object.values(rests).map(r => ({
-      ...r, gross:r2(r.gross), commission:r2(r.commission), pending:r2(r.pending)
-    })).sort((a,b) => b.gross - a.gross);
+    /* الشريك كالمندوب الآن: مستحقٌّ ومسدَّدٌ ومتبقٍّ — ثلاثة أرقام لا
+     * رقمٌ واحد. و`pending` يبقى اسمه ومعناه (ما نشأ عليك من الطلبات)
+     * كي لا تكذب أي واجهةٍ قديمة تقرؤه، و`balanceDue` هو ما تدفعه
+     * فعلاً اليوم. */
+    const restsList = Object.values(rests).map(r => {
+      const paid = payoutTo[r.id] || 0;
+      return {
+        ...r, gross:r2(r.gross), commission:r2(r.commission), pending:r2(r.pending),
+        paidOut: r2(paid),
+        balanceDue: r2(Math.max(0, r.pending - paid)),
+        // دفعتَ أكثر ممّا عليك — يظهر صريحاً بدل أن يبتلعه `Math.max`
+        overpaid: r2(Math.max(0, paid - r.pending)),
+      };
+    }).sort((a,b) => b.balanceDue - a.balanceDue || b.gross - a.gross);
+
+    const owedToPartnersNet = r2(restsList.reduce((s,r) => s + r.balanceDue, 0));
+    const paidOutToPartners = r2(Object.values(payoutTo).reduce((s,v) => s+v, 0));
 
     res.json({
       success:true, drivers:driversList, restaurants:restsList,
@@ -505,9 +575,16 @@ router.get('/wallet/summary', adminOnly, async (req, res) => {
            ============================================================ */
         onlineOrders,
         onlineVolume: r2(onlineVolume),
-        owedToPartners: r2(owedToPartners),   // للمطاعم والماركتات
+        /* `owedToPartners` صار **صافياً** بعد خصم ما دفعتَه. وهذا تغيير
+         * في معنى رقمٍ كانت اللوحة تعرضه — مقصودٌ: المعنى القديم
+         * («مجموع ما نشأ عليك منذ البداية») لا يفيد أحداً، والجديد
+         * («ما عليك الآن») هو ما تقرؤه لتقرّر. والقديم محفوظ في
+         * `partnersGross` لمن يحتاجه. */
+        owedToPartners: owedToPartnersNet,       // للمطاعم والماركتات — بعد الخصم
+        partnersGross: r2(owedToPartners),       // ما نشأ عليك إجمالاً
+        paidOutToPartners,
         owedToDrivers:  r2(owedToDrivers),    // أجور المناديب
-        totalOwedByZadna: r2(owedToPartners + owedToDrivers),
+        totalOwedByZadna: r2(owedToPartnersNet + owedToDrivers),
         paidOutToDrivers: r2(Object.values(paidOutTo).reduce((s,v)=>s+v,0)),
       },
       model: onlineOrders > 0
@@ -646,6 +723,26 @@ router.get('/wallet/settlements', adminOnly, async (req, res) => {
     list.sort((a,b) => ((b.createdAt&&b.createdAt._seconds)||0) - ((a.createdAt&&a.createdAt._seconds)||0));
     res.json(list.slice(0, 100));
   } catch (e) { res.status(500).json({ error:e.message }); }
+});
+
+/* GET /api/payouts/partner — سجلّ ما دفعتَه للشركاء.
+ *
+ * الدفعة كانت تُسجَّل بإيصالٍ مرقّم ولا سبيل لرؤيتها. وإيصالٌ لا يُقرأ
+ * ليس إيصالاً — فحين يقول شريكٌ «لم تدفع لي» تحتاج السطر لا الذاكرة.
+ *
+ * `?partnerId=` يقصره على شريكٍ واحد. */
+router.get('/payouts/partner', adminOnly, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.json([]);
+    const pid = String(req.query.partnerId || '').trim();
+    const col = db.collection('partner_payouts');
+    const snap = await (pid ? col.where('partnerId', '==', pid).get() : col.get());
+    meter.addReads(snap.size, 'سجلّ دفعات الشركاء');
+    const list = []; snap.forEach(d => list.push({ id: d.id, ...d.data() }));
+    list.sort((a,b) => ((b.createdAt&&b.createdAt._seconds)||0) - ((a.createdAt&&a.createdAt._seconds)||0));
+    res.json(list.slice(0, 200));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 /* ═══════════════════ الدفتر: ثلاثة أبوابٍ للقراءة ═══════════════════
