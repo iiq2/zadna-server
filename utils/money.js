@@ -22,6 +22,18 @@
 const RESTAURANT_COMMISSION = parseFloat(process.env.RESTAURANT_COMMISSION || '0.10');
 const DRIVER_COMMISSION     = parseFloat(process.env.DRIVER_COMMISSION || '0.10');
 
+/* ============================================================
+   عمولة السوبرماركت أقلّ — ٦٪ لا ١٠٪.
+
+   وليست تخفيضاً مجاملةً: هامش السوبرماركت على البضاعة أرقّ من هامش
+   المطعم على الوجبة. المطعم يشتري بعشرة ويبيع بأربعين؛ والماركت
+   يشتري بتسعة ويبيع بعشرة. فعشرة بالمئة من ثمن البضاعة قد تبتلع
+   ربحه كلّه، وشريكٌ يخسر لا يبقى شريكاً.
+
+   وتُقرأ من البيئة كأختها: `MARKET_COMMISSION=0.06` على Render.
+   ============================================================ */
+const MARKET_COMMISSION = parseFloat(process.env.MARKET_COMMISSION || '0.06');
+
 /* ١٠ لا ٥: هذا هو BASE_FEE في نظام التسعير (zones.js). كان الرقمان
  * مختلفين، فطلب بلا أجرة مسجَّلة يُحسب بنصف قيمته في كشف الحساب —
  * فتظهر على المندوب ديون أقلّ ممّا عليه، وعلى زادنا إيراد أقلّ ممّا لها. */
@@ -46,6 +58,47 @@ function deliveryFeeOf(o) {
   return Number(o.deliveryFee) || 0;
 }
 
+/** هل هذا طلب سوبرماركت؟ ثلاثة أدلّة، أوّلها المحفوظ في الطلب نفسه. */
+function isMarketOrder(o) {
+  if (!o) return false;
+  if (o.isMarketOrder === true) return true;
+  return String(o.restaurantId || '').startsWith('mkt_') || o.restaurantId === 'mart_001';
+}
+
+/* ============================================================
+   النسبة تُجمَّد يوم الطلب — وهذا أهمّ سطرٍ في هذا الملفّ.
+
+   السؤال: لو رفعتَ العمولة من ٦٪ إلى ٨٪ بعد ألف طلب، فماذا يحدث
+   لكشوف الحسابات القديمة؟
+
+   لو قرأنا النسبة من البيئة **وقت العرض**، لتغيّر كشفُ حسابِ مندوبٍ
+   سدّد الأسبوع الماضي — بأثرٍ رجعي، بلا أن يلمس أحدٌ شيئاً. فيفتح
+   محفظته فيجد رقماً غير الذي دفع عليه، ولا سبيل لإقناعه أنك لم
+   تتلاعب. وأسوأ منه: مجموع ما قبضتَه فعلاً لا يطابق ما يقوله النظام،
+   فلا تعرف أنت نفسك كم لك وكم عليك.
+
+   فالقاعدة: **النسبة المحفوظة في الطلب هي الحقيقة**، والثابت الحالي
+   لا يُستعمل إلا لطلبٍ لم تُحفظ فيه نسبة (وهي طلبات ما قبل وحدة
+   المال، وقد صارت قليلة ثم تنتهي).
+
+   ونقبل `commissionRate` على الطلب أيضاً — كي تستطيع يوماً أن تتّفق
+   مع شريكٍ بعينه على نسبةٍ خاصّة، فتُكتب على طلباته وحدها.
+   ============================================================ */
+function rateOf(o, saved, fallback) {
+  /* الغياب ليس صفراً.
+   *
+   * `Number(null)` و`Number('')` كلاهما صفر في جافاسكربت. فحقلٌ فارغ
+   * في نموذجٍ إداري كان سيُقرأ «عمولة صفر» ويُجمَّد على الطلب أبداً —
+   * شريكٌ لا تأخذ منه شيئاً بلا أن يقرّر ذلك أحد.
+   *
+   * والصفر **المكتوب صراحةً** يبقى مقبولاً: شريكٌ بعمولة صفر لشهرين
+   * قرارٌ تجاري حقيقي، ولو أسقطناه للثابت لجُبي منه رغم اتفاقك. */
+  if (saved === null || saved === undefined || saved === '') return fallback;
+  const v = Number(saved);
+  if (Number.isFinite(v) && v >= 0 && v <= 1) return v;
+  return fallback;
+}
+
 /**
  * تفصيل مال طلبٍ واحد. هذه الحقول تُخزَّن داخل الطلب وتُرسل كما هي
  * إلى التطبيقات الثلاثة واللوحة — لا يعيد أحدٌ حسابها.
@@ -53,6 +106,15 @@ function deliveryFeeOf(o) {
 function breakdown(o) {
   const items = r2(itemsTotal(o));
   const fee   = r2(deliveryFeeOf(o));
+
+  /* النسبة: المحفوظة في الطلب أولاً، ثم اتفاقٌ خاصّ على الطلب، ثم
+   * الثابت الحالي بحسب نوع الشريك. */
+  const saved = (o && o.money) || {};
+  const partnerRate = rateOf(o, saved.restaurantRate,
+    rateOf(o, o && o.commissionRate,
+      isMarketOrder(o) ? MARKET_COMMISSION : RESTAURANT_COMMISSION));
+  const drvRate = rateOf(o, saved.driverRate,
+    rateOf(o, o && o.driverCommissionRate, DRIVER_COMMISSION));
 
   /* ============================================================
      الخصم — ومن يتحمّله.
@@ -77,8 +139,8 @@ function breakdown(o) {
   const discountBy = String((o && o.discountBy) || 'restaurant');
   const restBase   = discountBy === 'restaurant' ? r2(items - discount) : items;
 
-  const restaurantCommission = r2(restBase * RESTAURANT_COMMISSION);
-  const driverCommission     = r2(fee * DRIVER_COMMISSION);
+  const restaurantCommission = r2(restBase * partnerRate);
+  const driverCommission     = r2(fee * drvRate);
   // خصمُ زادنا ينقص من عمولتها لا من حصّة أحد آخر — وقد يبلغ صفراً
   const zadnaGross = r2(restaurantCommission + driverCommission);
   const zadnaNet   = discountBy === 'zadna' ? r2(Math.max(0, zadnaGross - discount)) : zadnaGross;
@@ -103,9 +165,11 @@ function breakdown(o) {
     restaurantNet:   payToRestaurant,                     // ما يقبضه المطعم (الاسم نفسه من زاويته)
     driverNet,                                            // ما يبقى للمندوب
 
-    // النِّسَب مرفقة كي تعرض الواجهة «١٠٪» من هنا لا من نصّ محفور
-    restaurantRate: RESTAURANT_COMMISSION,
-    driverRate:     DRIVER_COMMISSION,
+    /* النِّسَب مرفقة كي تعرض الواجهة «١٠٪» من هنا لا من نصّ محفور —
+     * وكي **تُجمَّد** مع الطلب فلا يُعاد حسابه بنسبةٍ لم تكن قائمة يومه. */
+    restaurantRate: partnerRate,
+    driverRate:     drvRate,
+    isMarketOrder:  isMarketOrder(o),
   };
 }
 
@@ -127,18 +191,53 @@ function breakdown(o) {
    ============================================================ */
 function applyPayment(b, order) {
   const paidOnline = !!(order && (order.paidOnline === true || order.paymentStatus === 'paid'));
+
   if (!paidOnline) {
     return Object.assign({}, b, {
       paidOnline: false,
-      owedToRestaurant: 0,   // المندوب يدفع نقداً — لا دين عليك
+      paymentMethod: String((order && order.paymentMethod) || 'cash'),
+
+      // المندوب يدفع للمطعم نقداً ويحصّل من الزبون — لا دين عليك لأحد
+      owedToRestaurant: 0,
       owedToDriver: 0,
+
+      /* ما يدين به المندوب لزادنا من هذا الطلب: العمولتان.
+       * هو قبض من الزبون ودفع للمطعم، وبقي في جيبه نصيبُك ونصيبُه. */
+      driverOwesZadna: b.zadnaCommission,
+      zadnaOwesDriver: 0,
     });
   }
+
+  /* ============================================================
+     مدفوعٌ إلكترونياً — المال وصلك أنت، فانعكس كل شيء.
+
+     ثلاث حقائق تتبدّل معاً، ولا يجوز أن تتبدّل واحدة دون أختيها:
+
+     ١ · **المندوب لا يحصّل شيئاً** (`cashToCollect = 0`). ولو بقيت
+         موجبةً لذهب يطلب مالاً من زبونٍ دفع — وهذه أسوأ لحظة يمكن
+         أن تقع لمنصّة توصيل على باب بيت.
+
+     ٢ · **المندوب لا يدين لك بشيء** (`driverOwesZadna = 0`). عمولتك
+         اقتطعتَها من المبلغ الذي وصلك، فلا تُطالبه بها ثانيةً. وكان
+         `owedFor` في المحفظة يُطالبه بها — ٢٥ ₪ في الاتجاه الخطأ على
+         كل طلب مئة شيكل.
+
+     ٣ · **أنت تدين لهما**: للمطعم بحصّته وللمندوب بأجرته. ويظهران
+         صراحةً كي تعرف كم عليك في آخر اليوم بلا حساب يدوي.
+
+     والمحصّلة واحدة في الحالتين: ربحك `zadnaCommission`. الفرق في
+     الطريق لا في المبلغ.
+     ============================================================ */
   return Object.assign({}, b, {
     paidOnline: true,
-    cashToCollect: 0,                    // لا يُحصّل المندوب شيئاً
-    owedToRestaurant: b.payToRestaurant, // تدفعها أنت للمطعم
-    owedToDriver: b.driverNet,           // تدفعها أنت للمندوب
+    paymentMethod: String((order && order.paymentMethod) || 'card'),
+
+    cashToCollect: 0,
+    owedToRestaurant: b.payToRestaurant,
+    owedToDriver: b.driverNet,
+
+    driverOwesZadna: 0,
+    zadnaOwesDriver: b.driverNet,
   });
 }
 
@@ -150,11 +249,13 @@ function withMoney(o) {
 
 module.exports = {
   RESTAURANT_COMMISSION,
+  MARKET_COMMISSION,
   DRIVER_COMMISSION,
   DEFAULT_DELIVERY_FEE,
   r2,
   itemsTotal,
   deliveryFeeOf,
+  isMarketOrder,
   breakdown,
   applyPayment,
   withMoney,
