@@ -16,6 +16,11 @@ const meter = require('../utils/meter');
 /* المصدر الوحيد لكل رقم مالي. التطبيقات الثلاثة واللوحة تعرض ما يأتي
  * من هنا ولا يحسب أيٌّ منها شيئاً — انظر utils/money.js. */
 const { breakdown, applyPayment } = require('../utils/money');
+// تقريبٌ لقرشين — نفس قاعدة money.js كي لا يختلف رقمان لنفس المبلغ
+const r2m = (n) => Math.round((Number(n) || 0) * 100) / 100;
+/* دفتر الأستاذ — قيدٌ عند كل حركة مال. الطلب يحمل الصورة، والدفتر
+ * يحمل القصّة: من فعل ماذا ومتى. راجع utils/ledger.js. */
+const ledger = require('../utils/ledger');
 
 /* رسالة الخطأ للزبون: عربية ومفيدة، والتفصيل يُسجَّل عندنا لا يُرسَل إليه.
    نأخذها من السيرفر ليكون لسان المنصّة واحداً في كل مسار. */
@@ -383,7 +388,10 @@ router.post('/', needsIdentity, async (req, res) => {
        * التطبيق أبداً: من يقول «دفعتُ» هو مزوّد الدفع عبر مساره الخاص،
        * لا الجهاز الذي بيد الزبون. */
       const askedMethod = String(orderData.paymentMethod || 'cash');
-      orderData.paymentMethod = ['cash', 'wallet', 'card'].includes(askedMethod) ? askedMethod : 'cash';
+      /* `qr` طريقةٌ يختارها الزبون كما يختار الكاش — والفرق أن ماله
+       * يصل حسابَ زادنا لا جيبَ المندوب. لكن اختيارَه ليس دفعاً:
+       * تبقى `paymentStatus = 'pending'` حتى يُؤكَّد وصولُ التحويل. */
+      orderData.paymentMethod = ['cash', 'wallet', 'card', 'qr'].includes(askedMethod) ? askedMethod : 'cash';
       orderData.paymentStatus = 'pending';
       orderData.paidOnline = false;
       // الخصم صفرٌ حتى تُبنى الكوبونات — والحقل موجود ليُحسب صحيحاً حين تُبنى
@@ -422,6 +430,20 @@ router.post('/', needsIdentity, async (req, res) => {
       const savedId = finalId;
 
       console.log(`✅ [Firestore] تم حفظ طلب جديد: ${savedId}`);
+
+      /* أوّل قيدٍ في قصّة الطلب: نشأ التزامٌ بمبلغٍ محدَّد.
+       * `neutral` لأن شيئاً لم يدخل خزنتك بعد — نشأ الالتزام فقط. */
+      ledger.record(db, {
+        kind: ledger.KINDS.ORDER_CREATED,
+        orderId: savedId,
+        amount: m.grandTotal,
+        direction: 'neutral',
+        actorId: (req.user && req.user.userId) || orderData.customerId || null,
+        actorRole: 'customer',
+        actorName: orderData.customerName || '',
+        note: `${m.itemsTotal} أصناف + ${m.deliveryFee} توصيل · ${orderData.restaurant || ''}`,
+        meta: { restaurantId: orderData.restaurantId || null, isMart },
+      }).catch(() => {});
 
       // Emit Real-time update
       // ملاحظة: نستعمل savedId لا orderId — عند التصادم يختلفان، وبثّ
@@ -852,10 +874,10 @@ router.patch('/:id', needsIdentity, async (req, res) => {
          لا يدهس أحدهما الآخر. وفشلُه لا يُسقط التسليم — تسليمٌ تمّ
          فعلاً أهمّ من عدّاد. */
       if (status === 'DELIVERED') {
+        const m = cur.money || {};
+        const drvId = curDrvKey || meId;
         try {
-          const m = cur.money || {};
           const kept = Math.max(0, Number(m.cashToCollect || 0) - Number(m.payToRestaurant || 0));
-          const drvId = curDrvKey || meId;
           if (kept > 0 && drvId) {
             const FV = require('firebase-admin').firestore.FieldValue;
             await db.collection('users').doc(String(drvId))
@@ -864,6 +886,61 @@ router.patch('/:id', needsIdentity, async (req, res) => {
         } catch (e) {
           console.warn('⚠️ تعذّر تحديث كاش المندوب:', e.message);
         }
+
+        /* ═══ قيود لحظة التسليم ═══
+         *
+         * هنا يتحرّك المال فعلياً، فهنا تُكتب القصّة. وثلاثة قيود لا
+         * واحد، لأن ثلاثة أشياء وقعت: قُبض من الزبون، ودُفع للمحلّ،
+         * وانتقلت البضاعة.
+         *
+         * وكلّها `neutral` في الكاش: لا شيء دخل خزنتك ولا خرج منها —
+         * المال مرّ بين الزبون والمندوب والمحلّ. ما يبقى لك هو
+         * العمولة، وتُقيَّد يوم التسوية لا اليوم. */
+        const drvName = (cur.driver && cur.driver.name) || '';
+        const collectedVia = String(cur.collectedVia || '');
+        const paidOnline = (m.paidOnline === true);
+
+        const entries = [];
+
+        if (!paidOnline && Number(m.cashToCollect) > 0) {
+          entries.push({
+            kind: collectedVia === 'qr' ? ledger.KINDS.COLLECTED_QR : ledger.KINDS.COLLECTED_CASH,
+            orderId: String(id),
+            amount: m.cashToCollect,
+            direction: 'neutral',
+            actorId: drvId || null, actorRole: 'driver', actorName: drvName,
+            reference: cur.paymentReference || null,
+            note: collectedVia === 'qr'
+              ? 'تحويل على حساب المندوب — لم يمرّ بزادنا'
+              : 'نقداً من الزبون',
+          });
+        }
+
+        if (!paidOnline && Number(m.payToRestaurant) > 0) {
+          entries.push({
+            kind: ledger.KINDS.PAID_RESTAURANT,
+            orderId: String(id),
+            amount: m.payToRestaurant,
+            direction: 'neutral',
+            actorId: drvId || null, actorRole: 'driver', actorName: drvName,
+            note: `للمحلّ ${cur.restaurant || cur.restaurantId || ''} — نقداً وقت الاستلام`,
+            meta: { restaurantId: cur.restaurantId || null },
+          });
+        }
+
+        entries.push({
+          kind: ledger.KINDS.DELIVERED,
+          orderId: String(id),
+          amount: m.grandTotal || 0,
+          direction: 'neutral',
+          actorId: drvId || null, actorRole: 'driver', actorName: drvName,
+          note: paidOnline
+            ? `مدفوع مسبقاً — عليك ${m.owedToRestaurant || 0} للمحلّ و${m.owedToDriver || 0} للمندوب`
+            : `عمولة زادنا ${m.zadnaCommission || 0} ₪ تنتظر التسوية`,
+          meta: { paidOnline, zadnaCommission: m.zadnaCommission || 0 },
+        });
+
+        ledger.recordMany(db, entries).catch(() => {});
       }
 
       // Notify via sockets
@@ -999,7 +1076,9 @@ router.post('/:id/payment', async (req, res) => {
       return res.json({ success: true, already: true, money: cur.money, message: 'مسجَّل مدفوعاً سابقاً' });
     }
 
-    const method = ['card', 'wallet'].includes(String(b.method)) ? String(b.method) : 'card';
+    /* `qr` هنا كأختيها: مالٌ وصل زادنا فعلاً. والحسابات تنقلب
+     * انقلابها نفسه — المندوب لا يحصّل ولا يدفع ولا يدين. */
+    const method = ['card', 'wallet', 'qr'].includes(String(b.method)) ? String(b.method) : 'card';
 
     /* المرجع من البوابة — بدونه لا سبيل لمطابقة كشفك بكشفها عند خلاف.
      * ونجعله مطلوباً: تأكيدُ دفعٍ بلا مرجع كلامٌ لا وثيقة. */
@@ -1026,6 +1105,32 @@ router.post('/:id/payment', async (req, res) => {
     const patched = { ...cur, paidOnline: true, paymentStatus: 'paid', paymentMethod: method };
     const m = applyPayment(breakdown(patched), patched);
 
+    /* ══════════════════════════════════════════════════════════════
+       التأكيد المتأخّر — ومن يستحقّ التسعين.
+
+       `applyPayment` تفترض أنك المدين للمحلّ، وهو صحيحٌ حين يُدفع
+       الثمن قبل أن يتحرّك المندوب. لكن تأكيدَ تحويلٍ بالـQR قد يصلك
+       بعد أن يكون المندوب استلم الطلب — وهو يدفع للمحلّ نقداً لحظة
+       الاستلام.
+
+       فلو تركنا الحساب على حاله لدفعتَ التسعين ثانيةً للمحلّ الذي
+       قبضها، ولم تُعِد للمندوب ما أخرجه من جيبه. تسعون تضيع في كل
+       طلب، ولا شاشة تُظهر الفرق — لأن المجموع يبقى متّزناً ظاهرياً.
+
+       فنُحوّل الدَّين إلى صاحبه: المحلّ قبض، والمندوب هو الدائن الآن
+       بما دفع مضافاً إليه أجرته.
+       ══════════════════════════════════════════════════════════════ */
+    const AFTER_PICKUP = ['PICKED_UP', 'ON_THE_WAY', 'DELIVERED'];
+    const driverAlreadyPaid = AFTER_PICKUP.includes(status) && !(cur.paidOnline === true);
+
+    if (driverAlreadyPaid && m.owedToRestaurant > 0) {
+      const reimburse = m.owedToRestaurant;
+      m.owedToDriver      = r2m(m.owedToDriver + reimburse);
+      m.zadnaOwesDriver   = r2m(m.zadnaOwesDriver + reimburse);
+      m.owedToRestaurant  = 0;
+      m.driverPaidRestaurant = reimburse;   // أثرٌ يبقى: لماذا كبر دَينك للمندوب
+    }
+
     await ref.update({
       paidOnline: true,
       paymentStatus: 'paid',
@@ -1038,6 +1143,21 @@ router.post('/:id/payment', async (req, res) => {
 
     // الكاش يحمل نسخةً بـ`cashToCollect` القديمة — ولو بقيت لطالب المندوب بها
     invalidate('orders:all');
+
+    /* المال دخل خزنتك فعلاً — `in`، وهو الفرق بين الإلكتروني والكاش.
+     * وهذا القيد هو ما يجعل «ما عليّ للشركاء» رقماً موثّقاً لا تقديراً. */
+    ledger.record(db, {
+      kind: ledger.KINDS.PAID_ONLINE,
+      orderId: String(id),
+      amount: m.grandTotal,
+      direction: 'in',
+      actorId: (req.user && req.user.userId) || cur.customerId || null,
+      actorRole: req.isAdmin ? 'admin' : 'customer',
+      actorName: cur.customerName || '',
+      reference,
+      note: `${method} — عليك للمحلّ ${m.owedToRestaurant} وللمندوب ${m.owedToDriver}`,
+      meta: { method, owedToRestaurant: m.owedToRestaurant, owedToDriver: m.owedToDriver },
+    }).catch(() => {});
 
     const io = req.app.get('socketio');
     if (io) io.emit('order_paid', { orderId: id, method, money: m });
@@ -1053,6 +1173,111 @@ router.post('/:id/payment', async (req, res) => {
     });
   } catch (e) {
     console.error('❌ تأكيد الدفع:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════════
+   POST /api/orders/:id/qr-claim — الزبون يبلّغ أنه حوّل.
+
+   وهذا المسار **لا يجعل الطلب مدفوعاً**، وهذا كلّ الأمر.
+
+   الفرق بين «قال إنه دفع» و«وصلني المال» هو الفرق بين منصّةٍ تُسرَق
+   وأخرى لا تُسرَق. صورةُ شاشةٍ تُزوَّر في دقيقة، ورقمُ مرجعٍ يُخترع
+   بلا كلفة. فلو كان هذا المسار يقلب `paidOnline` إلى true لصار بابَ
+   سرقةٍ مفتوحاً: يطلب، يكتب رقماً من رأسه، يستلم طعامه، ولا شيء وصلك.
+
+   ما يفعله: يسجّل الادّعاء بوقته ورقمه، ويُنبّهك، ويكتب سطراً في
+   الدفتر. والتأكيد يبقى عندك — من اللوحة اليوم، ومن رسائل بنكك حين
+   نبنيها. ثم يمرّ على `/payment` الذي يتحقّق من المبلغ ويقلب الحساب.
+
+   ولماذا نقبل الادّعاء أصلاً بدل تجاهله؟ لأنه يوفّر عليك البحث:
+   يأتيك الرقم والمبلغ والوقت جاهزةً، فتطابقها بكشفك في ثوانٍ بدل أن
+   تسأل الزبون وتنتظر ردّه.
+   ══════════════════════════════════════════════════════════════════ */
+router.post('/:id/qr-claim', needsIdentity, async (req, res) => {
+  try {
+    const db = getDb(req);
+    const id = String(req.params.id);
+    if (!db) return res.status(503).json({ success: false, error: 'لا قاعدة بيانات' });
+
+    const ref = db.collection('orders').doc(id);
+    const snap = await ref.get();
+    meter.addReads(1, 'ادّعاء تحويل');
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+
+    const o = snap.data() || {};
+
+    if (String(o.status || '') === 'CANCELLED') {
+      return res.status(409).json({ success: false, error: 'الطلب ملغيّ' });
+    }
+    if (o.paidOnline === true) {
+      return res.json({ success: true, already: true, message: 'الطلب مؤكَّد الدفع سلفاً' });
+    }
+
+    /* صاحبُ الطلب وحده يبلّغ عنه. وبلا هذا يستطيع أي مستخدمٍ مسجَّل
+     * أن يُغرق طلبات الآخرين بادّعاءاتٍ كاذبة فيُربك كشفك. */
+    const me = req.user || {};
+    const meId = String(me.userId || me.id || '');
+    const mePhone = String(me.phone || '');
+    const isOwner = (meId && String(o.customerId || '') === meId)
+                 || (mePhone && String(o.customerPhone || '') === mePhone);
+    if (!req.isAdmin && !isOwner) {
+      return res.status(403).json({ success: false, error: 'هذا الطلب ليس لك' });
+    }
+
+    const reference = String((req.body || {}).reference || '').trim().slice(0, 120);
+    if (reference.length < 3) {
+      return res.status(400).json({ success: false, error: 'اكتب رقم عملية التحويل كما ظهر لك' });
+    }
+
+    const expected = Number((o.money && o.money.grandTotal) != null ? o.money.grandTotal : o.grandTotal) || 0;
+
+    await ref.update({
+      paymentMethod: 'qr',
+      paymentStatus: 'claim_pending',
+      qrClaim: {
+        reference,
+        amount: expected,
+        at: new Date(),
+        by: meId || mePhone || 'customer',
+      },
+    });
+    invalidate('orders:all');
+
+    ledger.record(db, {
+      kind: ledger.KINDS.QR_CLAIMED,
+      orderId: id,
+      amount: 0,                 // لا مال تحرّك — الميزان لا يتأثّر
+      direction: 'neutral',
+      actorId: meId || null,
+      actorRole: req.isAdmin ? 'admin' : 'customer',
+      actorName: o.customerName || '',
+      reference,
+      note: `أبلغ عن تحويل ${expected} ₪ — بانتظار تأكيدك`,
+      meta: { claimedAmount: expected },
+    }).catch(() => {});
+
+    /* تنبيهك أنت لا المندوب: المندوب لا يملك تأكيد وصول مالٍ لحسابك،
+     * وإخباره يغريه بتسليم الطلب على ادّعاءٍ لم يُتحقّق منه. */
+    const io = req.app.get('socketio');
+    if (io) {
+      io.emit('qr_claim', {
+        orderId: id, reference, amount: expected,
+        customerName: o.customerName || '', customerPhone: o.customerPhone || '',
+        at: new Date(),
+      });
+    }
+
+    console.log(`🔔 ادّعاء تحويل #${id} · مرجع ${reference} · ${expected} ₪ — لم يُؤكَّد`);
+
+    res.status(201).json({
+      success: true,
+      confirmed: false,
+      message: 'وصلنا بلاغك — نتأكّد من التحويل ونؤكّد طلبك',
+    });
+  } catch (e) {
+    console.error('❌ ادّعاء تحويل:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -1148,6 +1373,38 @@ router.post('/:id/cancel', needsIdentity, async (req, res) => {
         paymentStatus: 'refund_pending',
       } : {}),
     });
+
+    /* الإلغاء حدثٌ يُقيَّد ولو لم يتحرّك فيه قرش: الطلب الذي اختفى بلا
+     * أثرٍ في الدفتر هو بابُ كل خلاف لاحق. */
+    {
+      const who = req.isAdmin ? 'admin' : 'customer';
+      const cancelEntries = [{
+        kind: ledger.KINDS.CANCELLED,
+        orderId: String(id),
+        amount: Number((o.money && o.money.grandTotal) || o.grandTotal || 0),
+        direction: 'neutral',
+        actorId: (req.user && req.user.userId) || null,
+        actorRole: who, actorName: o.customerName || '',
+        note: reason || 'بلا سبب مذكور',
+        meta: { wasPaid },
+      }];
+      /* ودَينُ الاسترداد قيدٌ مستقلّ: المال لم يخرج بعد، لكنه صار
+       * التزاماً. يخرج يوم تُنفَّذ الإعادة بقيد refund_paid. */
+      if (wasPaid && refundAmt > 0) {
+        cancelEntries.push({
+          kind: ledger.KINDS.REFUND_DUE,
+          orderId: String(id),
+          amount: refundAmt,
+          direction: 'neutral',
+          actorId: (req.user && req.user.userId) || null,
+          actorRole: who,
+          actorName: o.customerName || '',
+          note: `استرداد مستحقّ للزبون ${o.customerPhone || ''} — لم يُنفَّذ بعد`,
+          meta: { phone: o.customerPhone || '' },
+        });
+      }
+      ledger.recordMany(db, cancelEntries).catch(() => {});
+    }
 
     if (wasPaid) {
       console.warn(`💸 إلغاء طلبٍ مدفوع #${id} — استرداد مستحقّ ${refundAmt} ₪ للزبون ${o.customerPhone || ''}`);
