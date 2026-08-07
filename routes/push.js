@@ -42,16 +42,30 @@ const CHANNELS = {
   // v3 للكابتن وحده: صوت منبّه واهتزاز أطول وإيقاظ شاشة — إعدادات
   // القناة تتجمّد عند إنشائها فلا ترقية إلا باسم جديد. **يستلزم بناء
   // تطبيق الكابتن مع هذا النشر** وإلا سقط إشعاره على قناة غير موجودة.
-  alert:   { id: 'zadna_alert_v3',   sound: 'zadna_alert',   priority: 'high' },
-  partner: { id: 'zadna_partner_v2', sound: 'zadna_partner', priority: 'high' },
-  update:  { id: 'zadna_update_v2',  sound: 'zadna_update',  priority: 'default' },
-  arrived: { id: 'zadna_arrived_v2', sound: 'zadna_arrived', priority: 'high' },
-  success: { id: 'zadna_success_v2', sound: 'zadna_intro',   priority: 'high' },
+  /* ============================================================
+     قفزة النسخ الجماعية (٧ آب) — أغنية زادنا بطّلت تيجي.
+
+     التطبيق كان يبني رابط صوت القناة **برقم المورد**، وأرقام الموارد
+     تتزحزح بين البناءات — فبناء خطوط Cairo زحزحها وبقيت قنوات الأجهزة
+     تشير لأرقامٍ صارت تعني ملفاً آخر. قنواتُ أندرويد لا تُعدَّل بعد
+     إنشائها، فالعلاج نسخ قنوات جديدة (والتطبيق صار يبني الرابط بالاسم
+     فلا يتكرّر هذا).
+
+     ⚠️ هذه الأسماء حقيقة في مكانين — هنا وفي ZadnaMessagingService.kt.
+     **هذا النشر يرافق بناء التطبيقات الثلاثة** وإلا سقطت الإشعارات
+     على أسماء قديمة (يلتقطها LEGACY_CHANNELS في التطبيق الجديد، أما
+     التطبيق القديم فقناته القديمة أصلاً معطوبة الصوت).
+     ============================================================ */
+  alert:   { id: 'zadna_alert_v4',   sound: 'zadna_alert',   priority: 'high' },
+  partner: { id: 'zadna_partner_v3', sound: 'zadna_partner', priority: 'high' },
+  update:  { id: 'zadna_update_v3',  sound: 'zadna_update',  priority: 'default' },
+  arrived: { id: 'zadna_arrived_v3', sound: 'zadna_arrived', priority: 'high' },
+  success: { id: 'zadna_success_v3', sound: 'zadna_intro',   priority: 'high' },
   /* الشات: خفيفة عمداً.
    * الرسالة ليست طلباً — لا تتجاوز «عدم الإزعاج» ولا تهتزّ طويلاً ولا
    * توقظ الشاشة. من يُرعبه رنينُ رسالةٍ يُطفئ إشعارات زادنا كلها،
    * فيخسر الطلبات معها. `zadna_update` أقصر نغماتنا وأهدؤها. */
-  chat:    { id: 'zadna_chat_v1',    sound: 'zadna_update',  priority: 'default' },
+  chat:    { id: 'zadna_chat_v2',    sound: 'zadna_update',  priority: 'default' },
 };
 
 /* ===== حفظ رموز الأجهزة =====
