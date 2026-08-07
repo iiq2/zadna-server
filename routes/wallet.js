@@ -290,8 +290,35 @@ router.get('/wallet/driver/:id', needsIdentity,
     const zadnaOwesD = r2(Math.max(0, zadnaOwesAll - paidOut));
     const netBalance = r2(owesZadna - zadnaOwesD);
 
+    /* ============================================================
+       سقف الكاش — الحارس الذي كان يعمل بصمت.
+
+       `routes/push.js` يستبعد من تجاوز السقف **قبل** أن يصله الطلب،
+       فتتوقّف طلباته فجأة. والتطبيق كان يقول له في نفس اللحظة: «أنت
+       متصل ومستعد استقبال الطلبات ⚡» — وهذا كذبٌ لا نقص.
+
+       مندوبٌ فاته الإشعار (وهاتفه في جيبه وهو يقود) يتّهم المنصّة
+       بالتمييز، وهو ببساطة لا يعرف قاعدةً موجودة. فنرسل الرقمين
+       ليعرف السبب ويعرف الحلّ.
+       ============================================================ */
+    let cashOnHand = 0;
+    try {
+      const u = await db.collection('users').doc(id).get();
+      if (u.exists) cashOnHand = Number((u.data() || {}).cashOnHand || 0);
+      meter.addReads(1, 'كاش المندوب');
+    } catch (e) {
+      console.warn('⚠️ تعذّرت قراءة كاش المندوب:', e.message);
+    }
+    const cashCap = Number(process.env.ZADNA_CASH_CAP || 800);
+
     res.json({
       success: true, ownerType: 'driver', ownerId: id,
+      /* الحقول الثلاثة تُقرأ معاً: الرقم والسقف والحكم. ولا نترك
+       * التطبيق يستنتج الحكم بمقارنةٍ يكرّرها — فلو غيّرنا القاعدة
+       * غداً (سقفٌ لكل مندوب مثلاً) تغيّر الحكم في مكانٍ واحد. */
+      cashOnHand: r2(cashOnHand),
+      cashCap,
+      blockedByCashCap: cashCap > 0 && cashOnHand >= cashCap,
       period: req.query.period || 'all',
       deliveries: inPeriod.length,
       onlineDeliveries: onlineCount,        // كم منها مدفوعٌ إلكترونياً
