@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { MART_CATEGORIES, MART_SUGGESTIONS } = require('../data/martCatalog');
-const { cached, invalidate } = require('../utils/cache');
+const { cached, invalidate, updateCached } = require('../utils/cache');
 const meter = require('../utils/meter');
 
 /* ============================================================
@@ -39,7 +39,35 @@ const needsIdentity = (req, res, next) => {
   return fn ? fn(req, res, next) : next();
 };
 
-const CATALOG_TTL = 300000;   // خمس دقائق — ويُمحى فوراً بعد أي تعديل
+/* ============================================================
+   عمر كتالوج المحلّ — رُفع من ٥ دقائق إلى ٦ ساعات (٧ آب).
+
+   السبب: شريكٌ حقيقي بخمسة آلاف صنف. بعمر ٥ دقائق يُعاد قراءة
+   الكتالوج كاملاً ٢٨٨ مرّة يومياً = ١٫٤ مليون قراءة — والحصة ٥٠ ألفاً.
+
+   والصحّة لا تأتي من قِصَر العمر بل من دقّة الإبطال (نفس درس كتالوج
+   الإدارة أدناه): كل كتابة تُصلح الكاش أو تمسحه فوراً، فالتعديل يظهر
+   في اللحظة، والقراءة الكاملة تقع فقط عند الإقلاع وبعد استيرادٍ جماعي.
+
+   ⚠️ هذا صحيح لأن السيرفر **نسخة واحدة** (خطة Render الحالية).
+   لو صار نسخاً متعددة يوماً، احتاج الإبطال قناةً بينها.
+   ============================================================ */
+const CATALOG_TTL = 6 * 60 * 60 * 1000;   // ست ساعات — والإبطال الدقيق هو الضامن
+
+/* تطبيع نصّ البحث — عربيّ الهمزات والتاء المربوطة والتشكيل.
+
+   «زيت زيتون» يجب أن يجد «الزَّيت» و«زيتة». والبحث يقع على السيرفر
+   (لا بالذاكرة في التطبيق) لأن خمسة آلاف صنف لا تُنزَل لتُفلتر. */
+function normText(s) {
+  return String(s || '')
+    .replace(/[ً-ْٰ]/g, '')   // التشكيل
+    .replace(/[أإآا]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .replace(/ؤ/g, 'و')
+    .replace(/ئ/g, 'ي')
+    .toLowerCase().trim();
+}
 
 /* ============================================================
    كتالوج الإدارة (كل المحلّات معاً) — عمرٌ طويل عمداً.
@@ -62,6 +90,73 @@ const ADMIN_CATALOG_TTL = 6 * 60 * 60 * 1000;   // ست ساعات
 /** كل كتابة على صنف تمسح كتالوج محلّه وكتالوج الإدارة معاً. */
 function invalidateCatalog(marketId) {
   invalidate(`mart:${marketId}`, 'mart:all');
+}
+
+/* ============================================================
+   الإصلاح الجراحي للكاش — بديل الإبطال للكتابات المفردة.
+
+   لماذا: بعمر كاشٍ ستّ ساعات، الإبطالُ الكامل يعني أن **تعديل سعر
+   صنفٍ واحد** يُعيد قراءة الكتالوج كلّه (٥٠٠٠ مستند). صاحبُ محلٍّ
+   يُطفئ ثلاثين صنفاً نفدت خلال يومه = ١٥٠ ألف قراءة — ثلاثة أضعاف
+   الحصة اليومية كلّها.
+
+   فالكتابة المفردة تُصلح النسخة المخزَّنة في مكانها. والاستيراد
+   الجماعي وحده يُبطل كاملاً — حدثٌ نادر يستحق قراءته.
+
+   السقوط آمن بالبناء: مفتاحٌ غير محمَّل → `updateCached` تُرجع false
+   ولا شيء يُفعل، والقراءة القادمة تحمّل الطازج من Firestore.
+
+   ⚠️ الدالة الممرَّرة **تُرجع مصفوفةً دائماً** — غير المصفوفة تُبقي
+   القديم بلا تحديث (سلوك updateCached).
+   ============================================================ */
+function patchCatalogCaches(marketId, mutate) {
+  try { updateCached(`mart:${marketId}`, list => mutate(list, /*isAdminList*/ false)); }
+  catch (_) { invalidate(`mart:${marketId}`); }
+  try { updateCached('mart:all', list => mutate(list, true)); }
+  catch (_) { invalidate('mart:all'); }
+}
+
+/** استبدال صنفٍ أو إدراجه في كاشَي الكتالوج. عناصر كاش الإدارة تحمل marketId. */
+function upsertInCaches(marketId, id, product) {
+  patchCatalogCaches(marketId, (list, isAdmin) => {
+    const item = isAdmin ? { id, marketId, ...product } : { id, ...product };
+    const i = list.findIndex(p => p && p.id === id && (!isAdmin || p.marketId === marketId));
+    if (i >= 0) { const next = [...list]; next[i] = { ...list[i], ...item }; return next; }
+    return [...list, item];
+  });
+}
+
+/** حذف صنفٍ من كاشَي الكتالوج. */
+function removeFromCaches(marketId, id) {
+  patchCatalogCaches(marketId, (list, isAdmin) =>
+    list.filter(p => !(p && p.id === id && (!isAdmin || p.marketId === marketId))));
+}
+
+/* ============================================================
+   المعرّف المستقرّ — درع الاستيراد المكرّر.
+
+   `bulk` كان يولّد `p_<وقت>_<عشوائي>` لكل صنفٍ بلا معرّف. فمن استورد
+   ملف الخمسة آلاف مرّتين (تصحيح سعر، إضافة عمود) صار عنده عشرة آلاف —
+   كل صنفٍ مرّتين بسعرين، والزبون يرى الاثنين.
+
+   القاعدة: الهوية من **الاسم المطبَّع + العلامة** (أو `sku` إن أعطاه
+   نظام الكاشير). نفس الصف في الملف → نفس المعرّف → `set merge` يحدّث
+   ولا يضاعف.
+
+   والدمج يلتقط حتى اختلاف التشكيل والهمزات بين استيرادَين.
+   ============================================================ */
+function stableProductId(item) {
+  const sku = String((item && item.sku) || '').trim();
+  if (sku) return 'sku_' + sku.replace(/[^0-9A-Za-z_-]/g, '').slice(0, 60);
+  const key = normText((item && item.nameAr) || '') + '|' + normText((item && item.brand) || '');
+  /* بصمة قصيرة حتمية — لا مكتبة خارجية، ولا عشوائية */
+  let h1 = 0x811c9dc5, h2 = 0x1000193;
+  for (let i = 0; i < key.length; i++) {
+    const c = key.charCodeAt(i);
+    h1 = ((h1 ^ c) * 0x01000193) >>> 0;
+    h2 = ((h2 + c) * 0x0100019b) >>> 0;
+  }
+  return 'pn_' + h1.toString(36) + h2.toString(36);
 }
 
 /* ===== الصلاحية =====
@@ -406,12 +501,58 @@ router.get('/nearest', async (req, res) => {
      * لبقيت النتيجة مخزَّنةً بوقت أوّل قارئ، فيرى من بعده عرضاً انقضى
      * — أو يُحرَم من عرضٍ ما زال قائماً. الطيّ عند كل ردّ لا عند كل قراءة. */
     const nowMs = Date.now();
+    const market = { id: open.id, name: open.name, emoji: open.emoji, imageUrl: open.imageUrl,
+                     address: open.address, lat: open.lat, lng: open.lng, km: open.km };
+
+    /* ============================================================
+       `light=1` — الأقسام بعدّاداتها، لا الكتالوج.
+
+       وُلد يوم جاء شريكٌ بخمسة آلاف صنف: الردّ الكامل ≈ ٢ ميغا لكل
+       فتحة تطبيق، أغلبها لن يُنظر إليه. فالشاشة الأولى تحتاج «ما
+       الأقسام وكم فيها وأين العروض» — والأصناف تُجلب كسولاً بالقسم
+       من `GET /mart_products?marketId=&categoryId=` (صفحات).
+
+       الردّ ثابت الحجم مهما كبر الكتالوج. والعرض القائم يُحسب بساعة
+       السيرفر — نفس ساعة المحاسبة.
+       ============================================================ */
+    if (String(req.query.light || '') === '1') {
+      const visible = products.filter(p => p.available !== false)
+                              .map(p => withLiveOffers(p, nowMs));
+      const catMap = {};
+      let offersTotal = 0;
+      for (const p of visible) {
+        const cid = String(p.categoryId || 'pantry');
+        if (!catMap[cid]) catMap[cid] = { categoryId: cid, count: 0, offers: 0 };
+        catMap[cid].count++;
+        /* بعد `withLiveOffers` للزبون: المنتهي أُسقط حقلاه، والقائم بقي
+         * `offerPrice` عليه. فوجود الحقل هو علامة العرض الحيّ — لا
+         * `offerLive` (تلك تُرسل لصاحب المحلّ وحده مع keepExpired). */
+        const hasOffer = Array.isArray(p.units) && p.units.some(u => u && u.offerPrice != null);
+        if (hasOffer) { catMap[cid].offers++; offersTotal++; }
+      }
+      /* أسماء الأقسام ورموزها من القائمة المشتركة — والقسم الذي لا
+       * تعرفه القائمة (بيانات قديمة) يمرّ بمعرّفه لا يُسقَط صامتاً. */
+      const named = Object.values(catMap).map(c => {
+        const meta = MART_CATEGORIES.find(m => m.id === c.categoryId);
+        return { ...c, nameAr: meta ? meta.nameAr : c.categoryId,
+                 emoji: meta ? meta.emoji : '🛒' };
+      }).sort((a, b) => b.count - a.count);
+
+      return res.json({
+        success: true, light: true,
+        serverTime: new Date(nowMs).toISOString(),
+        market,
+        totalProducts: visible.length,
+        offersTotal,
+        categories: named,
+        alternatives: ranked.length - 1,
+      });
+    }
 
     res.json({
       success: true,
       serverTime: new Date(nowMs).toISOString(),   // ليحسب التطبيق «ينتهي بعد…» بساعتنا لا بساعته
-      market: { id: open.id, name: open.name, emoji: open.emoji, imageUrl: open.imageUrl,
-                address: open.address, lat: open.lat, lng: open.lng, km: open.km },
+      market,
       /* الزبون لا يرى ما نفد؛ صاحب المحل يراه في تطبيقه ليُعيده.
        * والرمز يُمنَح لمن لا رمز له — هذا هو المسار الذي يراه الزبون
        * فعلاً، فبلا هذا السطر تبقى شاشته صفّاً من الشعارات المتطابقة. */
@@ -513,7 +654,59 @@ async (req, res) => {
      * السيرفر التي يُحاسِب بها. */
     const nowMs = Date.now();
     if (forOwner) return res.json(withEmoji.map(p => withLiveOffers(p, nowMs, true)));
-    res.json(withEmoji.filter(p => p.available !== false).map(p => withLiveOffers(p, nowMs)));
+
+    const visible = withEmoji.filter(p => p.available !== false)
+                             .map(p => withLiveOffers(p, nowMs));
+
+    /* ============================================================
+       صفحات + بحث + فلترة قسم — وُلدت مع شريك الخمسة آلاف صنف.
+
+         ?categoryId=dairy          قسمٌ واحد
+         ?q=زيت                     بحث مطبَّع (السيرفر لا الهاتف —
+                                    خمسة آلاف صنف لا تُنزَل لتُفلتر)
+         ?offers=1                  ما عليه عرضٌ قائم فقط
+         ?limit=50&cursor=N         صفحات
+
+       الفلترة كلّها على كاش الذاكرة — **صفر قراءات Firestore** لكل
+       طلب زبون بعد أول تحميل.
+
+       المؤشّر فهرسٌ رقمي لا معرّف مستند: القائمة مرتّبة ثابتاً
+       (بالاسم) فالفهرس مستقرّ داخل عمر الكاش. ولو تبدّل الكتالوج بين
+       صفحتين (تعديلُ صاحب المحلّ) فأسوأ الأثر صنفٌ مكرّر أو مفقود في
+       حدود صفحة — مقبولٌ في تصفّح، قاتلٌ لو كان مالاً.
+
+       **العقد القديم محفوظ**: بلا `limit` يرجع الردّ مصفوفةً كاملة كما
+       كان — فلا ينكسر تطبيقٌ مثبَّت قبل هذا التعديل.
+       ============================================================ */
+    const catFilter = String(req.query.categoryId || '').trim();
+    const qFilter = normText(req.query.q || '');
+    const offersOnly = String(req.query.offers || '') === '1';
+
+    let filtered = visible;
+    if (catFilter) filtered = filtered.filter(p => String(p.categoryId || 'pantry') === catFilter);
+    if (qFilter) filtered = filtered.filter(p =>
+      normText(p.nameAr).includes(qFilter) || normText(p.brand).includes(qFilter));
+    if (offersOnly) filtered = filtered.filter(p =>
+      Array.isArray(p.units) && p.units.some(u => u && u.offerPrice != null));
+
+    const limitRaw = parseInt(req.query.limit, 10);
+    if (!Number.isFinite(limitRaw) || limitRaw <= 0) {
+      // العقد القديم: مصفوفة عارية كاملة
+      return res.json(filtered);
+    }
+
+    const limit = Math.min(limitRaw, 100);
+    const cursor = Math.max(0, parseInt(req.query.cursor, 10) || 0);
+    /* ترتيب ثابت كي لا يقفز الصنف بين الصفحات */
+    const sorted = [...filtered].sort((a, b) =>
+      String(a.nameAr || '').localeCompare(String(b.nameAr || ''), 'ar'));
+    const page = sorted.slice(cursor, cursor + limit);
+    const next = cursor + limit < sorted.length ? String(cursor + limit) : null;
+
+    res.json({
+      success: true, items: page, total: sorted.length,
+      nextCursor: next, serverTime: new Date(nowMs).toISOString(),
+    });
   } catch (e) {
     console.error('❌ كتالوج المارت:', e.message);
     res.status(500).json({ success: false, error: e.message });
@@ -534,13 +727,13 @@ router.post('/', needsIdentity, async (req, res) => {
     const { product, error } = cleanProduct(b);
     if (error) return res.status(400).json({ success: false, error });
 
-    // معرّف الاقتراح إن جاء منه، وإلا معرّف جديد لا يتصادم
-    const id = String(b.id || '').trim()
-      || `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    /* معرّف الاقتراح إن جاء منه، وإلا **معرّف مستقرّ من الاسم** — فمن
+     * أضاف «زيت زيتون ١ لتر» مرّتين سهواً حدّث الأوّل بدل أن يضاعفه. */
+    const id = String(b.id || '').trim() || stableProductId(b);
     await db.collection('restaurants').doc(marketId)
       .collection('products').doc(id).set(product, { merge: true });
 
-    invalidateCatalog(marketId);
+    upsertInCaches(marketId, id, product);
     res.status(201).json({ success: true, id, product: { id, ...product } });
   } catch (e) {
     console.error('❌ حفظ صنف:', e.message);
@@ -567,8 +760,9 @@ router.post('/bulk', needsIdentity, async (req, res) => {
       const { product, error } = cleanProduct(it);
       // لا نُسقط الدفعة كلّها لأجل صنف ناقص — نحفظ الصالح ونُبلغ عن الباقي
       if (error) { rejected.push({ nameAr: (it && it.nameAr) || '', error }); continue; }
-      const id = String((it && it.id) || '').trim()
-        || `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      /* المعرّف المستقرّ: إعادة استيراد نفس الملف تحدّث ولا تضاعف.
+       * ودفعتان في نفس الطلب لنفس الاسم → آخرهما يفوز (set merge). */
+      const id = String((it && it.id) || '').trim() || stableProductId(it);
       batch.set(col.doc(id), product, { merge: true });
       saved++;
       // Firestore يسمح بـ٥٠٠ عملية في الدفعة — نلتزم بحدّ آمن دونها
@@ -613,7 +807,9 @@ router.patch('/:id', needsIdentity, async (req, res) => {
     if (!snap.exists) return res.status(404).json({ success: false, error: 'الصنف غير موجود' });
     await ref.update(patch);
 
-    invalidateCatalog(marketId);
+    /* جراحيّ لا إبطال: إطفاء ثلاثين صنفاً نفدت خلال اليوم كان سيكلّف
+     * ثلاثين قراءةً كاملة للكتالوج (١٥٠ ألف مستند بكتالوج الشريك الكبير). */
+    upsertInCaches(marketId, String(req.params.id), { ...snap.data(), ...patch });
     res.json({ success: true });
   } catch (e) {
     console.error('❌ تعديل صنف:', e.message);
@@ -721,7 +917,8 @@ router.post('/:id/offer', needsIdentity, async (req, res) => {
     }
 
     await ref.update({ units: next, updatedAt: new Date() });
-    invalidateCatalog(marketId);
+    // عرضُ الصباح وإنهاءُ المساء فعلٌ يومي — لا يعيد قراءة كتالوجٍ كامل
+    upsertInCaches(marketId, String(req.params.id), { ...cur, units: next, updatedAt: new Date() });
     console.log(`🏷️ ${ending ? 'أُنهي' : 'أُطلق'} عرض: ${cur.nameAr || req.params.id} · ${changed} وحدة · ${marketId}`);
 
     const nowMs = Date.now();
@@ -752,7 +949,7 @@ router.delete('/:id', needsIdentity, async (req, res) => {
     await db.collection('restaurants').doc(marketId)
       .collection('products').doc(String(req.params.id)).delete();
 
-    invalidateCatalog(marketId);
+    removeFromCaches(marketId, String(req.params.id));
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
