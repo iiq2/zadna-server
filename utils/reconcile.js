@@ -64,6 +64,7 @@ async function driverCash(db) {
     meter.addReads(users.size + orders.size + setts.size, 'فحص كاش المناديب');
 
     const kept = new Map();     // driverKey → ما بقي في جيبه من الطلبات
+    const owed = new Map();     // driverKey → ما يدين به لزادنا (العمولة وحدها)
     orders.forEach(d => {
       const o = d.data() || {};
       const m = o.money || {};
@@ -72,6 +73,8 @@ async function driverCash(db) {
       if (!key) return;
       const v = Math.max(0, Number(m.cashToCollect || 0) - Number(m.payToRestaurant || 0));
       kept.set(key, (kept.get(key) || 0) + v);
+      // الدَّين = عمولة زادنا من الطلب (صفرٌ للإلكتروني)
+      owed.set(key, (owed.get(key) || 0) + Number(m.driverOwesZadna || 0));
     });
 
     const settled = new Map();  // ما سدّده لك (اتجاه in فقط)
@@ -104,6 +107,30 @@ async function driverCash(db) {
           hint: diff > 0
             ? 'العدّاد أكبر من الواقع — تسوية لم تُخصم، أو تسليم عُدّ مرّتين'
             : 'العدّاد أصغر من الواقع — تسليم لم يُحتسب، أو خصمٌ زائد',
+        });
+      }
+
+      /* ═══ الدَّين المخزَّن مقابل المحسوب ═══
+         `debtToZadna` رقمٌ مخزَّن يحرسه الحجب، ومصدره الأصدق هو
+         العمولة المحسوبة من الطلبات ناقص ما سُدِّد. فإن انحرفا، مندوبٌ
+         دَينه صفرٌ قد يبقى محجوباً — أو دائنٌ يمرّ. نصرخ عند الانحراف
+         بدل أن نتظاهر أن رقماً في مكانين لا يختلف أبداً. */
+      const debtStored = Number(u.debtToZadna || 0);
+      const debtEarned = (owed.get(id) || 0) + (owed.get(String(u.phone || '')) || 0);
+      const debtExpected = Math.max(0, debtEarned - paid);
+      const debtDiff = r2(debtStored - debtExpected);
+      if (Math.abs(debtDiff) > CASH_TOLERANCE) {
+        out.push({
+          driverId: id,
+          name: u.name || id,
+          phone: u.phone || '',
+          kind: 'debt',
+          stored: r2(debtStored),
+          expected: r2(debtExpected),
+          diff: debtDiff,
+          hint: debtDiff > 0
+            ? 'دَينٌ مخزَّن أكبر من المحسوب — قد يبقى المندوب محجوباً بلا حقّ'
+            : 'دَينٌ مخزَّن أصغر — تسليمٌ لم يُحتسب على دَينه',
         });
       }
     });
