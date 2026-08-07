@@ -136,6 +136,68 @@ const STATUS_AR = {
   CANCELLED:          'ملغي ❌'
 };  // أحدث 250 طلباً — يغطي أيام العمل بوفرة
 
+/* ═══════════════════════════════════════════════════════════════════
+   الإلغاء — حقيقةٌ واحدة لا أربع.
+
+   كان لكلّ مسار إلغاءٍ نسخته: `/cancel` وحده يكتب `refundDue` ويقيّده،
+   بينما `reject_by_shop` والمكنستان (المطعم لم يردّ · مهجور ١٢ ساعة)
+   يكتبن `CANCELLED` عارية، **ويَعِدن الزبون «المبلغ سيُعاد إليك»**
+   نصّاً بلا أن يخلّفن أثراً: لا `refundStatus`، فلا يظهر في
+   `refunds/pending`، ولا يلتقطه `reconcile.lateRefunds`. مالٌ حقيقي
+   وُعد به وضاع من كل سجلّ.
+
+   فصار الإلغاء بابه واحد: هذا الحقلُ والقيدُ. من يضيف مسار إلغاءٍ
+   خامساً غداً يمرّ من هنا — أو لا يُلغي.
+
+   ترجع: { patch, ledgerEntries } — patch يُدمَج في update، والقيود
+   تُمرَّر لـ recordMany.
+   ═══════════════════════════════════════════════════════════════════ */
+function buildCancellation(order, { by, reason, actorId, actorName }) {
+  const wasPaid = order.paidOnline === true || order.paymentStatus === 'paid';
+  const grand = Number((order.money && order.money.grandTotal) != null
+    ? order.money.grandTotal : order.grandTotal) || 0;
+  const refundAmt = wasPaid ? grand : 0;
+
+  const patch = {
+    status: 'CANCELLED',
+    statusAr: STATUS_AR.CANCELLED,
+    cancelledBy: by,
+    cancelReason: reason,
+    cancelledAt: new Date(),
+    ...(wasPaid ? {
+      refundDue: refundAmt,
+      refundStatus: 'pending',
+      paymentStatus: 'refund_pending',
+    } : {}),
+  };
+
+  const ledgerEntries = [{
+    kind: ledger.KINDS.CANCELLED,
+    orderId: String(order.id || ''),
+    amount: grand,
+    direction: 'neutral',
+    actorId: actorId || null,
+    actorRole: by,
+    actorName: actorName || order.customerName || '',
+    note: reason || 'بلا سبب مذكور',
+    meta: { wasPaid },
+  }];
+  if (wasPaid && refundAmt > 0) {
+    ledgerEntries.push({
+      kind: ledger.KINDS.REFUND_DUE,
+      orderId: String(order.id || ''),
+      amount: refundAmt,
+      direction: 'neutral',
+      actorId: actorId || null,
+      actorRole: by,
+      actorName: actorName || order.customerName || '',
+      note: `استرداد مستحقّ للزبون ${order.customerPhone || ''} — لم يُنفَّذ بعد`,
+      meta: { phone: order.customerPhone || '' },
+    });
+  }
+  return { patch, ledgerEntries, wasPaid, refundAmt };
+}
+
 // =====================
 // Routes - Orders
 // =====================
@@ -802,6 +864,26 @@ router.patch('/:id', needsIdentity, async (req, res) => {
     const meId = String(req.user?.userId || '');
     const UNASSIGNED_STATES = ['READY_FOR_PICKUP', 'PENDING_RESTAURANT', 'ACCEPTED', 'PREPARING'];
 
+    /* ============================================================
+       الطلب المنتهي لا يُحيا — لا كاش ولا مندوب ولا حالة.
+
+       كان `PATCH` وحده بين كل المسارات لا يفحص الحالة الحالية:
+       `isFreeToTake` تصير صحيحةً لأي طلبٍ بلا مندوب **بما فيها
+       الملغى** (`!curDrvKey` وحدها تكفي). فمندوبٌ يصله نداءٌ لطلبٍ
+       أُلغي للتوّ يقبله فينقلب من CANCELLED إلى DRIVER_ASSIGNED
+       بصمت، ويسلّمه، فيُقيَّد كاشٌ ووُيدفع للمطعم عن طلبٍ أُلغي
+       واستُرِدّ للزبون ماله. مالٌ يُدفع مرّتين.
+
+       والإدارة تُستثنى: تصحيحُ حالةٍ عالقة قرارُها. */
+    if (!req.isAdmin && ['CANCELLED', 'DELIVERED'].includes(String(cur.status || ''))) {
+      return res.status(409).json({
+        success: false,
+        error: String(cur.status) === 'CANCELLED'
+          ? 'هذا الطلب أُلغي — لم يعد قابلاً للتعديل'
+          : 'هذا الطلب سُلّم — انتهى'
+      });
+    }
+
     if (!req.isAdmin) {
       /* المندوب له هويتان: معرّف حسابه ورقم هاتفه — والقبول قد يسجّل
        * أيّاً منهما في `driver.id` (نسخ التطبيق القديمة ترسل الرقم).
@@ -820,7 +902,18 @@ router.patch('/:id', needsIdentity, async (req, res) => {
         curDrvKey === meId ||
         (mePhone && sp(curDrvKey, mePhone))
       );
-      const isFreeToTake = !curDrvKey || UNASSIGNED_STATES.includes(String(cur.status));
+
+      /* ============================================================
+         التقاطُ طلبٍ حرّ حقٌّ للمندوب وحده — لا لأي حساب مسجَّل.
+
+         كان `isFreeToTake` لا يسأل: هل الطالب مندوبٌ أصلاً؟ فأي زبون
+         مسجّلٍ يعرف رقم طلبٍ حرّ يعيّن نفسه مندوباً عليه ويسلّمه، فتُنسب
+         له أرباح، ويُلفَّق تسليمٌ وهمي يُفسد كل الأرقام. نفس فحص الدور
+         المطبَّق في `notifyDrivers` و`GET /orders` — كان غائباً هنا
+         وحده. */
+      const iAmDriver = me && (me.userType === 'driver' || me.worksAsDriver === true);
+      const isFreeToTake = iAmDriver &&
+        (!curDrvKey || UNASSIGNED_STATES.includes(String(cur.status)));
 
       /* صاحب المطعم يتحكّم بمراحل مطبخه دائماً — حتى بعد إسناد مندوب.
        *
@@ -874,7 +967,23 @@ router.patch('/:id', needsIdentity, async (req, res) => {
          `increment` لا قراءة-ثم-كتابة: طلبان يُسلَّمان في نفس الثانية
          لا يدهس أحدهما الآخر. وفشلُه لا يُسقط التسليم — تسليمٌ تمّ
          فعلاً أهمّ من عدّاد. */
-      if (status === 'DELIVERED') {
+      /* التسليم يُقيَّد المالَ ويزيد الكاش — فلا يُقبل إلا من حالةٍ
+       * يصحّ أن يسبقها تسليم. القفز من PENDING إلى DELIVERED مباشرةً
+       * (نداءٌ ملفَّق) كان يُقيَّد كاشاً ويكتب ثلاثة قيود عن طلبٍ لم
+       * يمرّ بمندوبٍ قطّ. الإدارة تُستثنى — تصحيحُها قرارُها. */
+      const DELIVERABLE_FROM = ['DRIVER_ASSIGNED', 'AT_RESTAURANT', 'PICKED_UP', 'ON_THE_WAY'];
+      const deliveryIsValid = status === 'DELIVERED' &&
+        (req.isAdmin || DELIVERABLE_FROM.includes(String(cur.status || '')));
+
+      if (status === 'DELIVERED' && !deliveryIsValid) {
+        console.warn('🔒 تسليم من حالة غير صالحة:', id, '| من:', cur.status, '| الطالب:', meId);
+        return res.status(409).json({
+          success: false,
+          error: 'لا يمكن تسليم طلبٍ لم يُستلم بعد'
+        });
+      }
+
+      if (deliveryIsValid) {
         const m = cur.money || {};
         const drvId = curDrvKey || meId;
         try {
@@ -1232,6 +1341,39 @@ router.post('/:id/qr-claim', needsIdentity, async (req, res) => {
       return res.status(400).json({ success: false, error: 'اكتب رقم عملية التحويل كما ظهر لك' });
     }
 
+    /* ═══════════════════════════════════════════════════════════════
+       رقم التحويل الواحد لا يُبلَّغ عنه مرّتين.
+
+       تحويلٌ بنكي واحد يخصّ طلباً واحداً. وبلا هذا الحارس يستطيع
+       الزبون (سهواً أو قصداً) كتابة نفس رقم العملية على طلبين، فيصير
+       تحويلٌ حقيقي واحد «يؤكّد» طلبين — أحدهما دفعه فعلاً والآخر لا.
+       مسار البنك يطابق أوّل ما يجده، فيبقى الثاني قابلاً للتأكيد
+       اليدوي بلا أن يقابله مالٌ حقيقي.
+
+       نطبّع المرجع (فـ«١٢٣» و«123» و«ABC 123» رقمٌ واحد) ونرفض
+       المكرَّر على طلبٍ حيٍّ آخر. المُلغى لا يمنع — رقمه تحرّر. */
+    const refNorm = normRef(reference);
+    try {
+      const dup = await db.collection('orders')
+        .where('qrClaim.refNorm', '==', refNorm).limit(5).get();
+      meter.addReads(dup.size, 'فحص تكرار مرجع QR');
+      const clash = dup.docs.find(d => {
+        if (d.id === id) return false;                    // نفس الطلب — تحديث لا تكرار
+        const od = d.data() || {};
+        return String(od.status || '') !== 'CANCELLED';   // المُلغى حرّر رقمه
+      });
+      if (clash) {
+        return res.status(409).json({
+          success: false,
+          error: 'رقم هذا التحويل مسجَّل على طلبٍ آخر. تأكّد من الرقم — كل تحويلٍ لطلبٍ واحد.',
+        });
+      }
+    } catch (e) {
+      /* غياب الفهرس المركّب يُسقط الاستعلام — لا نمنع البلاغ لأجله،
+       * فالتأكيد لاحقاً يبقى بيدك. لكن نُسجّله كي لا يمرّ صامتاً. */
+      console.warn('⚠️ تعذّر فحص تكرار مرجع QR (فهرس؟):', e.message);
+    }
+
     const expected = Number((o.money && o.money.grandTotal) != null ? o.money.grandTotal : o.grandTotal) || 0;
 
     await ref.update({
@@ -1563,11 +1705,12 @@ async function sweepReadyUnclaimed(app, db, o) {
   if (ABANDON_MS > 0 && age >= ABANDON_MS) {
     _readySeen.delete(id);
     try {
-      await db.collection('orders').doc(id).update({
-        status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
-        cancelledBy: 'system', cancelReason: 'مهجور — لم يلتقطه مندوب خلال ١٢ ساعة',
-        cancelledAt: new Date(),
+      // الباب الموحّد — يكتب `refundDue` إن كان مدفوعاً
+      const { patch, ledgerEntries } = buildCancellation({ ...o, id }, {
+        by: 'system', reason: 'مهجور — لم يلتقطه مندوب خلال ١٢ ساعة',
       });
+      await db.collection('orders').doc(id).update(patch);
+      ledger.recordMany(db, ledgerEntries).catch(() => {});
       updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED } : x)));
       const io = app.get('socketio');
       if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
@@ -1662,10 +1805,12 @@ function startRestaurantTimeout(app) {
          * متغيّرٌ اسمه «عطّلني» لا يجوز أن يعني «ألغِ كل شيء». */
         if (EXPIRE_MS > 0 && age >= EXPIRE_MS && stage < 3) {
           _staleSeen.set(id, 3);
-          await db.collection('orders').doc(id).update({
-            status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
-            cancelledBy: 'system', cancelReason: 'لم يردّ المطعم', cancelledAt: new Date(),
+          // الباب الموحّد — يكتب `refundDue` إن كان مدفوعاً
+          const { patch, ledgerEntries } = buildCancellation({ ...o, id }, {
+            by: 'system', reason: 'لم يردّ المطعم',
           });
+          await db.collection('orders').doc(id).update(patch);
+          ledger.recordMany(db, ledgerEntries).catch(() => {});
           updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED } : x)));
           const io = app.get('socketio');
           if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
@@ -1758,10 +1903,14 @@ router.post('/:id/reject_by_shop', needsIdentity, async (req, res) => {
     const code = String((req.body && req.body.reason) || 'OTHER').toUpperCase();
     const reasonAr = SHOP_REJECT_REASONS[code] || SHOP_REJECT_REASONS.OTHER;
 
-    await ref.update({
-      status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED,
-      cancelledBy: 'shop', cancelReason: code, cancelReasonAr: reasonAr, cancelledAt: new Date(),
+    /* الباب الموحّد: يكتب `refundDue` إن كان مدفوعاً — فوعدُ «سيُعاد
+     * إليك» أدناه يصير أثراً في `refunds/pending` لا كلمةً تضيع. */
+    const { patch, ledgerEntries } = buildCancellation({ ...o, id }, {
+      by: 'shop', reason: `رفض المحلّ: ${code}`,
+      actorId: (req.user && req.user.userId) || null, actorName: o.customerName,
     });
+    await ref.update({ ...patch, cancelReason: code, cancelReasonAr: reasonAr });
+    ledger.recordMany(db, ledgerEntries).catch(() => {});
     updateCached('orders:all', l => l.map(x => (String(x.id) === id ? { ...x, status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED } : x)));
     const io = req.app.get('socketio');
     if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
