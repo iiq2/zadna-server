@@ -534,9 +534,21 @@ async function notifyDrivers(app, { title, body, data, restaurantLat, restaurant
        *
        * بل هو عكس ذلك: الطلبات الإلكترونية هي التي **تُخرجه** من
        * الحبس، لأنها تُنقص ما تدين به له لا تزيد ما يحمله. */
-      const cap = Number(process.env.ZADNA_CASH_CAP || 800);
-      if (!paidOnline && cap > 0 && Number(u.cashOnHand || 0) >= cap) {
-        overCap.push({ id: d.id, name: u.name || d.id, cash: Number(u.cashOnHand || 0) });
+      /* ═══════════════════════════════════════════════════════════════
+         الحجب على الدَّين لا على الكاش الكلّي (قرار يزن ٨ آب).
+
+         كان الحجب على `cashOnHand` — وهو يشمل **أجرة المندوب**، مالَه
+         هو. فيبلغ السقفَ بمالٍ لا يدين به، ويُحجَب وهو نظيف. الآن على
+         `debtToZadna`: عمولةُ زادنا المتراكمة غير المسوّاة وحدها. من
+         تجاوز ١٠٠ ديناً يُسكَّر حتى يسدّد (كاشاً من اللوحة، أو QR عبر
+         البنك)، ومن سدّد عاد فوراً — لأن الدَّين نفسه ينقص.
+
+         `DRIVER_DEBT_CAP=0` يُعطّله. والطلب الإلكتروني يتجاوز دائماً:
+         لا يزيد دَينه، بل الطلبات الإلكترونية هي التي تُخرجه من الحبس. */
+      const debtCap = Number(process.env.DRIVER_DEBT_CAP || 100);
+      const debt = Number(u.debtToZadna || 0);
+      if (!paidOnline && debtCap > 0 && debt >= debtCap) {
+        overCap.push({ id: d.id, name: u.name || d.id, cash: debt });
         return;
       }
 
@@ -553,9 +565,9 @@ async function notifyDrivers(app, { title, body, data, restaurantLat, restaurant
         const tk = await tokensOf(db, [o.id], 'captain');
         if (tk.length) {
           await push(db, tk, {
-            title: '💰 سوِّ حسابك لتستقبل طلبات',
-            body: `معك ${Math.round(o.cash)} ₪ غير مسوّاة. سلّمها للإدارة وتعود الطلبات فوراً.`,
-            channel: 'update', data: { type: 'cash_cap' },
+            title: '⏸️ حسابك موقوف — سوِّ لتستقبل طلبات',
+            body: `عليك ${Math.round(o.cash)} ₪ لزادنا. سدِّدها كاشاً أو حوّلها بالكود من التطبيق، وتعود الطلبات فوراً.`,
+            channel: 'update', data: { type: 'debt_cap', debt: String(Math.round(o.cash)) },
           });
         }
       }

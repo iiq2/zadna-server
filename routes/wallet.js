@@ -37,6 +37,7 @@ async function selfOrAdmin(req, res, next, matches) {
  * منه الطلباتُ والتطبيقاتُ الثلاثة واللوحة. كانت مكرَّرة هنا حرفياً،
  * وأيّ تعديل على أحد النسختين كان يمرّ بلا أن يلاحظه أحد. */
 const money = require('../utils/money');
+const { normRef } = require('../utils/refs');   // تطبيع مرجع تسوية المندوب
 const {
   RESTAURANT_COMMISSION,
   MARKET_COMMISSION,
@@ -234,6 +235,69 @@ async function settlementsOf(db, driverId) {
 }
 
 // GET /api/wallet/driver/:id — كشف حساب المندوب (كم عليه لزادنا)
+/* ══════════════════════════════════════════════════════════════════
+   POST /api/wallet/my-settlement-claim — المندوب يبلّغ أنه حوّل دَينه.
+
+   نظير `qr-claim` للزبون، لكن لتسوية دَين المندوب لا لطلب. يكتب
+   المرجع على مستند المندوب، ثم رسالة البنك تطابقه في `banksms.js`
+   فتُنشئ التسوية آلياً وتنقص الدَّين — بلا لمس اللوحة.
+
+   ولا يقلب شيئاً بنفسه (البلاغ ليس تأكيداً — نفس مبدأ الزبون): صورةُ
+   شاشةٍ تُزوَّر، ورقمُ مرجعٍ يُخترع. التأكيد من البنك أو من اللوحة.
+   ══════════════════════════════════════════════════════════════════ */
+router.post('/wallet/my-settlement-claim', needsIdentity, async (req, res) => {
+  try {
+    const db = getDb(req);
+    if (!db) return res.status(503).json({ success: false, error: 'لا قاعدة بيانات' });
+    const me = req.user || {};
+    const meId = String(me.userId || me.id || '');
+    if (!meId) return res.status(401).json({ success: false, error: 'من أنت؟' });
+
+    const reference = String((req.body || {}).reference || '').trim().slice(0, 120);
+    if (reference.length < 3) {
+      return res.status(400).json({ success: false, error: 'اكتب رقم عملية التحويل كما ظهر لك' });
+    }
+    const refNorm = normRef(reference);
+    const amount = r2(Number((req.body || {}).amount) || 0);
+    if (amount <= 0) return res.status(400).json({ success: false, error: 'المبلغ غير صحيح' });
+
+    /* رقم التحويل الواحد لا يُبلَّغ عنه مرّتين — لا كطلبٍ ولا كتسوية. */
+    try {
+      const clashOrder = await db.collection('orders')
+        .where('qrClaim.refNorm', '==', refNorm).limit(1).get();
+      if (!clashOrder.empty && String((clashOrder.docs[0].data() || {}).status) !== 'CANCELLED') {
+        return res.status(409).json({ success: false, error: 'هذا المرجع مسجَّل على طلب زبون' });
+      }
+    } catch (_) { /* غياب فهرس — لا نمنع، التأكيد يبقى بالبنك واللوحة */ }
+
+    await db.collection('users').doc(meId).update({
+      settlementClaim: {
+        reference, refNorm, amount,
+        at: new Date(), by: meId,
+        settledAt: null,
+      },
+    });
+
+    ledger.record(db, {
+      kind: ledger.KINDS.QR_CLAIMED, orderId: null,
+      amount: 0, direction: 'neutral',
+      actorId: meId, actorRole: 'driver', actorName: me.name || '',
+      reference,
+      note: `المندوب أبلغ عن تحويل تسوية ${amount} ₪ — بانتظار رسالة البنك`,
+      meta: { settlement: true, claimedAmount: amount },
+    }).catch(() => {});
+
+    const io = req.app.get('socketio');
+    if (io) io.emit('settlement_claim', { driverId: meId, reference, amount, at: new Date() });
+
+    console.log(`🧾 بلاغ تسوية مندوب: ${me.name || meId} · ${amount} ₪ · مرجع ${reference}`);
+    res.json({ success: true, message: 'سُجِّل بلاغك — يؤكَّد فور وصول رسالة البنك' });
+  } catch (e) {
+    console.error('❌ بلاغ تسوية:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 router.get('/wallet/driver/:id', needsIdentity,
   (req, res, next) => selfOrAdmin(req, res, next,
     (me, id) => String(me.id) === id || String(me.phone || '') === id),
@@ -301,24 +365,46 @@ router.get('/wallet/driver/:id', needsIdentity,
        بالتمييز، وهو ببساطة لا يعرف قاعدةً موجودة. فنرسل الرقمين
        ليعرف السبب ويعرف الحلّ.
        ============================================================ */
-    let cashOnHand = 0;
+    let cashOnHand = 0, debtStored = 0;
     try {
       const u = await db.collection('users').doc(id).get();
-      if (u.exists) cashOnHand = Number((u.data() || {}).cashOnHand || 0);
-      meter.addReads(1, 'كاش المندوب');
+      if (u.exists) {
+        const ud = u.data() || {};
+        cashOnHand = Number(ud.cashOnHand || 0);
+        debtStored = Number(ud.debtToZadna || 0);
+      }
+      meter.addReads(1, 'كاش/دَين المندوب');
     } catch (e) {
       console.warn('⚠️ تعذّرت قراءة كاش المندوب:', e.message);
     }
-    const cashCap = Number(process.env.ZADNA_CASH_CAP || 800);
+    /* الحجب على **الدَّين** لا على الكاش الكلّي (قرار يزن ٨ آب): يُسكَّر
+     * حسابه حين يتجاوز دَينه لزادنا ١٠٠ — لا حين يمتلئ جيبه بأجرته هو.
+     * `DRIVER_DEBT_CAP` قابل للضبط من البيئة، افتراضه ١٠٠. */
+    const debtCap = Number(process.env.DRIVER_DEBT_CAP || 100);
+    /* `owesZadna` أدناه (`owedAll - paidIn`) هو الدَّين **المحسوب** من
+     * الطلبات — المصدر الأصدق. نعرضه للحجب، ونرسل المخزَّن بجانبه ليقارنه
+     * `reconcile`. فلو انحرفا صرخ، بدل أن يمرّ الانحراف صامتاً. */
 
     res.json({
       success: true, ownerType: 'driver', ownerId: id,
-      /* الحقول الثلاثة تُقرأ معاً: الرقم والسقف والحكم. ولا نترك
-       * التطبيق يستنتج الحكم بمقارنةٍ يكرّرها — فلو غيّرنا القاعدة
-       * غداً (سقفٌ لكل مندوب مثلاً) تغيّر الحكم في مكانٍ واحد. */
+      /* الحقول تُقرأ معاً: الدَّين والسقف والحكم. ولا نترك التطبيق
+       * يستنتج الحكم بمقارنةٍ يكرّرها — فلو غيّرنا القاعدة غداً تغيّر
+       * الحكم في مكانٍ واحد. */
       cashOnHand: r2(cashOnHand),
-      cashCap,
-      blockedByCashCap: cashCap > 0 && cashOnHand >= cashCap,
+      debtToZadna: r2(owesZadna),          // المحسوب — المرجع (يُعرَض)
+      debtStored: r2(debtStored),          // المخزَّن — للمطابقة
+      debtCap,
+      /* الحجب على **اتحاد** المحسوب والمخزَّن — لا المحسوب وحده.
+       * السبب: `push.js` يحجب فعلياً على المخزَّن (لا يحتمل حساب الدفتر
+       * لكل مندوب في كل بثّ). فلو انحرف المخزَّن للأعلى (طلبٌ مُسلَّمٌ
+       * أُلغي، أو خللٌ في تزامنٍ) لحجب push بصمت بينما يقول هذا الحقلُ
+       * «متصل ومستعد» — نفسُ الكذبة التي نحاربها، لكن من الانقسام هذه
+       * المرّة. فنُظهر «موقوف» متى حجب push، ولو كان المحسوب أدنى. الفرقُ
+       * يبقى ظاهراً في `debtStored` ويصرخ به `reconcile` ليُسوّى يدوياً. */
+      blockedByDebt: debtCap > 0 && (owesZadna >= debtCap || debtStored >= debtCap),
+      // مُبقاة للتوافق مع نسخٍ قديمة من التطبيق قد تقرؤها
+      cashCap: debtCap,
+      blockedByCashCap: debtCap > 0 && (owesZadna >= debtCap || debtStored >= debtCap),
       period: req.query.period || 'all',
       deliveries: inPeriod.length,
       onlineDeliveries: onlineCount,        // كم منها مدفوعٌ إلكترونياً
@@ -727,10 +813,16 @@ router.post('/wallet/settlement', adminOnly, async (req, res) => {
       try {
         const uref = db.collection('users').doc(String(driverId));
         const u = await uref.get();
-        const cur = Number((u.exists ? u.data() : {}).cashOnHand || 0);
-        await uref.update({ cashOnHand: Math.max(0, cur - amt) });
+        const d = u.exists ? u.data() : {};
+        /* الكاش والدَّين ينقصان معاً بما سدّد — والدَّين هو ما يحرسه
+         * الحجب، فبإنقاصه يعود المندوب للعمل فور تسجيلك تسويته. لا
+         * ينزل أيّهما تحت الصفر: من سدّد أكثر ممّا عليه لا يصير دائناً. */
+        await uref.update({
+          cashOnHand:  Math.max(0, Number(d.cashOnHand || 0) - amt),
+          debtToZadna: Math.max(0, Number(d.debtToZadna || 0) - amt),
+        });
       } catch (e) {
-        console.warn('⚠️ تعذّر إنقاص كاش المندوب بعد التسوية:', e.message);
+        console.warn('⚠️ تعذّر إنقاص كاش/دَين المندوب بعد التسوية:', e.message);
       }
     }
 

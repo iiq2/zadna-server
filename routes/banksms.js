@@ -146,6 +146,83 @@ router.post('/bank/sms', hookAuth, async (req, res) => {
       match = { id: d.id, o, expected };
     });
 
+    /* ══ لم يطابق طلباً؟ جرّب بلاغ تسوية مندوب ══
+     *
+     * المندوب يسدّد دَينه لزادنا بالQR (قرار يزن ٨ آب: كاش يدوي، QR
+     * آلي). يبلّغ من تطبيقه بمرجع تحويله، فيُكتب على مستنده
+     * `settlementClaim{refNorm, amount, ...}`. ورسالة البنك تطابقه هنا
+     * فتُسجَّل التسوية آلياً وينفكّ الحجب — بلا لمس اللوحة.
+     *
+     * والفرق عن الطلب: هنا لا `paidOnline` يُقلب بل `settlement` تُنشأ
+     * و`debtToZadna` يُنقص — نفس أثر التسوية اليدوية. */
+    if (!match) {
+      const dsnap = await db.collection('users')
+        .where('settlementClaim.refNorm', '==', reference)
+        .limit(3).get();
+      meter.addReads(dsnap.size || 1, 'مطابقة تسوية مندوب');
+
+      let dmatch = null;
+      dsnap.forEach(du => {
+        if (dmatch) return;
+        const ud = du.data() || {};
+        const sc = ud.settlementClaim || {};
+        if (sc.settledAt) return;                           // بلاغٌ سُوِّي سلفاً
+        if (Math.abs(Number(sc.amount || 0) - amount) > 0.01) return;
+        const cms = sc.at && sc.at._seconds ? sc.at._seconds * 1000
+                  : (sc.at ? new Date(sc.at).getTime() : 0);
+        if (cms && Math.abs(atMs - cms) > MATCH_WINDOW_MS) return;
+        dmatch = { id: du.id, u: ud, amount };
+      });
+
+      if (dmatch) {
+        const FV = require('firebase-admin').firestore.FieldValue;
+        const uref = db.collection('users').doc(dmatch.id);
+        const ud = dmatch.u;
+        /* رقم إيصالٍ للتسوية كأختها اليدوية. */
+        let receiptNo;
+        try {
+          const cnt = await db.collection('settlements').count().get();
+          receiptNo = 'SET-' + String((cnt.data().count || 0) + 1).padStart(4, '0');
+        } catch (_) { receiptNo = 'SET-' + Date.now().toString().slice(-6); }
+
+        await db.collection('settlements').add({
+          driverId: dmatch.id, driverName: ud.name || '',
+          amount, direction: 'in', receiptNo,
+          reference, note: 'تسوية بالQR — طابقتها رسالة البنك آلياً',
+          confirmedBy: 'bank_sms',
+          createdAt: new Date(),
+        });
+
+        /* الكاش والدَّين ينقصان معاً — نفس منطق التسوية اليدوية. */
+        await uref.update({
+          cashOnHand:  Math.max(0, Number(ud.cashOnHand || 0) - amount),
+          debtToZadna: Math.max(0, Number(ud.debtToZadna || 0) - amount),
+          'settlementClaim.settledAt': new Date(),
+          'settlementClaim.settledVia': 'bank_sms',
+        });
+        await inRef.update({ status: 'matched_settlement', driverId: dmatch.id, matchedAt: new Date() });
+
+        ledger.record(db, {
+          kind: ledger.KINDS.SETTLE_IN, orderId: null,
+          amount, direction: 'in',
+          actorId: 'bank_sms', actorRole: 'system',
+          actorName: ud.name || dmatch.id,
+          reference: receiptNo,
+          note: `تسوية مندوب بالQR — طابقتها رسالة البنك · مرجع ${reference}`,
+          meta: { driverId: dmatch.id, auto: true, bankReference: reference },
+        }).catch(() => {});
+
+        try { require('../utils/cache').invalidate('orders:all'); } catch (_) {}
+        const io2 = req.app.get('socketio');
+        if (io2) {
+          io2.emit('settlement_matched', { driverId: dmatch.id, amount, reference, receiptNo });
+          io2.emit('bank_matched', { driverId: dmatch.id, amount, reference, kind: 'settlement' });
+        }
+        console.log(`✅ طوبقت تسوية مندوب ${reference} · ${amount} ₪ → ${ud.name || dmatch.id}`);
+        return res.json({ success: true, matched: true, kind: 'settlement', driverId: dmatch.id, amount, reference });
+      }
+    }
+
     if (!match) {
       /* تحويلٌ وصلك بلا بلاغٍ يقابله. ليس خطأً — قد يكون زبوناً نسي
        * أن يُبلغ، أو مالاً لك من مصدرٍ آخر. يبقى في الصندوق ظاهراً

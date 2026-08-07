@@ -987,14 +987,29 @@ router.patch('/:id', needsIdentity, async (req, res) => {
         const m = cur.money || {};
         const drvId = curDrvKey || meId;
         try {
+          const FV = require('firebase-admin').firestore.FieldValue;
+          /* رقمان مختلفان لحقيقتين مختلفتين:
+
+             `cashOnHand` = الكاش الزائد في جيبه = التحصيل ناقص ما دفعه
+               للمحلّ = عمولة زادنا + أجرته معاً. رقمٌ تشغيليّ للعرض.
+
+             `debtToZadna` = ما يدين به لك فعلاً = العمولة وحدها
+               (`driverOwesZadna`: صفرٌ للطلب الإلكتروني). وهذا وحده ما
+               يُحجَب عليه.
+
+             خلطُهما كان العطب: الحجب على `cashOnHand` يبلغ سقفه بأجرة
+             المندوب — مالِه هو — فيُحجَب مندوبٌ دَينه صفر بعد ~٥٩ طلباً.
+             الآن الحجب على الدَّين وحده، فمن سدّد عاد فوراً. */
+          const patchUser = {};
           const kept = Math.max(0, Number(m.cashToCollect || 0) - Number(m.payToRestaurant || 0));
-          if (kept > 0 && drvId) {
-            const FV = require('firebase-admin').firestore.FieldValue;
-            await db.collection('users').doc(String(drvId))
-              .update({ cashOnHand: FV.increment(kept) });
+          if (kept > 0) patchUser.cashOnHand = FV.increment(kept);
+          const owes = Number(m.driverOwesZadna || 0);
+          if (owes > 0) patchUser.debtToZadna = FV.increment(owes);
+          if (drvId && Object.keys(patchUser).length) {
+            await db.collection('users').doc(String(drvId)).update(patchUser);
           }
         } catch (e) {
-          console.warn('⚠️ تعذّر تحديث كاش المندوب:', e.message);
+          console.warn('⚠️ تعذّر تحديث كاش/دَين المندوب:', e.message);
         }
 
         /* ═══ قيود لحظة التسليم ═══
