@@ -11,6 +11,10 @@ const { cached, invalidate } = require('../utils/cache');
 // عدّاد القراءات — قراءةٌ لا تُحصى تجعل مقياس الحصة يكذب، والمقياس
 // الذي لا يُصدَّق أسوأ من غياب المقياس.
 const meter = require('../utils/meter');
+/* المصدر الوحيد لكل رقم مالي — نفسه الذي تقرأ منه المحفظة (wallet.js).
+ * حارس الحذف كان يحسب الدَّين بصيغته الخاصة فيخالف ما تعرضه المحفظة
+ * للمندوب نفسه — رقمان لدَينٍ واحد. */
+const money = require('../utils/money');
 // 5 دقائق: أي اعتماد أو تجميد أو تسجيل جديد يُبطل الكاش فوراً.
 const PARTNERS_TTL = 300000;
 
@@ -787,10 +791,18 @@ async function debtOf(db, id) {
       const drv = String((o.driver && (o.driver.id || o.driver.phone)) || o.driverId || '');
       if (drv !== uid) return;
       delivered++;
-      // ما يجب أن يورده للإدارة: قيمة الطلب ناقص أجرته
-      const total = Number(o.total || o.totalAmount || 0);
-      const fee   = Number(o.driverEarning || o.deliveryFee || 0);
-      owed += Math.max(0, total - fee);
+      /* دَين المندوب لزادنا = عمولتها وحدها (المطعم + التوصيل) — لا
+       * «قيمة الطلب ناقص أجرته».
+       *
+       * الصيغة القديمة (total − fee) كانت تخالف wallet.js تماماً: المحفظة
+       * تعرض للمندوب أنه مدينٌ بالعمولة (٠٫١٠ وجبة + ٠٫١٠ توصيل ≈ ١١٫٥ ₪
+       * لطلب ١٠٠+١٥)، وهذا الحارس يقول ٨٥ ₪ — رقمان لدَينٍ واحد. والسبب
+       * أن المندوب دفع للمطعم كاشاً وقت الاستلام، فلم يبقَ عليه إلا العمولة.
+       *
+       * نقرأ من `o.money` المخزَّن وقت الإنشاء (كما تفعل المحفظة حرفياً)،
+       * فطلبٌ سُلّم بنسبةٍ قديمة يبقى محاسَباً بها. */
+      const m = o.money || money.breakdown(o);
+      owed += (Number(m.restaurantCommission) || 0) + (Number(m.driverCommission) || 0);
     });
 
     let settled = 0;
