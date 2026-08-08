@@ -13,10 +13,14 @@ const _resolve = Module._resolveFilename;
 Module._resolveFilename = function (req, ...rest) {
   if (req.endsWith('utils/meter') || req === '../utils/meter') return 'FAKE_METER';
   if (req === 'express') return 'FAKE_EXPRESS';
+  // banksms صار يستورد push (releaseHeldOrder) — نموّهه فلا نجرّ firebase-admin
+  if (req === './push' || req.endsWith('routes/push')) return 'FAKE_PUSH';
   return _resolve.call(this, req, ...rest);
 };
 require.cache['FAKE_METER'] = { id:'FAKE_METER', filename:'FAKE_METER', loaded:true,
   exports:{ addReads(){}, addWrites(){}, stats:()=>({}) } };
+require.cache['FAKE_PUSH'] = { id:'FAKE_PUSH', filename:'FAKE_PUSH', loaded:true,
+  exports:{ releaseHeldOrder: async () => false, notifyRestaurant(){}, notifyDrivers(){}, notifyCustomer(){} } };
 
 const ROUTES = {};
 require.cache['FAKE_EXPRESS'] = { id:'FAKE_EXPRESS', filename:'FAKE_EXPRESS', loaded:true,
