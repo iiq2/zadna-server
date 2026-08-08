@@ -833,8 +833,95 @@ async function notifyDriverById(app, driverKey, { title, body, channel = 'update
   } catch (e) { console.warn('⚠️ إشعار مندوب بعينه:', e.message); }
 }
 
+/* ============================================================
+   إطلاق الطلب المحجوز بانتظار الدفع — بعد أن يؤكّد البنك التحويل.
+
+   طلب الـQR حين يُنشأ (وHOLD_QR_UNTIL_PAID مفعّل) يُحفظ `PENDING_PAYMENT`
+   ولا يُخطَر به المطعم — الزبون اختار الدفع لكنه لم يدفع بعد. فحين يصل
+   التأكيد (`/paid` أو مطابقة `banksms`)، هنا نُطلقه: ننقله لحالته الطبيعية
+   ونُطلق الإشعارات التي فاتت لحظة الإنشاء — والآن الدفع مؤكَّد يقيناً.
+
+   حقيقةٌ واحدة في مكان واحد: كلا مساري التأكيد يناديان هذه الدالة، فلا
+   يتفرّق منطق «متى يصل المطعم» بينهما. من يضيف مسار تأكيدٍ ثالثاً يناديها.
+   ============================================================ */
+async function releaseHeldOrder(app, db, id, o) {
+  if (!o || o.heldForPayment !== true) return false;   // ليس محجوزاً → لا شيء
+  const isMart = o.isMarketOrder === true;
+  const nextStatus = isMart ? 'READY_FOR_PICKUP' : 'PENDING_RESTAURANT';
+  const money = `${o.grandTotal || o.totalAmount || 0} ₪`;
+
+  try {
+    await db.collection('orders').doc(String(id)).update({
+      status: nextStatus,
+      heldForPayment: false,
+      releasedAt: new Date(),
+    });
+  } catch (e) {
+    console.warn('⚠️ إطلاق طلب محجوز:', id, e.message);
+    return false;
+  }
+  // نحدّث الكاش مكانه كي لا يبقى GET يعرضه محجوزاً حتى انتهاء TTL
+  try {
+    require('../utils/cache').updateCached('orders:all', l =>
+      l.map(x => (String(x.id) === String(id)
+        ? { ...x, status: nextStatus, heldForPayment: false } : x)));
+  } catch (_) {}
+
+  const io = app.get('socketio');
+  if (io) {
+    if (isMart) io.emit('new_ready_order', {
+      orderId: id, restaurantName: o.restaurant || 'زادنا مارت',
+      location: { lat: 32.2211, lng: 35.2622 },
+    });
+    io.emit('order_updated', {
+      orderId: id, status: nextStatus, restaurantId: o.restaurantId || '',
+      isNew: true, timestamp: new Date(),
+    });
+  }
+
+  // إحداثيات المحلّ لترتيب «الأقرب أولاً» — قراءةٌ واحدة تسقط بأمان
+  let lat, lng;
+  try {
+    const r = await db.collection('restaurants').doc(String(o.restaurantId)).get();
+    if (r.exists) { const d = r.data() || {}; lat = Number(d.lat); lng = Number(d.lng); }
+  } catch (_) {}
+
+  if (isMart) {
+    notifyDrivers(app, {
+      title: 'طلب جاهز للاستلام 📦',
+      body: `${o.restaurant || 'زادنا مارت'} — ${money}`,
+      data: { orderId: id, type: 'new_ready_order' },
+      restaurantLat: Number.isFinite(lat) ? lat : undefined,
+      restaurantLng: Number.isFinite(lng) ? lng : undefined,
+      paidOnline: true,   // وصلنا هنا بعد التأكيد — لا نقد في جيب المندوب
+    }).catch(() => {});
+    notifyRestaurant(app, o.restaurantId, {
+      title: 'طلب مدفوع — جهّز الأصناف 🛒',
+      body: `${o.itemsSummary || 'طلب'} — ${money} · تأكّد الدفع · المندوب في الطريق`,
+      data: { orderId: id, type: 'new_order' },
+    }).catch(() => {});
+  } else {
+    notifyRestaurant(app, o.restaurantId, {
+      title: 'طلب جديد مدفوع وصلك 🔔',
+      body: `${o.itemsSummary || 'طلب جديد'} — ${money} · تأكّد الدفع`,
+      data: { orderId: id, type: 'new_order' },
+    }).catch(() => {});
+  }
+
+  notifyCustomer(app, o.customerPhone, {
+    title: 'تأكّد دفعك ✅',
+    body: 'وصل طلبك المطعم الآن — نجهّزه ونرسله إليك',
+    channel: 'update',
+    data: { orderId: id, type: 'status', status: nextStatus },
+  }).catch(() => {});
+
+  console.log(`🔓 أُطلق طلب محجوز ${id} بعد تأكيد الدفع → ${nextStatus}`);
+  return true;
+}
+
 module.exports = router;
 module.exports.notifyDriverById = notifyDriverById;
+module.exports.releaseHeldOrder = releaseHeldOrder;
 module.exports.notifyManagers = notifyManagers;
 module.exports.notifyRestaurant = notifyRestaurant;
 module.exports.notifyDrivers = notifyDrivers;

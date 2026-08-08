@@ -29,6 +29,7 @@ const router = express.Router();
 const meter = require('../utils/meter');
 const ledger = require('../utils/ledger');
 const { breakdown, applyPayment } = require('../utils/money');
+const { releaseHeldOrder } = require('./push');   // إطلاق الطلب المحجوز بعد تأكيد البنك
 
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const getDb = (req) => req.app.get('db');
@@ -285,6 +286,10 @@ router.post('/bank/sms', hookAuth, async (req, res) => {
       io.emit('order_paid', { orderId: id, method: 'qr', money: m });
       io.emit('bank_matched', { orderId: id, amount, reference });
     }
+
+    /* الطلب المحجوز بانتظار الدفع يصل المطعم الآن — هنا بيت القصيد من
+     * الميزة: التأكيد جاء من البنك، فيُطلَق. (لا شيء إن لم يكن محجوزاً.) */
+    try { await releaseHeldOrder(req.app, db, id, { ...cur, grandTotal: m.grandTotal }); } catch (_) {}
 
     console.log(`✅ طوبق تحويل ${reference} · ${amount} ₪ → طلب #${id}`);
     res.json({ success: true, matched: true, orderId: id, amount, reference });

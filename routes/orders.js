@@ -10,7 +10,7 @@ const needsIdentity = (req, res, next) => {
 };
 const { cached, peekCached, invalidate, updateCached } = require('../utils/cache');
 const { quoteDelivery } = require('./zones');
-const { notifyRestaurant, notifyDrivers, notifyCustomer, notifyDriverById } = require('./push');
+const { notifyRestaurant, notifyDrivers, notifyCustomer, notifyDriverById, releaseHeldOrder } = require('./push');
 const { priceMartItems } = require('./mart');
 const meter = require('../utils/meter');
 /* المصدر الوحيد لكل رقم مالي. التطبيقات الثلاثة واللوحة تعرض ما يأتي
@@ -124,6 +124,7 @@ const ORDERS_LIMIT = 250;
 // الترجمة العربية لكل الحالات. كانت ناقصة فتُخزَّن الحالات غير المذكورة
 // باسمها الإنجليزي ويراها الزبون هكذا: "AT_RESTAURANT" بدل نص مفهوم.
 const STATUS_AR = {
+  PENDING_PAYMENT:    'بانتظار تأكيد دفعك 💳',
   PENDING_RESTAURANT: 'بانتظار موافقة المطعم ⏳',
   ACCEPTED:           'المطعم قبل طلبك ✅',
   PREPARING:          'قيد التحضير 👨‍🍳',
@@ -457,6 +458,17 @@ router.post('/', needsIdentity, async (req, res) => {
       orderData.paymentMethod = ['cash', 'wallet', 'card', 'qr'].includes(askedMethod) ? askedMethod : 'cash';
       orderData.paymentStatus = 'pending';
       orderData.paidOnline = false;
+
+      /* ═══ حجب طلب الـQR حتى يتأكّد الدفع (قرار يزن ٨ آب) ═══
+       * الزبون اختار QR؟ لا يصل المطعم حتى يؤكّد البنك وصول التحويل.
+       * يُحفظ `PENDING_PAYMENT` بدل ما يُبثّ للمطعم، ويُطلَق فور التأكيد
+       * (`releaseHeldOrder`). خلف علَمٍ مطفأ افتراضاً: بلا قارئ بنكٍ حيّ
+       * لن يصل تأكيدٌ أبداً فيتجمّد الطلب — فلا يُفعَّل إلا حين يجهز القارئ.
+       * `=1` يشغّله بعد ضبط `SMS_HOOK_KEY` وتشغيل التطبيق القارئ. */
+      const holdForPayment =
+        process.env.HOLD_QR_UNTIL_PAID === '1' &&
+        orderData.paymentMethod === 'qr' &&
+        orderData.paidOnline !== true;
       // الخصم صفرٌ حتى تُبنى الكوبونات — والحقل موجود ليُحسب صحيحاً حين تُبنى
       orderData.discount = 0;
       orderData.discountBy = 'restaurant';   // العروض من المطاعم — قرار العمل
@@ -464,6 +476,14 @@ router.post('/', needsIdentity, async (req, res) => {
       const m = applyPayment(breakdown(orderData), orderData);
       orderData.grandTotal = m.grandTotal;
       orderData.money = m;
+
+      /* الحجب يُلبِس الطلب حالته الخاصّة — يعلو على `READY_FOR_PICKUP`
+       * التي وسمها المارت أعلاه. `heldAt` منه تُحسب مهلة الإلغاء. */
+      if (holdForPayment) {
+        orderData.status = 'PENDING_PAYMENT';
+        orderData.heldForPayment = true;
+        orderData.heldAt = new Date();
+      }
 
       // Save to Firestore
       //
@@ -512,7 +532,7 @@ router.post('/', needsIdentity, async (req, res) => {
       // ملاحظة: نستعمل savedId لا orderId — عند التصادم يختلفان، وبثّ
       // الرقم القديم يجعل المندوب يفتح طلباً غير موجود.
       const io = req.app.get('socketio');
-          if (io && isMart) {
+          if (io && isMart && !holdForPayment) {
                   io.emit('new_ready_order', {
                             orderId: savedId,
                             restaurantName: orderData.restaurant || 'زادنا مارت',
@@ -529,7 +549,7 @@ router.post('/', needsIdentity, async (req, res) => {
        *
        * order_updated يكفي: كل التطبيقات تسمعه أصلاً وتُعيد الجلب عنده،
        * فلا يحتاج الأمر حدثاً جديداً ولا تعديلاً في أي تطبيق. */
-      if (io && !isMart) {
+      if (io && !isMart && !holdForPayment) {
         io.emit('order_updated', {
           orderId: savedId,
           status: orderData.status || 'PENDING_RESTAURANT',
@@ -543,6 +563,10 @@ router.post('/', needsIdentity, async (req, res) => {
        * السوكت يكفي إن كان التطبيق مفتوحاً. وهو ليس مفتوحاً عادةً:
        * صاحب المطعم في المطبخ. لذلك الإشعار هو القناة الحقيقية. */
       const money = `${orderData.grandTotal || orderData.totalAmount || 0} ₪`;
+      /* الطلب المحجوز بانتظار الدفع لا يُخطَر به المطعم ولا المناديب —
+       * يُطلَق فور تأكيد التحويل (releaseHeldOrder). الشرط يحكم الـif/else
+       * كاملاً (جملةٌ واحدة) فلا يحتاج قوساً. */
+      if (!holdForPayment)
       if (isMart) {
         /* طلب مارت يذهب للمناديب مباشرة — لا موافقة تسبقه.
          *
@@ -586,7 +610,12 @@ router.post('/', needsIdentity, async (req, res) => {
        *
        * مكانها الصحيح لحظة واحدة: حين يمسك طلبه بيده. عندها تكون
        * خاتمةً يتذكّرها، لا إشعاراً يمرّ. */
-      notifyCustomer(req.app, orderData.customerPhone, {
+      notifyCustomer(req.app, orderData.customerPhone, holdForPayment ? {
+        title: 'طلبك بانتظار تأكيد تحويلك 💳',
+        body: `حوّل ${money} عبر الكود — يصل المطعم فور تأكيد وصول المبلغ`,
+        channel: 'update',
+        data: { orderId: savedId, type: 'awaiting_payment' },
+      } : {
         title: 'تم استلام طلبك 🎉',
         body: `طلبك من ${orderData.restaurant || 'زادنا'} — ${money}`,
         channel: 'update',
@@ -736,6 +765,11 @@ router.get('/', needsIdentity, async (req, res) => {
         let filtered = all;
         if (restaurantId) {
             filtered = filtered.filter(o => o.restaurantId === restaurantId);
+            /* الطلب المحجوز بانتظار تأكيد الدفع لا يظهر للمطعم — يظهر فور
+             * تأكيد البنك (releaseHeldOrder ينقله عن PENDING_PAYMENT).
+             * المندوب لا يراه أصلاً (ليس في UNASSIGNED)، والزبون يراه في
+             * نطاقه ليتابع تحويله. الحجب عن المطعم وحده. */
+            filtered = filtered.filter(o => String(o.status || '') !== 'PENDING_PAYMENT');
         }
         if (customerPhone) {
             /* بدونها كان كل زبون يرى طلبات كل زبائن المنصة بأسمائهم وأرقامهم.
@@ -1287,6 +1321,10 @@ router.post('/:id/payment', async (req, res) => {
     const io = req.app.get('socketio');
     if (io) io.emit('order_paid', { orderId: id, method, money: m });
 
+    /* إن كان محجوزاً بانتظار الدفع — يصل المطعم الآن، لا قبل التأكيد.
+     * لا شيء يحدث إن لم يكن محجوزاً (طلبٌ حيّ دُفع لاحقاً، أو كاش). */
+    try { await releaseHeldOrder(req.app, db, id, { ...cur, grandTotal: m.grandTotal }); } catch (_) {}
+
     console.log(`💳 دُفع إلكترونياً: #${id} · ${m.grandTotal} ₪ · ${method} · مرجع ${reference}`
       + ` — عليك للمحلّ ${m.owedToRestaurant} وللمندوب ${m.owedToDriver}`);
 
@@ -1782,6 +1820,45 @@ async function sweepReadyUnclaimed(app, db, o) {
   }
 }
 
+/* ============================================================
+   مهلة الدفع — طلب الـQR المحجوز لا ينتظر التحويل إلى الأبد.
+
+   الزبون اختار الدفع بالكود ولم يحوّل؟ الطلب في `PENDING_PAYMENT` لا
+   يراه المطعم. لكن بقاءه معلّقاً بلا نهاية يملأ اللوحة بطلباتٍ ميتة،
+   والزبون قد يكون بدّل رأيه. فبعد المهلة (٣٠ دقيقة، `QR_PAYMENT_TIMEOUT_MIN`)
+   يُلغى — **بلا استرداد** لأنه لم يُدفع أصلاً، بابُ الإلغاء الموحّد يتكفّل.
+   `=0` يُعطّل الإلغاء التلقائي فيبقى حتى يُدفع أو يُلغى يدوياً.
+   ============================================================ */
+const PAY_TIMEOUT_MS = Number(process.env.QR_PAYMENT_TIMEOUT_MIN || 30) * 60000;
+
+async function sweepUnpaidHeld(app, db, o, now) {
+  if (PAY_TIMEOUT_MS <= 0) return;             // مُعطَّل صراحةً
+  const created = orderCreatedMs(o);
+  if (!created) return;                        // تاريخٌ لا نفهمه = لا حكم
+  if ((now - created) < PAY_TIMEOUT_MS) return;
+  const id = String(o.id);
+  try {
+    // الباب الموحّد — لم يُدفع شيء فلا `refundDue`، لكنه يكتب القيد والحالة
+    const { patch, ledgerEntries } = buildCancellation({ ...o, id }, {
+      by: 'system', reason: 'لم يصل تحويلك خلال مهلة الدفع',
+    });
+    await db.collection('orders').doc(id).update(patch);
+    ledger.recordMany(db, ledgerEntries).catch(() => {});
+    updateCached('orders:all', l => l.map(x => (String(x.id) === id
+      ? { ...x, status: 'CANCELLED', statusAr: STATUS_AR.CANCELLED } : x)));
+    const io = app.get('socketio');
+    if (io) io.emit('order_updated', { orderId: id, status: 'CANCELLED', timestamp: new Date() });
+    notifyCustomer(app, o.customerPhone, {
+      title: 'انتهت مهلة الدفع — أُلغي طلبك',
+      body: 'لم يصلنا تحويلك خلال المهلة. لم يُخصم منك شيء — أعد الطلب وقتما شئت',
+      channel: 'update', data: { orderId: id, type: 'status', status: 'CANCELLED' },
+    }).catch(() => {});
+    console.warn(`⏳ أُلغي طلب محجوز ${id} — لم يصل تحويله خلال ${PAY_TIMEOUT_MS / 60000} دقيقة`);
+  } catch (e) {
+    console.warn('⚠️ مكنسة مهلة الدفع:', id, e.message);
+  }
+}
+
 function startRestaurantTimeout(app) {
   const tick = async () => {
     try {
@@ -1795,6 +1872,8 @@ function startRestaurantTimeout(app) {
 
       for (const o of list) {
         const st = String(o.status || '');
+        // الطلب المحجوز بانتظار الدفع — مهلته الخاصّة قبل كل شيء
+        if (st === 'PENDING_PAYMENT') { await sweepUnpaidHeld(app, db, o, now); continue; }
         const hasDrv = !!(o.driver && (o.driver.id || o.driver.phone)) || !!o.driverId;
         // «جاهز بلا مندوب» له مكنسته الخاصة — مارت كان أو مطعماً أنهى الطبخ
         if (st === 'READY_FOR_PICKUP' && !hasDrv) {
